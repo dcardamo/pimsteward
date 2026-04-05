@@ -66,11 +66,7 @@ impl Client {
     }
 
     /// PUT /v1/sieve-scripts/:id — update an existing script.
-    pub async fn update_sieve_script(
-        &self,
-        id: &str,
-        content: &str,
-    ) -> Result<SieveScript, Error> {
+    pub async fn update_sieve_script(&self, id: &str, content: &str) -> Result<SieveScript, Error> {
         let body = json!({"content": content});
         self.put_json(&format!("/v1/sieve-scripts/{id}"), &body, None)
             .await
@@ -96,11 +92,7 @@ impl Client {
 
     /// PUT /v1/messages/:id with `{folder: "..."}` — move a message to a
     /// different folder by path (e.g. "Archive").
-    pub async fn move_message(
-        &self,
-        id: &str,
-        folder: &str,
-    ) -> Result<serde_json::Value, Error> {
+    pub async fn move_message(&self, id: &str, folder: &str) -> Result<serde_json::Value, Error> {
         let body = json!({"folder": folder});
         self.put_json(&format!("/v1/messages/{id}"), &body, None)
             .await

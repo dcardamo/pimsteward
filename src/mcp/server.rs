@@ -213,6 +213,32 @@ pub struct DeleteMessageParams {
     pub reason: Option<String>,
 }
 
+// ── Restore tool params ─────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreContactDryRunParams {
+    /// iCard UID of the contact (the filename stem in the backup tree).
+    /// Find it via list_contacts (uid field) or history (path like
+    /// `sources/.../contacts/default/<uid>.vcf`).
+    pub contact_uid: String,
+    /// Git commit SHA to restore from. Use the `history` tool to find
+    /// candidate commits.
+    pub at_sha: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreContactApplyParams {
+    /// The RestorePlan object returned by restore_contact_dry_run. Must
+    /// be passed back verbatim — any modification changes the plan_token
+    /// and the apply will be refused.
+    pub plan: serde_json::Value,
+    /// The plan_token returned alongside the plan in the dry-run response.
+    pub plan_token: String,
+    /// Free-text reason, embedded in the audit commit.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[tool_router]
 impl PimstewardServer {
     #[tool(
@@ -351,8 +377,11 @@ impl PimstewardServer {
     ) -> Result<String, McpError> {
         self.check_write(Resource::Contacts)?;
         let attr = self.attribution(None, p.reason);
-        let emails: Vec<(&str, &str)> =
-            p.emails.iter().map(|e| (e.kind.as_str(), e.value.as_str())).collect();
+        let emails: Vec<(&str, &str)> = p
+            .emails
+            .iter()
+            .map(|e| (e.kind.as_str(), e.value.as_str()))
+            .collect();
         let created = crate::write::contacts::create_contact(
             &self.inner.client,
             &self.inner.repo,
@@ -462,7 +491,10 @@ impl PimstewardServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
-    #[tool(name = "delete_sieve_script", description = "Delete a sieve script by id.")]
+    #[tool(
+        name = "delete_sieve_script",
+        description = "Delete a sieve script by id."
+    )]
     async fn delete_sieve_script(
         &self,
         Parameters(p): Parameters<DeleteSieveParams>,
@@ -504,7 +536,10 @@ impl PimstewardServer {
         Ok(format!("updated flags on {}", p.id))
     }
 
-    #[tool(name = "move_email", description = "Move a message to a different folder by path.")]
+    #[tool(
+        name = "move_email",
+        description = "Move a message to a different folder by path."
+    )]
     async fn move_email(
         &self,
         Parameters(p): Parameters<MoveMessageParams>,
@@ -541,6 +576,65 @@ impl PimstewardServer {
         .await
         .map_err(|e| self.api_error(e))?;
         Ok(format!("deleted {}", p.id))
+    }
+
+    // ── Restore tools (always available, gated by the two-call dance) ──
+
+    #[tool(
+        name = "restore_contact_dry_run",
+        description = "Compute what it would take to restore a contact back to its state at a past git commit. Returns a RestorePlan object plus a plan_token. This does NOT execute the restore — it's the safe dry-run step. Pass the returned plan and plan_token verbatim to restore_contact_apply to actually apply."
+    )]
+    async fn restore_contact_dry_run(
+        &self,
+        Parameters(p): Parameters<RestoreContactDryRunParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Contacts)?;
+        let (plan, token) = crate::restore::plan_contact(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &p.contact_uid,
+            &p.at_sha,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let out = serde_json::json!({
+            "plan": plan,
+            "plan_token": token,
+            "note": "Pass `plan` and `plan_token` verbatim to restore_contact_apply to execute."
+        });
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "restore_contact_apply",
+        description = "Execute a restore plan returned by restore_contact_dry_run. Re-computes plan_token from the submitted plan and refuses to proceed if it doesn't match the supplied token — this prevents dry-running one plan and applying a different one."
+    )]
+    async fn restore_contact_apply(
+        &self,
+        Parameters(p): Parameters<RestoreContactApplyParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Contacts)?;
+        let plan: crate::restore::RestorePlan = serde_json::from_value(p.plan).map_err(|e| {
+            McpError::invalid_params(format!("plan is not a valid RestorePlan: {e}"), None)
+        })?;
+        let attr = self.attribution(None, p.reason);
+        crate::restore::apply_contact(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &plan,
+            &p.plan_token,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!(
+            "restore applied: contact {} from {}",
+            plan.contact_uid,
+            &plan.at_sha[..8.min(plan.at_sha.len())]
+        ))
     }
 
     // ── History / audit ──────────────────────────────────────────────

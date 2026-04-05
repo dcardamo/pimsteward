@@ -8,6 +8,7 @@ pub mod forwardemail;
 pub mod mcp;
 pub mod permission;
 pub mod pull;
+pub mod restore;
 pub mod store;
 pub mod write;
 

@@ -39,11 +39,19 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             client.clone(),
             repo.clone(),
             alias.clone(),
-            |c, r, a| Box::pin(async move {
-                pull::contacts::pull_contacts(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
+            |c, r, a| {
+                Box::pin(async move {
+                    pull::contacts::pull_contacts(
+                        &c,
+                        &r,
+                        &a,
+                        "pimsteward-pull",
+                        "pull@pimsteward.local",
+                    )
                     .await
                     .map(|s| s.to_string())
-            }),
+                })
+            },
         );
         handles.push(h);
     }
@@ -55,11 +63,13 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             client.clone(),
             repo.clone(),
             alias.clone(),
-            |c, r, a| Box::pin(async move {
-                pull::sieve::pull_sieve(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
-                    .await
-                    .map(|s| s.to_string())
-            }),
+            |c, r, a| {
+                Box::pin(async move {
+                    pull::sieve::pull_sieve(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
+                        .await
+                        .map(|s| s.to_string())
+                })
+            },
         );
         handles.push(h);
     }
@@ -71,11 +81,19 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             client.clone(),
             repo.clone(),
             alias.clone(),
-            |c, r, a| Box::pin(async move {
-                pull::calendar::pull_calendar(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
+            |c, r, a| {
+                Box::pin(async move {
+                    pull::calendar::pull_calendar(
+                        &c,
+                        &r,
+                        &a,
+                        "pimsteward-pull",
+                        "pull@pimsteward.local",
+                    )
                     .await
                     .map(|s| s.to_string())
-            }),
+                })
+            },
         );
         handles.push(h);
     }
@@ -87,11 +105,13 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
             client.clone(),
             repo.clone(),
             alias.clone(),
-            |c, r, a| Box::pin(async move {
-                pull::mail::pull_mail(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
-                    .await
-                    .map(|s| s.to_string())
-            }),
+            |c, r, a| {
+                Box::pin(async move {
+                    pull::mail::pull_mail(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
+                        .await
+                        .map(|s| s.to_string())
+                })
+            },
         );
         handles.push(h);
     }
@@ -130,8 +150,7 @@ fn spawn_puller(
             Client,
             Arc<Repo>,
             String,
-        )
-            -> std::pin::Pin<Box<dyn Future<Output = Result<String, Error>> + Send>>
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, Error>> + Send>>
         + Send
         + Sync
         + 'static,

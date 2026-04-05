@@ -44,9 +44,7 @@ pub async fn update_contact_name(
     full_name: &str,
     if_match: Option<&str>,
 ) -> Result<Contact, Error> {
-    let updated = client
-        .update_contact_name(id, full_name, if_match)
-        .await?;
+    let updated = client.update_contact_name(id, full_name, if_match).await?;
     let audit = WriteAudit {
         attribution,
         tool: "update_contact_name",
@@ -111,11 +109,19 @@ async fn refresh_and_commit(
     // exists), we still want the audit commit to exist. Make an empty
     // commit in that case.
     let msg = audit.commit_message();
-    let sha = repo.commit_all(&audit.attribution.caller, &audit.attribution.caller_email, &msg)?;
+    let sha = repo.commit_all(
+        &audit.attribution.caller,
+        &audit.attribution.caller_email,
+        &msg,
+    )?;
     if sha.is_none() {
         // Nothing changed on disk (pull already captured the state).
         // Make an empty commit so the audit trail is complete.
-        repo.empty_commit(&audit.attribution.caller, &audit.attribution.caller_email, &msg)?;
+        repo.empty_commit(
+            &audit.attribution.caller,
+            &audit.attribution.caller_email,
+            &msg,
+        )?;
     }
     Ok(())
 }
