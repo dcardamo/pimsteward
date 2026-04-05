@@ -62,8 +62,8 @@ impl E2eContext {
 
         let api_base = std::env::var("PIMSTEWARD_TEST_API_BASE")
             .unwrap_or_else(|_| "https://api.forwardemail.net".to_string());
-        let client = Client::new(api_base, alias.clone(), password)
-            .expect("building reqwest client");
+        let client =
+            Client::new(api_base, alias.clone(), password).expect("building reqwest client");
         let repo = Repo::open_or_init(repo_dir.path()).expect("init test repo");
 
         Self {
@@ -82,10 +82,7 @@ impl E2eContext {
 
     /// Standard attribution for e2e writes.
     pub fn attribution(&self, reason: &str) -> pimsteward::write::audit::Attribution {
-        pimsteward::write::audit::Attribution::new(
-            "e2e-test",
-            Some(reason.to_string()),
-        )
+        pimsteward::write::audit::Attribution::new("e2e-test", Some(reason.to_string()))
     }
 }
 
