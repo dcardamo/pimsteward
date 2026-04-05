@@ -9,11 +9,22 @@ use crate::store::Repo;
 use crate::write::audit::Attribution;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler,
+    model::{ErrorCode, ServerCapabilities, ServerInfo},
+    schemars, tool, tool_router, ErrorData as McpError, ServerHandler,
 };
 use std::process::Command;
 use std::sync::Arc;
+
+/// JSON-RPC server-specific error code (the -32000..-32099 band is reserved
+/// for application-defined errors by the JSON-RPC 2.0 spec). We use -32001
+/// for "permission denied" so the LLM can distinguish a policy refusal from
+/// a bad-params error (which would otherwise tempt it to retry with
+/// different arguments).
+pub const PERMISSION_DENIED_CODE: ErrorCode = ErrorCode(-32001);
+
+fn perm_denied(msg: impl Into<std::borrow::Cow<'static, str>>) -> McpError {
+    McpError::new(PERMISSION_DENIED_CODE, msg, None)
+}
 
 /// Shared state held by every tool handler.
 #[derive(Clone)]
@@ -27,6 +38,11 @@ struct Inner {
     repo: Repo,
     permissions: Permissions,
     alias: String,
+    /// Default caller name attributed to writes initiated through this
+    /// server. Set from `PIMSTEWARD_CALLER` (or `config.mcp.caller`) at
+    /// startup; defaults to `"ai"` when unset. Lets operators distinguish
+    /// multiple assistants talking to the same backup repo in `git log`.
+    caller: String,
     /// Mail read source for post-write refresh. Matches the daemon's read
     /// source so IDs stay consistent.
     mail_source: Arc<dyn MailSource>,
@@ -48,6 +64,7 @@ impl PimstewardServer {
         repo: Repo,
         permissions: Permissions,
         alias: String,
+        caller: String,
         mail_source: Arc<dyn MailSource>,
         mail_writer: Arc<dyn MailWriter>,
     ) -> Self {
@@ -57,6 +74,7 @@ impl PimstewardServer {
                 repo,
                 permissions,
                 alias,
+                caller,
                 mail_source,
                 mail_writer,
             }),
@@ -68,14 +86,14 @@ impl PimstewardServer {
         self.inner
             .permissions
             .check_read(resource)
-            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+            .map_err(|e| perm_denied(format!("permission denied: {e}")))
     }
 
     fn check_write(&self, resource: Resource) -> Result<(), McpError> {
         self.inner
             .permissions
             .check_write(resource)
-            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+            .map_err(|e| perm_denied(format!("permission denied: {e}")))
     }
 
     /// Scoped read check — per-folder for email, per-calendar for calendar.
@@ -85,7 +103,7 @@ impl PimstewardServer {
         self.inner
             .permissions
             .check_read_scoped(&scope)
-            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+            .map_err(|e| perm_denied(format!("permission denied: {e}")))
     }
 
     /// Scoped write check.
@@ -93,7 +111,7 @@ impl PimstewardServer {
         self.inner
             .permissions
             .check_write_scoped(&scope)
-            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+            .map_err(|e| perm_denied(format!("permission denied: {e}")))
     }
 
     /// Gate an outgoing SMTP send. Deliberately separate from
@@ -103,7 +121,7 @@ impl PimstewardServer {
         self.inner
             .permissions
             .check_email_send()
-            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+            .map_err(|e| perm_denied(format!("permission denied: {e}")))
     }
 
     /// Look up a message's current folder and source-specific id from
@@ -164,7 +182,10 @@ impl PimstewardServer {
     }
 
     fn attribution(&self, caller: Option<String>, reason: Option<String>) -> Attribution {
-        Attribution::new(caller.unwrap_or_else(|| "ai".into()), reason)
+        Attribution::new(
+            caller.unwrap_or_else(|| self.inner.caller.clone()),
+            reason,
+        )
     }
 }
 
@@ -203,6 +224,16 @@ pub struct SearchEmailParams {
 pub struct EmptyParams {}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListEventsParams {
+    /// Optional calendar id to restrict the listing to. If omitted,
+    /// events from all calendars the caller can read are returned; any
+    /// events belonging to a calendar the caller does NOT have read
+    /// access to are filtered out (rather than failing the whole call).
+    #[serde(default)]
+    pub calendar_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct HistoryParams {
     /// Path within the backup tree, e.g.
     /// `sources/forwardemail/dan-hld.ca/calendars/` or
@@ -239,8 +270,21 @@ pub struct ContactEmail {
 pub struct UpdateContactParams {
     /// Forwardemail contact id.
     pub id: String,
-    /// New full name.
-    pub full_name: String,
+    /// New full name. Required when `vcard` is omitted. When `vcard` is
+    /// provided, `full_name` is optional and extracted from the card's
+    /// `FN:` line.
+    #[serde(default)]
+    pub full_name: Option<String>,
+    /// Optional full vCard (3.0 or 4.0) replacement. Pass this to update
+    /// structured fields that `full_name` can't express: emails, phones,
+    /// addresses, org, notes, etc. Forwardemail parses the card
+    /// server-side and rewrites the contact from it. If both `full_name`
+    /// and `vcard` are supplied the vCard wins; the `full_name` field is
+    /// ignored (the FN line in the card is authoritative). Read the
+    /// current card via `list_contacts`, edit the fields you want to
+    /// change, and pass the result back.
+    #[serde(default)]
+    pub vcard: Option<String>,
     /// Optional etag from a previous get_contact call. If provided and
     /// stale, the update will fail with 412 Precondition Failed — use this
     /// to prevent clobbering concurrent edits.
@@ -338,12 +382,12 @@ pub struct SendEmailParams {
     /// HTML body. Optional.
     #[serde(default)]
     pub html: Option<String>,
-    /// Free-text reason explaining *why* this message is being sent. This
-    /// is required-by-convention (not schema): send is an irreversible
-    /// outbound action and the reason lands in the git audit trail so you
-    /// can reconstruct the intent later. Set it.
-    #[serde(default)]
-    pub reason: Option<String>,
+    /// REQUIRED. Free-text reason explaining *why* this message is being
+    /// sent. Send is an irreversible outbound action — the reason lands
+    /// in the git audit trail so you (or a reviewer) can reconstruct the
+    /// intent later. Must be non-empty; the server refuses the call
+    /// otherwise.
+    pub reason: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -377,13 +421,39 @@ pub struct DeleteMessageParams {
 pub struct CreateEventParams {
     /// Calendar id (from list_calendars).
     pub calendar_id: String,
-    /// Full iCalendar text, e.g.
-    /// "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//foo//bar\nBEGIN:VEVENT\n
-    ///  UID:abc@example\nDTSTAMP:20260101T000000Z\nSUMMARY:Lunch
-    ///  DTSTART:20260115T120000Z\nDTEND:20260115T130000Z\n
-    ///  END:VEVENT\nEND:VCALENDAR".
-    /// Forwardemail parses and normalizes the ics server-side.
-    pub ical: String,
+    /// Event title / SUMMARY. Usually the only field the user phrases
+    /// directly ("book lunch with Sam").
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Start timestamp. Accepts either an RFC 3339 / ISO-8601 instant
+    /// (`2026-01-15T12:00:00Z`, `2026-01-15T08:00:00-04:00`) for a
+    /// timed event, or a bare `YYYY-MM-DD` for an all-day event.
+    /// Required unless you pass a raw `ical` override.
+    #[serde(default)]
+    pub start: Option<String>,
+    /// End timestamp. Same format as `start`. For timed events: exclusive
+    /// end instant. For all-day events: the DTEND date (exclusive — per
+    /// RFC 5545 an all-day event ending on the same day as its start
+    /// needs DTEND = start + 1 day).
+    #[serde(default)]
+    pub end: Option<String>,
+    /// Optional description / notes. Free-text, multi-line OK.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Optional location string ("Conference room B", a URL, an address).
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Optional attendee email addresses. Each becomes an ATTENDEE line
+    /// in the VEVENT.
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    /// Power-user override: if you'd rather hand-craft the iCalendar text
+    /// (e.g. to set RRULE, VALARM, or other properties the structured
+    /// fields don't expose), pass the full VCALENDAR/VEVENT block here
+    /// and every structured field above is ignored. Forwardemail
+    /// normalizes the ics server-side.
+    #[serde(default)]
+    pub ical: Option<String>,
     /// Optional client-provided event id. Forwardemail generates one if not
     /// provided. Useful for ensuring idempotence across retries.
     #[serde(default)]
@@ -481,10 +551,15 @@ pub struct RestoreCalendarApplyParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestoreMailDryRunParams {
-    /// Folder path, e.g. "INBOX" or "Sent Mail".
+    /// Folder path, e.g. "INBOX" or "Sent Mail". This should be the
+    /// folder the message lived in AT `at_sha` (its historical home),
+    /// not necessarily its current folder.
     pub folder: String,
-    /// Forwardemail message id.
-    pub message_id: String,
+    /// Message id — accepts either a canonical id (16-char hex filename
+    /// stem, as returned by `search_email` / `get_email` / `history`) OR
+    /// the forwardemail source id. The plan computation resolves both.
+    /// Use the same id you'd pass to `get_email`.
+    pub id: String,
     /// Git commit SHA to restore from.
     pub at_sha: String,
 }
@@ -603,38 +678,26 @@ impl PimstewardServer {
         // the full raw bytes.
         if let Ok(raw) = std::fs::read(&eml_path) {
             if let Ok(text) = std::str::from_utf8(&raw) {
-                let mut headers = serde_json::Map::new();
-                for line in text.lines() {
-                    if line.is_empty() {
-                        break; // end of headers
-                    }
-                    if let Some((key, val)) = line.split_once(':') {
-                        let k = key.trim().to_lowercase();
-                        if matches!(
-                            k.as_str(),
-                            "from" | "to" | "cc" | "subject" | "date" | "message-id" | "in-reply-to" | "references"
-                        ) {
-                            headers.insert(k, serde_json::Value::String(val.trim().to_string()));
-                        }
-                    }
-                }
-                obj.insert("headers".into(), serde_json::Value::Object(headers));
+                let (headers_map, content_type) = parse_headers(text);
+                obj.insert("headers".into(), serde_json::Value::Object(headers_map));
 
-                // Extract plain-text body (everything after the blank line
-                // separating headers from body). For MIME messages this is
-                // a simplification — the full .eml is available via
-                // include_raw for proper MIME parsing.
-                if let Some(body_start) = text.find("\r\n\r\n").or_else(|| text.find("\n\n")) {
-                    let offset = if text[body_start..].starts_with("\r\n\r\n") { 4 } else { 2 };
-                    let body = &text[body_start + offset..];
-                    // Truncate to ~4k chars to avoid blowing up the MCP response.
-                    let truncated = if body.len() > 4096 {
-                        format!("{}…[truncated, {} bytes total]", &body[..4096], body.len())
-                    } else {
-                        body.to_string()
-                    };
-                    obj.insert("body_preview".into(), serde_json::Value::String(truncated));
-                }
+                // Extract the best plain-text preview we can. For
+                // multipart/alternative (the common HTML-first layout) we
+                // pick the first text/plain part; if absent, fall back to
+                // stripping tags from the first text/html part. For
+                // single-part bodies we return the body verbatim. Full
+                // MIME parsing is deferred to the caller via include_raw.
+                let body_text = extract_body_preview(text, content_type.as_deref());
+                let truncated = if body_text.len() > 4096 {
+                    format!(
+                        "{}…[truncated, {} bytes total]",
+                        &body_text[..4096.min(body_text.len())],
+                        body_text.len()
+                    )
+                } else {
+                    body_text
+                };
+                obj.insert("body_preview".into(), serde_json::Value::String(truncated));
 
                 if p.include_raw {
                     use base64::Engine;
@@ -682,17 +745,55 @@ impl PimstewardServer {
 
     #[tool(
         name = "list_events",
-        description = "List calendar events. Returns event JSON including the raw iCalendar content in the `content` field."
+        description = "List calendar events. Pass `calendar_id` to restrict to one calendar (checked against scoped per-calendar permissions). With no `calendar_id`, events are returned for every calendar the caller has read access to — events in calendars you can't read are filtered out silently rather than failing the call. Returns event JSON including the raw iCalendar text."
     )]
-    async fn list_events(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
-        self.check(Resource::Calendar)?;
+    async fn list_events(
+        &self,
+        Parameters(p): Parameters<ListEventsParams>,
+    ) -> Result<String, McpError> {
+        // Scoped path: caller asked for one calendar. Gate that specific
+        // calendar id and pass it through to forwardemail as a filter.
+        if let Some(ref cal_id) = p.calendar_id {
+            self.check_scoped(Scope::Calendar {
+                calendar_id: Some(cal_id),
+            })?;
+            let events = self
+                .inner
+                .client
+                .list_calendar_events(Some(cal_id))
+                .await
+                .map_err(|e| self.api_error(e))?;
+            return serde_json::to_string_pretty(&events)
+                .map_err(|e| McpError::internal_error(e.to_string(), None));
+        }
+
+        // Unscoped path: the caller wants everything they can see. We need
+        // at least one readable calendar — default OR an override. If
+        // nothing is readable, refuse. If *something* is readable, fetch
+        // the full list and filter in-memory to the allowed set.
+        if !self.inner.permissions.has_any_read(Resource::Calendar) {
+            return Err(perm_denied(
+                "permission denied: calendar read access not granted in any scope",
+            ));
+        }
         let events = self
             .inner
             .client
             .list_calendar_events(None)
             .await
             .map_err(|e| self.api_error(e))?;
-        serde_json::to_string_pretty(&events)
+        let filtered: Vec<_> = events
+            .into_iter()
+            .filter(|ev| {
+                self.inner
+                    .permissions
+                    .check_read_scoped(&Scope::Calendar {
+                        calendar_id: ev.calendar_id.as_deref(),
+                    })
+                    .is_ok()
+            })
+            .collect();
+        serde_json::to_string_pretty(&filtered)
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
@@ -761,7 +862,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "update_contact",
-        description = "Update a contact's full_name. If `if_match` is provided, forwardemail uses it for optimistic concurrency — stale etags return 412. Requires readwrite permission."
+        description = "Update a contact. Two modes:\n\n• **Name only.** Pass `full_name` to rename. This is the quick path for fixing typos — it does not touch emails, phones, or any other field.\n\n• **Full vCard replacement.** Pass `vcard` with a complete vCard 3.0/4.0 card to update structured fields like emails, phones, addresses, org, or notes. Read the current card via `list_contacts`, edit it, and pass it back. Forwardemail parses the card server-side. If both `full_name` and `vcard` are supplied, the vCard's FN line wins.\n\n`if_match` carries an etag for optimistic concurrency — stale etags return 412. Requires readwrite permission."
     )]
     async fn update_contact(
         &self,
@@ -769,17 +870,37 @@ impl PimstewardServer {
     ) -> Result<String, McpError> {
         self.check_write(Resource::Contacts)?;
         let attr = self.attribution(None, p.reason);
-        let updated = crate::write::contacts::update_contact_name(
-            &self.inner.client,
-            &self.inner.repo,
-            &self.inner.alias,
-            &attr,
-            &p.id,
-            &p.full_name,
-            p.if_match.as_deref(),
-        )
-        .await
-        .map_err(|e| self.api_error(e))?;
+        let updated = if let Some(vcard) = p.vcard.as_deref() {
+            crate::write::contacts::update_contact_vcard(
+                &self.inner.client,
+                &self.inner.repo,
+                &self.inner.alias,
+                &attr,
+                &p.id,
+                vcard,
+                p.if_match.as_deref(),
+            )
+            .await
+            .map_err(|e| self.api_error(e))?
+        } else {
+            let full_name = p.full_name.as_deref().ok_or_else(|| {
+                McpError::invalid_params(
+                    "update_contact: either `full_name` or `vcard` must be provided",
+                    None,
+                )
+            })?;
+            crate::write::contacts::update_contact_name(
+                &self.inner.client,
+                &self.inner.repo,
+                &self.inner.alias,
+                &attr,
+                &p.id,
+                full_name,
+                p.if_match.as_deref(),
+            )
+            .await
+            .map_err(|e| self.api_error(e))?
+        };
         serde_json::to_string_pretty(&updated)
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
@@ -950,8 +1071,14 @@ impl PimstewardServer {
                 None,
             ));
         }
+        if p.reason.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "send_email: `reason` is required and must not be empty — it lands in the git audit trail as the justification for this irreversible send",
+                None,
+            ));
+        }
 
-        let attr = self.attribution(None, p.reason);
+        let attr = self.attribution(None, Some(p.reason));
         let msg = crate::forwardemail::writes::NewMessage {
             // `folder` is unused by the send path — forwardemail writes
             // to Sent automatically — but the NewMessage struct is shared
@@ -1083,7 +1210,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "create_event",
-        description = "Create a calendar event. Requires `ical` — the full iCalendar text including BEGIN:VCALENDAR and a VEVENT. Forwardemail normalizes the ics server-side. Requires readwrite on calendar."
+        description = "Create a calendar event. Two modes:\n\n• **Structured (recommended).** Pass `summary`, `start`, `end`, and optionally `description`/`location`/`attendees`. Times are RFC 3339 (`2026-01-15T12:00:00Z` or with offset) for timed events, or bare `YYYY-MM-DD` for all-day. The server builds a well-formed VEVENT for you — no iCal hand-crafting.\n\n• **Raw iCal (power-user).** Pass `ical` with a complete VCALENDAR/VEVENT block to control RRULE, VALARM, or properties the structured fields don't expose. Any structured fields are ignored in this mode.\n\nRequires readwrite on the target calendar (per-calendar scoped permissions are honored)."
     )]
     async fn create_event(
         &self,
@@ -1093,6 +1220,36 @@ impl PimstewardServer {
         self.check_write_scoped(Scope::Calendar {
             calendar_id: Some(&p.calendar_id),
         })?;
+
+        // Assemble the iCal payload. Prefer the raw override when present;
+        // otherwise build one from the structured fields.
+        let ical = if let Some(raw) = p.ical.as_deref() {
+            raw.to_string()
+        } else {
+            let summary = p.summary.as_deref().ok_or_else(|| {
+                McpError::invalid_params(
+                    "create_event: provide `summary`+`start`+`end` (structured) or `ical` (raw)",
+                    None,
+                )
+            })?;
+            let start = p.start.as_deref().ok_or_else(|| {
+                McpError::invalid_params("create_event: `start` is required in structured mode", None)
+            })?;
+            let end = p.end.as_deref().ok_or_else(|| {
+                McpError::invalid_params("create_event: `end` is required in structured mode", None)
+            })?;
+            build_ical_event(
+                summary,
+                start,
+                end,
+                p.description.as_deref(),
+                p.location.as_deref(),
+                &p.attendees,
+                p.event_id.as_deref(),
+            )
+            .map_err(|e| McpError::invalid_params(format!("create_event: {e}"), None))?
+        };
+
         let attr = self.attribution(None, p.reason);
         let created = crate::write::calendar::create_event(
             &self.inner.client,
@@ -1100,7 +1257,7 @@ impl PimstewardServer {
             &self.inner.alias,
             &attr,
             &p.calendar_id,
-            &p.ical,
+            &ical,
             p.event_id.as_deref(),
         )
         .await
@@ -1180,7 +1337,11 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<RestoreContactDryRunParams>,
     ) -> Result<String, McpError> {
-        self.check_write(Resource::Contacts)?;
+        // Dry-run only reads history and the live state — no mutation.
+        // Gate on read so callers can preview what a restore *would* do
+        // before deciding whether to grant write. The matching apply tool
+        // still enforces write.
+        self.check(Resource::Contacts)?;
         let (plan, token) = crate::restore::plan_contact(
             &self.inner.client,
             &self.inner.repo,
@@ -1201,7 +1362,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "restore_contact_apply",
-        description = "Execute a restore plan returned by restore_contact_dry_run. Re-computes plan_token from the submitted plan and refuses to proceed if it doesn't match the supplied token — this prevents dry-running one plan and applying a different one."
+        description = "Execute a restore plan returned by restore_contact_dry_run. Re-computes plan_token from the submitted plan and refuses to proceed if it doesn't match the supplied token — this prevents dry-running one plan and applying a different one.\n\n⚠️ **Pass the `plan` object through VERBATIM.** Do not reformat, pretty-print, re-serialize, reorder keys, drop fields you think are redundant, or 'clean it up'. Any modification — including whitespace changes on structured sub-values — invalidates the plan_token and the apply will be refused. Copy the exact JSON value returned by the dry-run."
     )]
     async fn restore_contact_apply(
         &self,
@@ -1239,7 +1400,8 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<RestoreSieveDryRunParams>,
     ) -> Result<String, McpError> {
-        self.check_write(Resource::Sieve)?;
+        // Read-only preview; apply enforces write.
+        self.check(Resource::Sieve)?;
         let (plan, token) = crate::restore::sieve::plan_sieve(
             &self.inner.client,
             &self.inner.repo,
@@ -1256,7 +1418,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "restore_sieve_apply",
-        description = "Execute a sieve restore plan. Re-computes plan_token and refuses on mismatch."
+        description = "Execute a sieve restore plan. Re-computes plan_token and refuses on mismatch.\n\n⚠️ **Pass the `plan` object through VERBATIM** — do not reformat, re-serialize, or 'clean up' the JSON returned by the dry-run. Any modification invalidates the plan_token."
     )]
     async fn restore_sieve_apply(
         &self,
@@ -1291,7 +1453,11 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<RestoreCalendarDryRunParams>,
     ) -> Result<String, McpError> {
-        self.check_write(Resource::Calendar)?;
+        // Read-only preview scoped to the specific calendar id in the
+        // plan params; apply enforces write.
+        self.check_scoped(Scope::Calendar {
+            calendar_id: Some(&p.calendar_id),
+        })?;
         let (plan, token) = crate::restore::calendar::plan_calendar(
             &self.inner.client,
             &self.inner.repo,
@@ -1309,7 +1475,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "restore_calendar_event_apply",
-        description = "Execute a calendar event restore plan."
+        description = "Execute a calendar event restore plan.\n\n⚠️ **Pass the `plan` object through VERBATIM** — do not reformat, re-serialize, or 'clean up' the JSON returned by the dry-run. Any modification invalidates the plan_token."
     )]
     async fn restore_calendar_event_apply(
         &self,
@@ -1347,9 +1513,10 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<RestoreMailDryRunParams>,
     ) -> Result<String, McpError> {
-        // Scoped to the folder named in the plan params — restore is a
-        // write against that folder (flags and/or folder movement).
-        self.check_write_scoped(Scope::Email {
+        // Dry-run: read-only preview of the folder the caller is asking
+        // about. Apply enforces write on both the historical folder and
+        // any cross-folder destination.
+        self.check_scoped(Scope::Email {
             folder: Some(&p.folder),
         })?;
         let (plan, token) = crate::restore::mail::plan_mail(
@@ -1357,7 +1524,7 @@ impl PimstewardServer {
             &self.inner.repo,
             &self.inner.alias,
             &p.folder,
-            &p.message_id,
+            &p.id,
             &p.at_sha,
         )
         .await
@@ -1369,7 +1536,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "restore_mail_apply",
-        description = "Execute a mail restore plan (flags or folder only)."
+        description = "Execute a mail restore plan (flags, folder, or re-append).\n\n⚠️ **Pass the `plan` object through VERBATIM** — do not reformat, re-serialize, or 'clean up' the JSON returned by the dry-run. The plan may carry a `raw_bytes` array for the re-append case; that array binds the plan_token to the exact bytes being restored, so dropping or reordering it will invalidate the token."
     )]
     async fn restore_mail_apply(
         &self,
@@ -1455,7 +1622,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "restore_path_apply",
-        description = "Execute a bulk restore plan. Re-verifies the bulk plan_token AND each sub-plan's individual token before executing. Continues past individual sub-plan failures and returns a summary of what succeeded and what failed."
+        description = "Execute a bulk restore plan. Re-verifies the bulk plan_token AND each sub-plan's individual token before executing. Continues past individual sub-plan failures and returns a summary of what succeeded and what failed.\n\n⚠️ **Pass the `plan` object through VERBATIM** — every sub-plan inside also carries its own token, and any whitespace or ordering change anywhere in the tree invalidates one of them."
     )]
     async fn restore_path_apply(
         &self,
@@ -1497,7 +1664,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "history",
-        description = "Git log for a path in the pimsteward backup tree. Shows commits that touched the file or directory, newest first. Use this to see who changed what and when, including AI-attributed mutations."
+        description = "Git log for a path in the pimsteward backup tree. Shows commits that touched the file or directory, newest first. Returns a JSON array of objects with `sha`, `author`, `date` (ISO-8601), and `subject`. Use this to see who changed what and when, including AI-attributed mutations — `author` distinguishes `pimsteward-pull` (reconciliation), caller names like `ai` (AI writes), and any human callers."
     )]
     async fn history(&self, Parameters(p): Parameters<HistoryParams>) -> Result<String, McpError> {
         let limit = p.limit.unwrap_or(20).clamp(1, 200);
@@ -1528,25 +1695,459 @@ impl PimstewardServer {
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        Ok(stdout)
+        // Parse the tab-separated output into structured commits so the
+        // caller (often an LLM) doesn't have to re-parse strings.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let commits: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut parts = line.splitn(4, '\t');
+                let sha = parts.next().unwrap_or("");
+                let author = parts.next().unwrap_or("");
+                let date = parts.next().unwrap_or("");
+                let subject = parts.next().unwrap_or("");
+                serde_json::json!({
+                    "sha": sha,
+                    "author": author,
+                    "date": date,
+                    "subject": subject,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&commits)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 }
 
-#[tool_handler(router = self.tool_router)]
+/// Visibility rule for a tool — what the caller's permission state must
+/// satisfy for the tool to appear in `list_tools` and dispatch in
+/// `call_tool`. Checked at *any-scope* granularity (a per-folder override
+/// granting write is enough to expose a resource-level write tool); the
+/// per-call scoped checks inside each tool handler still enforce the fine
+/// grain.
+#[derive(Debug, Clone, Copy)]
+enum ToolReq {
+    /// Any scope of the resource grants read.
+    Read(Resource),
+    /// Any scope of the resource grants write.
+    Write(Resource),
+    /// The dedicated `email_send` permission is allowed.
+    EmailSend,
+    /// Always visible (audit/history tools).
+    Always,
+}
+
+impl ToolReq {
+    fn is_satisfied(self, perms: &Permissions) -> bool {
+        match self {
+            Self::Read(r) => perms.has_any_read(r),
+            Self::Write(r) => perms.has_any_write(r),
+            Self::EmailSend => perms.email_send.is_allowed(),
+            Self::Always => true,
+        }
+    }
+}
+
+/// Static map of tool names to their visibility requirement. Any tool
+/// whose resource is fully denied in the current permission matrix is
+/// hidden from `list_tools` and rejected up-front in `call_tool` — the
+/// model never even learns the tool exists, which matches the threat
+/// model described in the README.
+const TOOL_REQS: &[(&str, ToolReq)] = &[
+    // Email reads
+    ("search_email", ToolReq::Read(Resource::Email)),
+    ("get_email", ToolReq::Read(Resource::Email)),
+    ("list_folders", ToolReq::Read(Resource::Email)),
+    // Email writes
+    ("create_draft", ToolReq::Write(Resource::Email)),
+    ("update_email_flags", ToolReq::Write(Resource::Email)),
+    ("move_email", ToolReq::Write(Resource::Email)),
+    ("delete_email", ToolReq::Write(Resource::Email)),
+    // Email send (its own permission)
+    ("send_email", ToolReq::EmailSend),
+    // Calendar reads
+    ("list_calendars", ToolReq::Read(Resource::Calendar)),
+    ("list_events", ToolReq::Read(Resource::Calendar)),
+    // Calendar writes
+    ("create_event", ToolReq::Write(Resource::Calendar)),
+    ("update_event", ToolReq::Write(Resource::Calendar)),
+    ("delete_event", ToolReq::Write(Resource::Calendar)),
+    // Contacts
+    ("list_contacts", ToolReq::Read(Resource::Contacts)),
+    ("create_contact", ToolReq::Write(Resource::Contacts)),
+    ("update_contact", ToolReq::Write(Resource::Contacts)),
+    ("delete_contact", ToolReq::Write(Resource::Contacts)),
+    // Sieve
+    ("list_sieve", ToolReq::Read(Resource::Sieve)),
+    ("install_sieve_script", ToolReq::Write(Resource::Sieve)),
+    ("update_sieve_script", ToolReq::Write(Resource::Sieve)),
+    ("delete_sieve_script", ToolReq::Write(Resource::Sieve)),
+    // Restore — dry-runs require READ, applies require WRITE. Bulk
+    // restore touches three resources, so we expose it whenever any of
+    // them is writable; the handler re-checks each resource per-op.
+    ("restore_contact_dry_run", ToolReq::Read(Resource::Contacts)),
+    ("restore_contact_apply", ToolReq::Write(Resource::Contacts)),
+    ("restore_sieve_dry_run", ToolReq::Read(Resource::Sieve)),
+    ("restore_sieve_apply", ToolReq::Write(Resource::Sieve)),
+    ("restore_calendar_event_dry_run", ToolReq::Read(Resource::Calendar)),
+    ("restore_calendar_event_apply", ToolReq::Write(Resource::Calendar)),
+    ("restore_mail_dry_run", ToolReq::Read(Resource::Email)),
+    ("restore_mail_apply", ToolReq::Write(Resource::Email)),
+    ("restore_path_dry_run", ToolReq::Read(Resource::Contacts)),
+    ("restore_path_apply", ToolReq::Write(Resource::Contacts)),
+    // Always-available audit tools.
+    ("history", ToolReq::Always),
+];
+
+impl PimstewardServer {
+    /// Return true if `tool_name` is exposed in the current permission
+    /// configuration. Used by both `list_tools` (to filter) and
+    /// `call_tool` (to refuse hidden tools with a proper error).
+    fn tool_visible(&self, tool_name: &str) -> bool {
+        TOOL_REQS
+            .iter()
+            .find(|(n, _)| *n == tool_name)
+            .map(|(_, req)| req.is_satisfied(&self.inner.permissions))
+            // Unknown tool name: fail closed. If the code ever grows a
+            // tool without an entry in TOOL_REQS, it'll be hidden until
+            // the map is updated — safer than silently granting access.
+            .unwrap_or(false)
+    }
+}
+
 impl ServerHandler for PimstewardServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        // Refuse up-front if the tool is hidden by the current permission
+        // configuration. Use METHOD_NOT_FOUND so the caller sees the same
+        // shape they'd see if the tool truly didn't exist — which, from
+        // their point of view, it doesn't.
+        if !self.tool_visible(&request.name) {
+            return Err(McpError::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("tool not available: {}", request.name),
+                None,
+            ));
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        // Filter the static tool list against the current permission
+        // configuration. Resources that are fully denied (e.g.
+        // `email = "none"`) disappear entirely — the model doesn't see
+        // their tool names, schemas, or descriptions.
+        let tools = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .filter(|t| self.tool_visible(&t.name))
+            .collect();
+        Ok(rmcp::model::ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        if !self.tool_visible(name) {
+            return None;
+        }
+        self.tool_router.get(name).cloned()
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             format!(
                 "pimsteward — permission-aware PIM mediator for forwardemail.net.\n\
                  Alias: {}\n\
+                 Caller attribution: {}\n\n\
                  Read, write, and restore tools for email, calendar, contacts, \
                  and sieve scripts, gated by the configured permission matrix. \
-                 Every mutation produces an attributed git commit in the backup repo.",
-                self.inner.alias
+                 Every mutation produces an attributed git commit in the backup repo.\n\n\
+                 UNDO: almost every mutation is reversible. Each resource has a \
+                 `restore_*_dry_run` tool that computes what a rollback would do \
+                 (returning a plan + plan_token) and a matching `restore_*_apply` \
+                 tool that re-verifies the token before executing. Use these \
+                 whenever the user asks you to undo a change. The one exception \
+                 is `send_email` — once forwardemail has accepted the message \
+                 for delivery, there is no rewind, only an audit trailer.\n\n\
+                 AUDIT: the `history` tool is `git log` for any path under the \
+                 backup tree, returning structured commits so you can see who \
+                 changed what. Tools whose resource is denied in the current \
+                 permission configuration are hidden from this list entirely.",
+                self.inner.alias, self.inner.caller
             ),
         )
     }
+}
+
+/// Build a minimal, RFC 5545-conformant VCALENDAR/VEVENT from structured
+/// fields. Handles two common cases:
+///
+/// - All-day events: `start` and `end` are bare `YYYY-MM-DD` dates → emits
+///   `DTSTART;VALUE=DATE:YYYYMMDD` / `DTEND;VALUE=DATE:YYYYMMDD` (DTEND
+///   exclusive per RFC 5545).
+/// - Timed events: `start` and `end` are RFC 3339 instants → emits
+///   `DTSTART:YYYYMMDDTHHMMSSZ` in UTC. Offsets are normalized to Z.
+///
+/// Returns a Result with a human-readable error on malformed input so the
+/// MCP layer can surface it back to the caller as an `invalid_params`.
+fn build_ical_event(
+    summary: &str,
+    start: &str,
+    end: &str,
+    description: Option<&str>,
+    location: Option<&str>,
+    attendees: &[String],
+    event_id: Option<&str>,
+) -> Result<String, String> {
+    use chrono::{DateTime, NaiveDate, Utc};
+
+    // Escape per RFC 5545 §3.3.11: backslash-escape backslash, semicolon,
+    // comma, and fold newlines to \n.
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace(';', "\\;")
+            .replace(',', "\\,")
+            .replace('\r', "")
+            .replace('\n', "\\n")
+    }
+
+    let (dtstart, dtend) = if start.len() == 10 && start.as_bytes()[4] == b'-' {
+        // Date-only all-day event.
+        let s = NaiveDate::parse_from_str(start, "%Y-%m-%d")
+            .map_err(|e| format!("start: invalid YYYY-MM-DD: {e}"))?;
+        let e = NaiveDate::parse_from_str(end, "%Y-%m-%d")
+            .map_err(|e| format!("end: invalid YYYY-MM-DD: {e}"))?;
+        (
+            format!("DTSTART;VALUE=DATE:{}", s.format("%Y%m%d")),
+            format!("DTEND;VALUE=DATE:{}", e.format("%Y%m%d")),
+        )
+    } else {
+        // Timed event: parse RFC 3339 and normalize to UTC.
+        let s: DateTime<Utc> = DateTime::parse_from_rfc3339(start)
+            .map_err(|e| format!("start: invalid RFC 3339: {e}"))?
+            .with_timezone(&Utc);
+        let e: DateTime<Utc> = DateTime::parse_from_rfc3339(end)
+            .map_err(|e| format!("end: invalid RFC 3339: {e}"))?
+            .with_timezone(&Utc);
+        (
+            format!("DTSTART:{}", s.format("%Y%m%dT%H%M%SZ")),
+            format!("DTEND:{}", e.format("%Y%m%dT%H%M%SZ")),
+        )
+    };
+
+    let uid = match event_id {
+        Some(id) => id.to_string(),
+        // RFC 5545 requires a globally unique UID. Use current timestamp +
+        // a hash of summary+start for determinism within a request.
+        None => {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(summary.as_bytes());
+            h.update(start.as_bytes());
+            h.update(Utc::now().timestamp_nanos_opt().unwrap_or(0).to_le_bytes());
+            format!("{:x}@pimsteward", h.finalize())
+        }
+    };
+    let dtstamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+
+    let mut out = String::new();
+    out.push_str("BEGIN:VCALENDAR\r\n");
+    out.push_str("VERSION:2.0\r\n");
+    out.push_str("PRODID:-//pimsteward//create_event//EN\r\n");
+    out.push_str("BEGIN:VEVENT\r\n");
+    out.push_str(&format!("UID:{uid}\r\n"));
+    out.push_str(&format!("DTSTAMP:{dtstamp}\r\n"));
+    out.push_str(&format!("{dtstart}\r\n"));
+    out.push_str(&format!("{dtend}\r\n"));
+    out.push_str(&format!("SUMMARY:{}\r\n", esc(summary)));
+    if let Some(d) = description {
+        out.push_str(&format!("DESCRIPTION:{}\r\n", esc(d)));
+    }
+    if let Some(l) = location {
+        out.push_str(&format!("LOCATION:{}\r\n", esc(l)));
+    }
+    for a in attendees {
+        out.push_str(&format!("ATTENDEE:mailto:{}\r\n", esc(a)));
+    }
+    out.push_str("END:VEVENT\r\n");
+    out.push_str("END:VCALENDAR\r\n");
+    Ok(out)
+}
+
+/// Parse the header block of an RFC822 message. Returns (a map of the
+/// interesting display headers, the full `Content-Type` value if present
+/// — used downstream to find MIME boundaries).
+///
+/// Unfolds RFC 5322 continuation lines (leading whitespace on a line
+/// means "continuation of the previous header") so `Content-Type` values
+/// split across lines parse correctly.
+fn parse_headers(text: &str) -> (serde_json::Map<String, serde_json::Value>, Option<String>) {
+    let mut headers = serde_json::Map::new();
+    let mut content_type: Option<String> = None;
+    let mut current: Option<(String, String)> = None;
+
+    let end = text
+        .find("\r\n\r\n")
+        .or_else(|| text.find("\n\n"))
+        .unwrap_or(text.len());
+    let header_block = &text[..end];
+
+    let flush = |current: &mut Option<(String, String)>,
+                 headers: &mut serde_json::Map<String, serde_json::Value>,
+                 content_type: &mut Option<String>| {
+        if let Some((k, v)) = current.take() {
+            if k == "content-type" {
+                *content_type = Some(v.clone());
+            }
+            if matches!(
+                k.as_str(),
+                "from"
+                    | "to"
+                    | "cc"
+                    | "subject"
+                    | "date"
+                    | "message-id"
+                    | "in-reply-to"
+                    | "references"
+                    | "content-type"
+            ) {
+                headers.insert(k, serde_json::Value::String(v));
+            }
+        }
+    };
+
+    for line in header_block.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation of the previous header.
+            if let Some((_, ref mut v)) = current {
+                v.push(' ');
+                v.push_str(line.trim());
+            }
+            continue;
+        }
+        flush(&mut current, &mut headers, &mut content_type);
+        if let Some((key, val)) = line.split_once(':') {
+            current = Some((key.trim().to_lowercase(), val.trim().to_string()));
+        }
+    }
+    flush(&mut current, &mut headers, &mut content_type);
+    (headers, content_type)
+}
+
+/// Pull the best text preview we can out of an RFC822 body. Handles
+/// multipart/alternative by selecting the first text/plain part; if none
+/// exists, falls back to stripping tags out of the first text/html part.
+/// Single-part bodies are returned verbatim (after the header/body split).
+///
+/// This is a deliberately minimal MIME parser — it doesn't decode
+/// quoted-printable or base64 transfer encodings, and it doesn't recurse
+/// into nested multiparts. Callers who need full fidelity pass
+/// `include_raw: true` and parse the .eml themselves.
+fn extract_body_preview(text: &str, content_type: Option<&str>) -> String {
+    let body_start = match text.find("\r\n\r\n").map(|i| i + 4).or_else(|| text.find("\n\n").map(|i| i + 2)) {
+        Some(i) => i,
+        None => return String::new(),
+    };
+    let body = &text[body_start..];
+
+    // Only handle multipart/* here; everything else is treated as a
+    // single-part text body.
+    let ct = match content_type {
+        Some(s) => s.to_ascii_lowercase(),
+        None => return body.to_string(),
+    };
+    if !ct.starts_with("multipart/") {
+        return body.to_string();
+    }
+
+    // Extract boundary="..." (or boundary=... with no quotes).
+    let boundary = match ct.split(';').find_map(|kv| {
+        let kv = kv.trim();
+        kv.strip_prefix("boundary=").map(|b| b.trim_matches('"').to_string())
+    }) {
+        Some(b) if !b.is_empty() => b,
+        _ => return body.to_string(),
+    };
+    let delim = format!("--{boundary}");
+
+    // Walk the parts. For each one, read its own Content-Type and body.
+    // Prefer the first text/plain; remember the first text/html as a
+    // fallback.
+    let mut plain: Option<String> = None;
+    let mut html: Option<String> = None;
+    for part in body.split(&delim).skip(1) {
+        // Trim the leading CRLF that follows the boundary line, and stop
+        // at the closing "--" marker.
+        let part = part.trim_start_matches(['\r', '\n']);
+        if part.starts_with("--") {
+            break;
+        }
+        let (part_headers_end, offset) = match part
+            .find("\r\n\r\n")
+            .map(|i| (i, 4))
+            .or_else(|| part.find("\n\n").map(|i| (i, 2)))
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let part_headers = &part[..part_headers_end];
+        let part_body = part[part_headers_end + offset..]
+            .trim_end_matches(['\r', '\n', '-']);
+        let part_ct = part_headers
+            .lines()
+            .find_map(|l| {
+                let lower = l.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-type:")
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_default();
+        if part_ct.starts_with("text/plain") && plain.is_none() {
+            plain = Some(part_body.to_string());
+        } else if part_ct.starts_with("text/html") && html.is_none() {
+            html = Some(part_body.to_string());
+        }
+        if plain.is_some() {
+            break;
+        }
+    }
+    if let Some(p) = plain {
+        return p;
+    }
+    if let Some(h) = html {
+        return strip_tags(&h);
+    }
+    body.to_string()
+}
+
+/// Crude HTML-tag stripper used as a last-resort fallback when a message
+/// is html-only. Good enough for preview purposes; anything more serious
+/// should use include_raw and a real HTML parser.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Minimal URL component encoder for query string values. We intentionally
@@ -1565,4 +2166,289 @@ fn urlenc(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::permission::{
+        Access, CalendarPermission, EmailPermission, Permissions, ScopedCalendar, ScopedEmail,
+        SendPermission,
+    };
+    use std::collections::HashMap;
+
+    // ── Tool visibility filter ──────────────────────────────────────
+    //
+    // The README guarantees that a denied resource's tools are hidden
+    // entirely — not just gated at call time. These tests pin that
+    // behaviour so a later refactor of the permission model can't
+    // silently re-expose the tools.
+
+    fn perms_with(email: Access, calendar: Access, contacts: Access, sieve: Access) -> Permissions {
+        Permissions {
+            email: EmailPermission::Flat(email),
+            email_send: SendPermission::Denied,
+            calendar: CalendarPermission::Flat(calendar),
+            contacts,
+            sieve,
+        }
+    }
+
+    fn req_for(name: &str) -> ToolReq {
+        TOOL_REQS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| panic!("tool {name} not in TOOL_REQS — every tool must be registered"))
+    }
+
+    #[test]
+    fn every_known_tool_has_a_visibility_rule() {
+        for name in [
+            "search_email", "get_email", "list_folders",
+            "create_draft", "update_email_flags", "move_email", "delete_email", "send_email",
+            "list_calendars", "list_events",
+            "create_event", "update_event", "delete_event",
+            "list_contacts", "create_contact", "update_contact", "delete_contact",
+            "list_sieve", "install_sieve_script", "update_sieve_script", "delete_sieve_script",
+            "restore_contact_dry_run", "restore_contact_apply",
+            "restore_sieve_dry_run", "restore_sieve_apply",
+            "restore_calendar_event_dry_run", "restore_calendar_event_apply",
+            "restore_mail_dry_run", "restore_mail_apply",
+            "restore_path_dry_run", "restore_path_apply",
+            "history",
+        ] {
+            let _ = req_for(name);
+        }
+    }
+
+    #[test]
+    fn none_resource_hides_all_of_its_tools() {
+        let p = perms_with(Access::None, Access::ReadWrite, Access::ReadWrite, Access::ReadWrite);
+        // Email is none → every email tool must be hidden.
+        for t in ["search_email", "get_email", "list_folders", "create_draft",
+                  "update_email_flags", "move_email", "delete_email",
+                  "restore_mail_dry_run", "restore_mail_apply"] {
+            assert!(!req_for(t).is_satisfied(&p), "{t} should be hidden when email=none");
+        }
+        // Unrelated resources stay visible.
+        assert!(req_for("list_calendars").is_satisfied(&p));
+        assert!(req_for("list_contacts").is_satisfied(&p));
+        assert!(req_for("list_sieve").is_satisfied(&p));
+    }
+
+    #[test]
+    fn read_only_hides_write_tools_but_keeps_reads() {
+        let p = perms_with(Access::Read, Access::Read, Access::Read, Access::Read);
+        assert!(req_for("search_email").is_satisfied(&p));
+        assert!(req_for("list_events").is_satisfied(&p));
+        assert!(req_for("list_contacts").is_satisfied(&p));
+        assert!(!req_for("create_draft").is_satisfied(&p));
+        assert!(!req_for("create_event").is_satisfied(&p));
+        assert!(!req_for("create_contact").is_satisfied(&p));
+        // Dry-runs take read, so they should still be visible.
+        assert!(req_for("restore_contact_dry_run").is_satisfied(&p));
+        // Applies require write, so they should not.
+        assert!(!req_for("restore_contact_apply").is_satisfied(&p));
+    }
+
+    #[test]
+    fn any_scope_grant_exposes_the_tool() {
+        // Default=none, but one folder has read_write → email write
+        // tools should be exposed (the per-call scoped check still
+        // enforces the actual folder rule).
+        let mut folders = HashMap::new();
+        folders.insert("Drafts".to_string(), Access::ReadWrite);
+        let p = Permissions {
+            email: EmailPermission::Scoped(ScopedEmail {
+                default: Access::None,
+                folders,
+            }),
+            ..Permissions::default()
+        };
+        assert!(req_for("create_draft").is_satisfied(&p));
+        assert!(req_for("search_email").is_satisfied(&p));
+    }
+
+    #[test]
+    fn send_email_requires_its_own_permission_not_read_write() {
+        // read_write on email must NOT expose send_email — this is the
+        // invariant the whole `email_send` split exists to protect.
+        let p = Permissions {
+            email: EmailPermission::Flat(Access::ReadWrite),
+            ..Permissions::default()
+        };
+        assert!(!req_for("send_email").is_satisfied(&p));
+        let p = Permissions {
+            email_send: SendPermission::Allowed,
+            ..Permissions::default()
+        };
+        assert!(req_for("send_email").is_satisfied(&p));
+    }
+
+    #[test]
+    fn history_is_always_visible() {
+        let p = Permissions::default(); // everything denied
+        assert!(req_for("history").is_satisfied(&p));
+    }
+
+    #[test]
+    fn calendar_scoped_with_one_allowed_id_exposes_tools() {
+        // default=none with a single per-id read_write override — the
+        // calendar tools should appear and the per-tool scoped check
+        // enforces the specific id on each call.
+        let mut by_id = HashMap::new();
+        by_id.insert("cal-work".to_string(), Access::ReadWrite);
+        let p = Permissions {
+            calendar: CalendarPermission::Scoped(ScopedCalendar {
+                default: Access::None,
+                by_id,
+            }),
+            ..Permissions::default()
+        };
+        assert!(req_for("list_events").is_satisfied(&p));
+        assert!(req_for("create_event").is_satisfied(&p));
+        assert!(req_for("delete_event").is_satisfied(&p));
+    }
+
+    // ── build_ical_event ────────────────────────────────────────────
+
+    #[test]
+    fn ical_builder_timed_event_uses_utc_format() {
+        let ics = build_ical_event(
+            "Lunch",
+            "2026-01-15T12:00:00Z",
+            "2026-01-15T13:00:00Z",
+            None,
+            None,
+            &[],
+            Some("abc@example"),
+        )
+        .unwrap();
+        assert!(ics.contains("BEGIN:VCALENDAR"));
+        assert!(ics.contains("BEGIN:VEVENT"));
+        assert!(ics.contains("UID:abc@example"));
+        assert!(ics.contains("DTSTART:20260115T120000Z"));
+        assert!(ics.contains("DTEND:20260115T130000Z"));
+        assert!(ics.contains("SUMMARY:Lunch"));
+        assert!(ics.contains("END:VEVENT"));
+    }
+
+    #[test]
+    fn ical_builder_normalizes_offsets_to_utc() {
+        // 08:00 -04:00 == 12:00 Z. The builder normalizes everything to
+        // UTC so the stored DTSTART is unambiguous.
+        let ics = build_ical_event(
+            "Lunch",
+            "2026-01-15T08:00:00-04:00",
+            "2026-01-15T09:00:00-04:00",
+            None, None, &[], Some("u@x"),
+        ).unwrap();
+        assert!(ics.contains("DTSTART:20260115T120000Z"));
+        assert!(ics.contains("DTEND:20260115T130000Z"));
+    }
+
+    #[test]
+    fn ical_builder_all_day_event() {
+        let ics = build_ical_event(
+            "Holiday",
+            "2026-07-04",
+            "2026-07-05",
+            None, None, &[], Some("h@x"),
+        ).unwrap();
+        assert!(ics.contains("DTSTART;VALUE=DATE:20260704"));
+        assert!(ics.contains("DTEND;VALUE=DATE:20260705"));
+    }
+
+    #[test]
+    fn ical_builder_escapes_semicolons_and_commas_in_summary() {
+        let ics = build_ical_event(
+            "Meeting; with, Alice",
+            "2026-01-15T12:00:00Z",
+            "2026-01-15T13:00:00Z",
+            Some("multi\nline"),
+            None, &[], Some("m@x"),
+        ).unwrap();
+        assert!(ics.contains("SUMMARY:Meeting\\; with\\, Alice"));
+        assert!(ics.contains("DESCRIPTION:multi\\nline"));
+    }
+
+    #[test]
+    fn ical_builder_rejects_malformed_timestamps() {
+        let err = build_ical_event(
+            "x", "not-a-date", "2026-01-15T13:00:00Z",
+            None, None, &[], Some("e@x"),
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn ical_builder_emits_attendees() {
+        let ics = build_ical_event(
+            "Standup",
+            "2026-01-15T09:00:00Z",
+            "2026-01-15T09:15:00Z",
+            None, None,
+            &["alice@example.com".into(), "bob@example.com".into()],
+            Some("s@x"),
+        ).unwrap();
+        assert!(ics.contains("ATTENDEE:mailto:alice@example.com"));
+        assert!(ics.contains("ATTENDEE:mailto:bob@example.com"));
+    }
+
+    // ── MIME preview ───────────────────────────────────────────────
+
+    #[test]
+    fn extract_body_preview_single_part_plain_returns_body_verbatim() {
+        let msg = "Subject: hi\r\n\r\nhello there";
+        let out = extract_body_preview(msg, Some("text/plain"));
+        assert_eq!(out, "hello there");
+    }
+
+    #[test]
+    fn extract_body_preview_multipart_alternative_prefers_text_plain() {
+        let msg = concat!(
+            "Content-Type: multipart/alternative; boundary=\"abc\"\r\n\r\n",
+            "--abc\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<p>html version</p>\r\n",
+            "--abc\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n",
+            "plain version\r\n",
+            "--abc--\r\n",
+        );
+        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"abc\""));
+        assert!(out.contains("plain version"), "got: {out:?}");
+        assert!(!out.contains("<p>"), "should not contain html tags");
+    }
+
+    #[test]
+    fn extract_body_preview_html_only_strips_tags() {
+        let msg = concat!(
+            "Content-Type: multipart/alternative; boundary=\"xyz\"\r\n\r\n",
+            "--xyz\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<html><body><p>hello <b>world</b></p></body></html>\r\n",
+            "--xyz--\r\n",
+        );
+        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"xyz\""));
+        assert!(out.contains("hello"));
+        assert!(out.contains("world"));
+        assert!(!out.contains("<b>"));
+    }
+
+    #[test]
+    fn parse_headers_unfolds_continuation_lines() {
+        let msg = "Subject: a very long\r\n subject line\r\nFrom: alice@x\r\n\r\nbody";
+        let (hs, _) = parse_headers(msg);
+        assert_eq!(hs.get("subject").unwrap().as_str().unwrap(), "a very long subject line");
+        assert_eq!(hs.get("from").unwrap().as_str().unwrap(), "alice@x");
+    }
+
+    #[test]
+    fn parse_headers_extracts_content_type_for_mime_selection() {
+        let msg = "Content-Type: multipart/alternative; boundary=\"foo\"\r\n\r\n";
+        let (_, ct) = parse_headers(msg);
+        assert_eq!(ct.unwrap(), "multipart/alternative; boundary=\"foo\"");
+    }
 }

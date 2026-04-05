@@ -326,6 +326,52 @@ impl Permissions {
         }
     }
 
+    /// True if the caller has read access to this resource in *any* scope
+    /// — either the default grants it, or at least one per-folder /
+    /// per-calendar override does. Used by the MCP server to decide which
+    /// tools to expose at session start: if a resource is completely
+    /// unreachable, its tools are filtered out of `list_tools` entirely so
+    /// the model never even learns they exist.
+    pub fn has_any_read(&self, resource: Resource) -> bool {
+        match resource {
+            Resource::Email => match &self.email {
+                EmailPermission::Flat(a) => a.can_read(),
+                EmailPermission::Scoped(s) => {
+                    s.default.can_read() || s.folders.values().any(|a| a.can_read())
+                }
+            },
+            Resource::Calendar => match &self.calendar {
+                CalendarPermission::Flat(a) => a.can_read(),
+                CalendarPermission::Scoped(s) => {
+                    s.default.can_read() || s.by_id.values().any(|a| a.can_read())
+                }
+            },
+            Resource::Contacts => self.contacts.can_read(),
+            Resource::Sieve => self.sieve.can_read(),
+        }
+    }
+
+    /// True if the caller has write access to this resource in *any* scope.
+    /// See [`Self::has_any_read`].
+    pub fn has_any_write(&self, resource: Resource) -> bool {
+        match resource {
+            Resource::Email => match &self.email {
+                EmailPermission::Flat(a) => a.can_write(),
+                EmailPermission::Scoped(s) => {
+                    s.default.can_write() || s.folders.values().any(|a| a.can_write())
+                }
+            },
+            Resource::Calendar => match &self.calendar {
+                CalendarPermission::Flat(a) => a.can_write(),
+                CalendarPermission::Scoped(s) => {
+                    s.default.can_write() || s.by_id.values().any(|a| a.can_write())
+                }
+            },
+            Resource::Contacts => self.contacts.can_write(),
+            Resource::Sieve => self.sieve.can_write(),
+        }
+    }
+
     /// Gate a write with an optional scope override.
     pub fn check_write_scoped(&self, scope: &Scope<'_>) -> Result<(), crate::Error> {
         let granted = self.get_scoped(scope);

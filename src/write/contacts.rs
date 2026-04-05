@@ -57,6 +57,77 @@ pub async fn update_contact_name(
     Ok(updated)
 }
 
+/// Update a contact with a full vCard replacement. Carries the structured
+/// fields (emails/phones/etc.) that `update_contact_name` can't express —
+/// the caller builds (or synthesizes) the vCard, we extract the FN for
+/// the `full_name` field the PUT endpoint insists on, and forwardemail's
+/// contact row is rewritten from the parsed card.
+pub async fn update_contact_vcard(
+    client: &Client,
+    repo: &Repo,
+    alias: &str,
+    attribution: &Attribution,
+    id: &str,
+    vcard: &str,
+    if_match: Option<&str>,
+) -> Result<Contact, Error> {
+    let full_name = extract_vcard_fn(vcard).unwrap_or_else(|| id.to_string());
+    let updated = client
+        .update_contact_vcard(id, vcard, &full_name, if_match)
+        .await?;
+    let audit = WriteAudit {
+        attribution,
+        tool: "update_contact_vcard",
+        resource: "contacts",
+        resource_id: id.to_string(),
+        args: serde_json::json!({
+            "full_name": full_name,
+            "if_match": if_match,
+            "vcard_bytes": vcard.len(),
+        }),
+        summary: format!("contacts: update {id} (vcard, full_name={full_name})"),
+    };
+    refresh_and_commit(client, repo, alias, &audit).await?;
+    Ok(updated)
+}
+
+/// Extract the `FN:` line value from a vCard. Unfolds RFC 6350 line
+/// continuations (a leading space on the next line means "joined to the
+/// previous one") but does not otherwise interpret escapes.
+fn extract_vcard_fn(vcard: &str) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for line in vcard.lines() {
+        if (line.starts_with(' ') || line.starts_with('\t')) && !lines.is_empty() {
+            let last = lines.last_mut().unwrap();
+            last.push_str(&line[1..]);
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    for line in lines {
+        let upper = line.to_ascii_uppercase();
+        if let Some(rest) = upper.strip_prefix("FN:") {
+            // Find the matching position in the original line (preserves
+            // the original case of the value).
+            let idx = line.len() - rest.len();
+            let val = line[idx..].trim().to_string();
+            if !val.is_empty() {
+                return Some(val);
+            }
+        } else if upper.starts_with("FN;") {
+            // Parameterised FN (e.g. FN;CHARSET=UTF-8:Alex Kim). Take
+            // everything after the first `:`.
+            if let Some((_, val)) = line.split_once(':') {
+                let val = val.trim().to_string();
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub async fn delete_contact(
     client: &Client,
     repo: &Repo,

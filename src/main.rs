@@ -336,11 +336,21 @@ async fn main() -> Result<()> {
             )?;
             let (mail_source, mail_writer) = build_mail_source(&cfg, client.clone(), &user, &pass);
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            // Caller name for git-commit attribution on AI-driven writes.
+            // Operators set PIMSTEWARD_CALLER to distinguish multiple
+            // assistants sharing one backup repo (e.g. `PIMSTEWARD_CALLER=claude-desktop`
+            // vs `rockycc`). Falls back to "ai" to preserve v1 behaviour.
+            let caller = std::env::var("PIMSTEWARD_CALLER")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "ai".to_string());
             let server = PimstewardServer::new(
                 client,
                 repo,
                 cfg.permissions.clone(),
                 alias.clone(),
+                caller,
                 mail_source,
                 mail_writer,
             );
