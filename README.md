@@ -179,82 +179,91 @@ flowchart TB
         AI["AI assistant<br/>Claude Desktop / Claude Code<br/>any MCP client"]
     end
 
-    subgraph daemon["pimsteward daemon"]
+    subgraph mcp["pimsteward mcp (stdio child of the AI client)"]
         direction TB
         MCP["MCP server<br/>typed, high-level tools"]
-        PERM["Permission gate<br/>none / read / readwrite<br/>per resource"]
-        PULL["Pull loop<br/>forwardemail → diff → git"]
-        WRITE["Write path<br/>git WAL → API → commit"]
-        REST["Restore engine<br/>git @ T → diff → API"]
+        PERM["Permission gate<br/>none / read / read_write<br/>flat or scoped"]
+        WRITE["Write path<br/>API → re-pull → commit"]
+        REST["Restore engine<br/>git @ T → diff → dry-run + apply"]
         MCP --> PERM
         PERM --> WRITE
         PERM --> REST
     end
 
-    subgraph storage["Local storage (backed up offsite)"]
-        GIT[("git repo<br/>gix / gitoxide")]
-        AUDIT[("audit log<br/>mutations.jsonl")]
+    subgraph daemon["pimsteward daemon (long-running)"]
+        direction TB
+        PULL["Pull loop<br/>forwardemail → diff → git"]
+        GC["git gc --auto<br/>weekly"]
+    end
+
+    subgraph storage["Local git repo (backed up offsite)"]
+        GIT[("repo_path<br/>gix / gitoxide")]
     end
 
     FE["forwardemail.net<br/>authoritative store"]
 
-    AI -- "MCP" --> MCP
-    PULL -- "REST" --> FE
+    AI -- "MCP / stdio" --> MCP
+    PULL -- "REST / DAV / IMAP" --> FE
     WRITE -- "REST" --> FE
     REST -- "REST" --> FE
     FE -. "poll 5 min" .-> PULL
     PULL --> GIT
     WRITE --> GIT
-    WRITE --> AUDIT
     REST --> GIT
+    GC --> GIT
 
-    classDef daemon fill:#1e3a8a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+    classDef daemonCls fill:#1e3a8a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
     classDef store fill:#0f172a,stroke:#fbbf24,stroke-width:2px,color:#f8fafc;
     classDef ext fill:#334155,stroke:#94a3b8,stroke-width:1px,color:#f8fafc;
-    class MCP,PERM,PULL,WRITE,REST daemon;
-    class GIT,AUDIT store;
+    class MCP,PERM,WRITE,REST,PULL,GC daemonCls;
+    class GIT store;
     class AI,FE ext;
 ```
 
 ### Four loops, one data store
 
-| Loop         | Trigger                 | What happens                                                            |
-| ------------ | ----------------------- | ----------------------------------------------------------------------- |
-| **Pull**     | systemd timer (~5 min)  | Poll forwardemail, diff against the git tree, commit any new state      |
-| **Write**    | MCP tool call           | Stage intended change, apply via API, commit with AI attribution        |
-| **Restore**  | MCP tool or CLI         | Read git tree at time T, compute diff vs live, apply as a new commit    |
-| **GC**       | weekly systemd timer    | `git gc --auto` so the offsite-mirrored backup stays compact            |
+| Loop        | Trigger                          | What happens                                                         |
+| ----------- | -------------------------------- | -------------------------------------------------------------------- |
+| **Pull**    | `pimsteward daemon` tick (~5 min)| Poll forwardemail, diff against the git tree, commit any new state   |
+| **Write**   | MCP tool call                    | Check permission, apply via API, re-pull the resource, commit        |
+| **Restore** | MCP tool (dry-run then apply)    | Read git tree at time T, compute diff vs live, apply as a new commit |
+| **GC**      | `pimsteward daemon` (weekly)     | `git gc --auto` so the offsite-mirrored backup stays compact         |
+
+The daemon owns Pull and GC. MCP is a separate process: the AI client spawns
+`pimsteward mcp` as a stdio child, so Write and Restore run in that short-lived
+process and commit to the same git repo the daemon is pulling into.
 
 ---
 
 ## How a write actually works
 
-Every AI-initiated mutation goes through a **write-ahead log**: the intent is
-committed to git *before* the forwardemail API is touched, and the outcome is
-committed *after*. That way a crash mid-write never loses attribution or
-silently diverges from the remote.
+Every AI-initiated mutation is permission-checked, applied to forwardemail,
+then reconciled into git as a single attributed commit. The pull loop is the
+reconciliation engine — after the write, pimsteward re-reads the affected
+resource so what lands in git is the authoritative post-write state rather
+than pimsteward's optimistic guess.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant AI as AI assistant
-    participant MCP as pimsteward
+    participant MCP as pimsteward mcp
     participant P as Permission gate
-    participant G as git repo
     participant FE as forwardemail.net
+    participant G as git repo
 
-    AI->>MCP: create_event(calendar, ics)
-    MCP->>P: check(calendar, write)
+    AI->>MCP: create_event(calendar, ics, reason)
+    MCP->>P: check(calendar, write, calendar_id)
     alt denied
         P-->>MCP: denied
         MCP-->>AI: error — permission
     else allowed
         P-->>MCP: allowed
-        MCP->>G: stage intent (WAL commit)
         MCP->>FE: POST /calendars/events
         FE-->>MCP: 201 Created, uid
-        MCP->>G: commit "ai create_event" + audit entry
-        MCP-->>AI: ok (uid)
+        MCP->>FE: re-pull the calendar
+        MCP->>G: commit (tool, resource, caller, reason, args)
+        MCP-->>AI: ok (uid, commit sha)
     end
 ```
 
@@ -274,200 +283,138 @@ sequenceDiagram
     participant G as git repo
     participant FE as forwardemail.net
 
-    U->>MCP: restore(path, at=T)
+    U->>MCP: restore_*_dry_run(id or path, at=T)
     MCP->>G: read tree at T
     MCP->>FE: GET current state
     MCP->>MCP: compute diff (add / del / update)
-    MCP-->>U: dry-run plan + confirm_token
-    Note over U,MCP: Human inspects the plan and approves.
-    U->>MCP: restore_apply(confirm_token)
+    MCP-->>U: plan + plan_token (hash of plan)
+    Note over U,MCP: Human (or AI) inspects the plan and approves.
+    U->>MCP: restore_*_apply(plan_token)
+    MCP->>MCP: recompute token, reject if changed
     MCP->>FE: apply diff (idempotent, ordered)
-    MCP->>G: commit "restore at T"
-    MCP-->>U: restored N files, M events
+    MCP->>G: commit with restore attribution
+    MCP-->>U: restored N items
 ```
 
-### Restore in practice — three scenarios
+### Restore in practice
 
-The easiest way to understand restore is to watch it fix mistakes. These
-are shown using the `pimsteward` CLI; the same operations are available
-to the AI via MCP tools (`restore_plan` + `restore_apply`), which is how
-you'd drive them from inside a conversation.
+Restore is driven by the AI through MCP — there is no separate restore CLI,
+and by design there never will be. If the AI is trusted enough to write, it
+is trusted enough to drive its own undo (behind a dry-run+confirm gate). You
+ask your assistant to fix the mistake in plain English; it picks the right
+MCP tool and walks you through the plan before any byte goes back over the
+wire.
 
-#### Scenario 1 — "the AI archived a newsletter I wanted to keep in my inbox"
+The tools come in type-specific dry-run / apply pairs:
 
-You asked the assistant to clean up your inbox this morning. It filed
-fifteen newsletters to `archive/newsletters/`, but one of them — the
-Friday edition of a newsletter you actually read — should have stayed
-put.
+| Resource        | Dry-run tool                    | Apply tool                    |
+| --------------- | ------------------------------- | ----------------------------- |
+| Contact         | `restore_contact_dry_run`       | `restore_contact_apply`       |
+| Sieve script    | `restore_sieve_dry_run`         | `restore_sieve_apply`         |
+| Calendar event  | `restore_calendar_event_dry_run`| `restore_calendar_event_apply`|
+| Mail message    | `restore_mail_dry_run`          | `restore_mail_apply`          |
+| Arbitrary path  | `restore_path_dry_run`          | `restore_path_apply`          |
 
-```sh
-# 1. See what changed in the last hour, scoped to mail.
-pimsteward log --since "1 hour ago" --path sources/forwardemail/*/mail/
+Every `*_dry_run` returns a plan plus a `plan_token` derived from the plan's
+contents. The matching `*_apply` refuses to run unless you hand it back the
+exact token — so a plan the human didn't see cannot be rubber-stamped, and a
+plan that changed between inspection and apply invalidates its own token.
 
-# 2. Find the specific move. Commit looks like:
-#    ai: move 15 messages → archive/newsletters/
-#    Source: ai
-#    Tool: bulk_move
-#    Session: 01HXYZ...
+A typical exchange looks like this:
 
-# 3. Dry-run a restore of just that message back to where it was.
-pimsteward restore plan \
-    --path 'sources/forwardemail/*/mail/inbox/2026-04-05-signal-weekly/' \
-    --at 'HEAD~1'            # the commit before the bulk move
+> **You:** *That newsletter I actually read — Signal Weekly — got swept into
+> `Archive/Newsletters` when you cleaned up my inbox this morning. Put it
+> back.*
+>
+> **AI:** *I found it. Commit `a1b2c3d` moved it from `INBOX` to
+> `Archive/Newsletters` at 08:14 this morning as part of a batch of fifteen.
+> Running `restore_mail_dry_run` against the commit just before that move.*
+>
+> *Plan: 1 message will be moved `Archive/Newsletters → INBOX`. The other
+> fourteen stay where they are. Token: `a1b2c3d4`. Want me to apply it?*
+>
+> **You:** *Yes.*
+>
+> **AI:** *`restore_mail_apply` with that token — done. One new commit on
+> the backup repo, attributed to me with reason "user asked to undo
+> accidental archive of Signal Weekly".*
 
-# Prints: 1 message will be moved: archive/newsletters/ → inbox/
+The same shape works for a rewritten sieve script (`restore_sieve_dry_run`
+with `at = "2026-04-04T09:00Z"`), a wrongly-merged contact
+(`restore_contact_dry_run` at `HEAD~1`), or any file under the backup tree
+(`restore_path_dry_run`). The pattern is always **narrow the scope, pick
+the time, dry-run, confirm, apply** — and the AI is the one running it,
+under your eye.
 
-# 4. Apply it.
-pimsteward restore apply --token <token-from-dry-run>
-```
-
-The other fourteen archived messages stay archived. Restore is a
-**selective** git checkout, not a global rewind.
-
-#### Scenario 2 — "the AI rewrote my sieve filter and now mail is going to the wrong folder"
-
-You gave the assistant `sieve = "readwrite"` last week. Overnight it
-"optimised" your filter script, and now messages from your accountant
-are landing in `spam/` instead of `taxes/`.
-
-```sh
-# 1. What did the sieve file look like yesterday morning?
-pimsteward show --path 'sources/forwardemail/*/sieve/inbox.sieve' \
-                --at '2026-04-04T09:00Z'
-
-# 2. Diff yesterday against now to see exactly what the AI changed.
-pimsteward diff --path 'sources/forwardemail/*/sieve/inbox.sieve' \
-                --from '2026-04-04T09:00Z' --to HEAD
-
-# 3. Roll the file back.
-pimsteward restore plan \
-    --path 'sources/forwardemail/*/sieve/inbox.sieve' \
-    --at '2026-04-04T09:00Z'
-
-pimsteward restore apply --token <token>
-```
-
-The restore is committed as a new commit with `Source: restore` and a
-reference back to the commit being reverted, so the audit trail shows
-both the AI's change and your undo.
-
-#### Scenario 3 — "the AI merged two contacts and kept the wrong one"
-
-The assistant helpfully deduped your address book, but it chose the
-older "Alex Kim" vcard and dropped the newer phone number you'd added
-last week.
-
-```sh
-# 1. Find the merge commit.
-pimsteward log --path 'sources/forwardemail/*/contacts/' --grep 'merge'
-
-# 2. Show the deleted vcard as it was just before the merge.
-pimsteward show --path 'sources/forwardemail/*/contacts/main/alex-kim-b.vcf' \
-                --at 'HEAD~1'
-
-# 3. Restore that single vcard. The AI-preferred one stays — you end
-#    up with both, and can tidy them yourself.
-pimsteward restore plan \
-    --path 'sources/forwardemail/*/contacts/main/alex-kim-b.vcf' \
-    --at 'HEAD~1'
-
-pimsteward restore apply --token <token>
-```
-
-In every case the pattern is the same: **narrow the path, pick the
-time, dry-run, confirm, apply.**
+If you want to inspect what happened before asking for a restore, the
+`history` MCP tool is `git log` for the backup tree — it returns the
+commits that touched a given path, newest first, so the AI can point at
+the exact commit you want to revert to.
 
 ---
 
 ## Auditing what the AI did
 
-pimsteward is a backup *and* an audit tool. Every AI-initiated change
-leaves two traces:
+pimsteward is a backup *and* an audit tool. Every mutation is a git commit
+with a structured attribution block — `git log` is your audit log, and the
+git author name tells you the provenance at a glance:
 
-1. **A git commit** with a structured footer identifying source, tool,
-   and session — so `git log` is your primary audit log.
-2. **A line in `audit/mutations.jsonl`** — an append-only, human-
-   readable JSON-lines log you can grep, pipe into `jq`, or load into
-   any log tooling.
+- `pimsteward-pull` — the pull daemon reconciled remote state into the tree.
+- `ai` (or whatever caller name the MCP session set) — an AI-driven write.
+- Anything else — a human-initiated write you kicked off yourself.
 
 ### Commit shape
 
-Every mutation commit carries trailers that make filtering easy:
+Every mutation commit embeds a YAML-ish attribution block delimited by
+`---` lines in the commit body. The subject line is the human summary.
 
 ```
-ai: create_event work-cal/2026-04-10-design-review
+contacts: update_contact abc123
 
-Source: ai
-Tool: create_event
-Session: 01HXYZ7P2Q3R4S5T6V
-Resource: calendar
-Alias: pimsteward_test@example.dev
+---
+tool: update_contact
+resource: contacts
+resource_id: abc123
+caller: ai
+reason: "user asked me to fix Alex Kim's phone number"
+args: {"full_name":"Alex Kim","phone":"+1-555-0142"}
+---
 ```
 
-`Source:` is one of `ai`, `pull`, or `restore`. `Tool:` names the MCP
-tool that was invoked. `Session:` ties together every mutation from a
-single AI conversation, so you can see a burst of related changes as
-one coherent action.
+`tool:` names the MCP tool that was invoked. `resource:` is one of `email`,
+`calendar`, `contacts`, `sieve`. `resource_id:` is the forwardemail id of
+the thing that changed. `caller:` identifies who drove the write (matches
+the git commit author). `reason:` is the free-text justification the AI
+(or human) attached to this specific call. `args:` is the JSON payload so
+you can reproduce or audit the exact request.
 
 ### Asking "what did the AI change today?"
 
 ```sh
-# Every AI-authored change today, newest first, scoped to one alias.
-git -C /data/Backups/$(hostname)/pimsteward/<alias_slug> \
-    log --since=midnight --grep='^Source: ai$'
+# Every AI-authored change today, newest first.
+git -C /var/lib/pimsteward log --since=midnight --author='^ai$'
 
-# Same question, but just the files touched.
-git -C .../<alias_slug> \
-    log --since=midnight --grep='^Source: ai$' --name-status
+# Same question, but with the files touched.
+git -C /var/lib/pimsteward log --since=midnight --author='^ai$' --name-status
 
-# All changes from a single AI session — useful when the assistant did
-# a burst of edits and you want to review them as a unit.
-git -C .../<alias_slug> \
-    log --grep='Session: 01HXYZ7P2Q3R4S5T6V'
+# Every mutation that invoked a specific tool.
+git -C /var/lib/pimsteward log --all --grep='^tool: move_email$'
 
-# "Who last touched this specific calendar event?"
-git -C .../<alias_slug> \
-    blame sources/forwardemail/*/calendars/work/events/01HXYZ....ics
+# Everything the AI did to one folder's worth of mail.
+git -C /var/lib/pimsteward log --author='^ai$' -- \
+    'sources/forwardemail/*/mail/INBOX/'
+
+# "Who last touched this calendar event?"
+git -C /var/lib/pimsteward blame \
+    sources/forwardemail/*/calendars/<cal_id>/events/<uid>.ics
 ```
 
-Because the repo is just git, **everything you already know about git
-works here**. `git log -p`, `git log --stat`, `gitk`, `tig`,
-`lazygit`, VS Code's git lens — all of them become audit tools for
-your AI.
-
-### The mutations log
-
-For the cases where you want something less git-shaped — dashboards,
-alerts, "email me if the AI ever deletes more than ten messages in a
-day" — there's `audit/mutations.jsonl`:
-
-```jsonl
-{"ts":"2026-04-05T08:14:22Z","source":"ai","tool":"create_event","resource":"calendar","path":"calendars/work/events/01HXYZ....ics","session":"01HXYZ7P2Q3R4S5T6V","result":"ok"}
-{"ts":"2026-04-05T08:14:23Z","source":"ai","tool":"bulk_move","resource":"mail","count":15,"from":"inbox/","to":"archive/newsletters/","session":"01HXYZ7P2Q3R4S5T6V","result":"ok"}
-{"ts":"2026-04-05T08:14:24Z","source":"ai","tool":"delete_message","resource":"mail","result":"denied","reason":"permission: email=drafts"}
-```
-
-Note the last line: **denied attempts are logged too.** If your AI
-repeatedly tries to do things its permission level forbids, that's a
-signal worth surfacing — pimsteward captures it whether or not the
-operation succeeded.
-
-```sh
-# Show every AI mutation today, pretty-printed.
-jq -c 'select(.source=="ai" and (.ts | startswith("2026-04-05")))' \
-    /data/Backups/.../<alias_slug>/audit/mutations.jsonl
-
-# Count by tool — where is the AI spending its write budget?
-jq -r 'select(.source=="ai") | .tool' mutations.jsonl | sort | uniq -c | sort -rn
-
-# Every denied attempt this week.
-jq -c 'select(.result=="denied")' mutations.jsonl
-```
-
-The combination — structured commits for narrative review, JSON-lines
-for tooling — is the whole point of pimsteward. You don't audit the
-AI by asking it what it did. You audit the AI by looking at the trail
-it couldn't avoid leaving.
+Because the repo is just git, **everything you already know about git works
+here**. `git log -p`, `git log --stat`, `gitk`, `tig`, `lazygit`, VS Code's
+git lens — all of them become audit tools for your AI. The `history` MCP
+tool gives the AI the same view, so you can ask "what have you changed in
+my inbox this week?" inside a conversation and get back a real `git log`
+answer, not a hallucinated summary.
 
 ---
 
@@ -476,12 +423,17 @@ it couldn't avoid leaving.
 Trust in an AI assistant is not binary, and neither is pimsteward. You set one
 policy per resource type, and you turn the dials up as the assistant earns it.
 
-| Level           | What the AI can do                                                           | Where it makes sense                  |
-| --------------- | ---------------------------------------------------------------------------- | ------------------------------------- |
-| **`none`**      | Resource is invisible — the MCP tools aren't even registered                 | Data you simply don't want AI near    |
-| **`read`**      | Search, read, summarise, quote — zero writes                                 | The safe default for everything       |
-| **`drafts`**    | *(email only)* read + create messages **only in your Drafts folder**         | Letting an AI help write replies      |
-| **`readwrite`** | Full CRUD: create, update, delete, move, send                                | Once the AI has earned it             |
+| Level            | What the AI can do                                           | Where it makes sense               |
+| ---------------- | ------------------------------------------------------------ | ---------------------------------- |
+| **`none`**       | Resource is invisible — the MCP tools aren't even registered | Data you simply don't want AI near |
+| **`read`**       | Search, read, summarise, quote — zero writes                 | The safe default for everything    |
+| **`read_write`** | Full CRUD: create, update, delete, move, send                | Once the AI has earned it          |
+
+For the "let the AI draft replies but never touch the rest of my mail"
+middle ground, use a **scoped** permission (documented below) rather than a
+dedicated level — you grant `read` at the default and `read_write` on just
+the `Drafts` folder. Same effect, but the rule lives in one place and the
+audit story stays identical.
 
 ### A typical progression
 
@@ -489,10 +441,10 @@ policy per resource type, and you turn the dials up as the assistant earns it.
 
 ```toml
 [permissions]
-email    = "read"        # AI can search and summarise, never modify
-calendar = "readwrite"   # calendar mistakes are cheap and reversible
-contacts = "readwrite"   # same — and dedupe is a great first task
-sieve    = "read"        # look but don't touch your filter rules yet
+email    = "read"         # AI can search and summarise, never modify
+calendar = "read_write"   # calendar mistakes are cheap and reversible
+contacts = "read_write"   # same — and dedupe is a great first task
+sieve    = "read"         # look but don't touch your filter rules yet
 ```
 
 Your assistant can triage your inbox, summarise threads, find meetings,
@@ -503,82 +455,150 @@ mail. This is where most people should start.
 
 ```toml
 [permissions]
-email    = "drafts"      # AI writes replies into Drafts only
-calendar = "readwrite"
-contacts = "readwrite"
-sieve    = "readwrite"   # AI now owns your filter rules (every change is a git diff)
+contacts = "read_write"
+sieve    = "read_write"   # AI now owns your filter rules (every change is a git diff)
+
+# Email: read everywhere, write only to Drafts. This is the "drafts tier"
+# everyone wants from an AI mail assistant, expressed as a scoped rule.
+[permissions.email]
+default = "read"
+[permissions.email.folders]
+"Drafts" = "read_write"
+
+[permissions.calendar]
+default = "read_write"
 ```
 
-The `drafts` tier is the middle step people actually want from an AI mail
-assistant: it can compose, quote, and thread replies into your Drafts folder,
-but it cannot send, delete, move, or modify any existing message. You review
-and hit send yourself.
+The scoped form means the AI can compose, quote, and thread replies into
+your Drafts folder, but it cannot send, delete, move, or modify any
+existing message. You review and hit send yourself.
 
 **Once the AI has earned it — "full trust, with receipts."**
 
 ```toml
 [permissions]
-email    = "readwrite"   # full CRUD, including send
-calendar = "readwrite"
-contacts = "readwrite"
-sieve    = "readwrite"
+email    = "read_write"   # full CRUD, including send
+calendar = "read_write"
+contacts = "read_write"
+sieve    = "read_write"
 ```
 
 At this point the assistant can autonomously triage, reply, file, and archive.
 The safety net is not the permission bit — it's the fact that **every mutation
-is still committed to git with AI attribution**, and `restore` can rewind any
-path to any point in time. You are trading convenience for the need to
-occasionally audit a `git log`, not for blind faith.
+is still committed to git with AI attribution**, and the restore MCP tools can
+rewind any path to any point in time. You are trading convenience for the
+need to occasionally audit a `git log`, not for blind faith.
 
 ### The rest of the config
 
 ```toml
 # /etc/pimsteward/config.toml
+log_level = "info"
 
 [forwardemail]
 api_base            = "https://api.forwardemail.net"
 alias_user_file     = "/run/pimsteward-secrets/forwardemail-alias-user"
 alias_password_file = "/run/pimsteward-secrets/forwardemail-alias-password"
 
-[storage]
-repo_path = "/data/Backups/<host>/pimsteward/<alias_slug>"
+# Source backends. Default is REST for everything; switch calendar/contacts
+# to dav for faster bulk pulls, or mail to imap for CONDSTORE/IDLE push.
+mail_source     = "rest"    # or "imap"
+calendar_source = "rest"    # or "caldav"
+contacts_source = "rest"    # or "carddav"
 
-[mcp]
-listen = "unix:/run/pimsteward/mcp.sock"
+[storage]
+repo_path = "/var/lib/pimsteward"
+
+# Per-resource pull intervals used by `pimsteward daemon`. Non-daemon
+# subcommands (probe, pull-*) ignore these.
+[pull]
+mail_interval_seconds     = 300
+calendar_interval_seconds = 300
+contacts_interval_seconds = 900
+sieve_interval_seconds    = 3600
 ```
+
+There is no `[mcp]` section: pimsteward's MCP server is a stdio transport,
+and your MCP client is expected to spawn `pimsteward mcp` as a child
+process. Claude Desktop, Claude Code, Cursor, and rockycc all do this the
+same way — point them at the `pimsteward` binary and they own the
+lifecycle.
 
 Permission checks happen **before** any API call and **before** any git write.
 A `none` resource is invisible to the AI: the corresponding MCP tools are not
-registered at all, so the model never even learns they exist. Per-folder and
-per-calendar rules (e.g. "write to `work-cal` but never `family-cal`") are an
-explicit v2 question — v1 keeps the dials coarse on purpose.
+registered at all, so the model never even learns they exist.
+
+### Scoped permissions — per-folder and per-calendar
+
+The flat `email = "read"` / `calendar = "read_write"` form is the easy path.
+When you need finer control, email and calendar both accept a scoped form
+with a default plus overrides — per-folder for email, per-calendar-id for
+calendar. A scoped override is authoritative: it wins over the default in
+both directions, so you can be broadly restrictive and open specific paths,
+or broadly permissive and lock specific paths down.
+
+```toml
+[permissions]
+contacts = "read_write"
+sieve    = "read_write"
+
+# Email: read everything, but the AI can only WRITE into Drafts.
+[permissions.email]
+default = "read"
+[permissions.email.folders]
+"Drafts" = "read_write"
+"Trash"  = "none"         # not even readable
+
+# Calendar: locked down by default, specific calendars opened up.
+[permissions.calendar]
+default = "none"
+[permissions.calendar.by_id]
+"cal-work-xyz"     = "read_write"
+"cal-family-abc"   = "read"
+```
+
+Contacts and sieve stay globally scoped on purpose — forwardemail gives you
+one default address book per alias and a flat sieve namespace, so per-item
+rules would add friction without meaningful security value.
 
 ---
 
 ## Storage layout
 
-One repository per forwardemail alias. One file per logical resource. Commits
-are atomic batches with a machine-readable footer identifying the source
-(`pull`, `ai`, `restore`).
+One repository per forwardemail alias. One file per logical resource. Every
+commit is an atomic batch with a YAML attribution block in the body (see
+[Auditing](#auditing-what-the-ai-did)) — the git author name (`pimsteward-pull`,
+`ai`, or your caller of choice) distinguishes pull, write, and restore
+commits at a glance.
 
 ```
-/data/Backups/<host>/pimsteward/<alias_slug>/
+/var/lib/pimsteward/
 ├── .git/
-├── sources/forwardemail/<alias_slug>/
-│   ├── calendars/<cal_id>/_meta.json
-│   ├── calendars/<cal_id>/events/<uid>.ics
-│   ├── contacts/<book_id>/_meta.json
-│   ├── contacts/<book_id>/<uid>.vcf
-│   ├── mail/<folder_id>/_meta.json
-│   ├── mail/<folder_id>/<msg_id>/raw.eml         # immutable body + headers
-│   ├── mail/<folder_id>/<msg_id>/meta.json       # flags, folder — mutable
-│   ├── mail/_attachments/<sha256>                # dedup
-│   └── sieve/<script_name>.sieve
-├── _sync/
-│   └── state.json            # poll cursors, last successful run per resource
-└── audit/
-    └── mutations.jsonl       # append-only human-readable log of AI writes
+└── sources/forwardemail/<alias_slug>/
+    ├── calendars/<cal_id>/
+    │   ├── _calendar.json               # calendar manifest (name, colour, ctag…)
+    │   └── events/
+    │       ├── <uid>.ics                # canonical event body
+    │       └── <uid>.meta.json          # etag, updated_at, sync hints
+    ├── contacts/default/                # one hard-coded book per alias
+    │   ├── <uid>.vcf
+    │   └── <uid>.meta.json
+    ├── mail/
+    │   ├── _attachments/<sha256>        # content-addressed, dedup across msgs
+    │   └── <folder_path>/               # folder path slugified, e.g. INBOX, Sent
+    │       ├── _folder.json             # uid_validity, modseq, last sync
+    │       ├── <canonical_id>.eml       # RFC822 body, immutable
+    │       └── <canonical_id>.meta.json # flags, source id, labels — mutable
+    └── sieve/
+        ├── <script_name>.sieve
+        └── <script_name>.meta.json
 ```
+
+Sync state is colocated with the resource it tracks: mail folders carry
+their own `_folder.json`, calendars carry `_calendar.json`, contacts and
+sieve scripts carry per-item `.meta.json` sidecars. There is no separate
+sync state file or mutations log — the git history *is* the log, and every
+field that would live in a separate log is already in the commit body.
 
 ### Why git (and [gix](https://github.com/GitoxideLabs/gitoxide) specifically)
 
@@ -659,10 +679,25 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full e2e walkthrough.
 
 ## Status
 
-Early development. Pull-loop and MCP server are functional; the write path
-and restore engine are landing behind them. See [PLAN.md](PLAN.md) for the
-full design and phased implementation, and [DESIGN.md](DESIGN.md) for deeper
-rationale on the trickier decisions.
+Early development, but the core is working end-to-end:
+
+- **Pull daemon** — functional for mail (REST + IMAP with CONDSTORE/IDLE),
+  calendar (REST + CalDAV), contacts (REST + CardDAV), and sieve scripts.
+  Weekly `git gc --auto` runs alongside the pull tasks.
+- **MCP server** — read tools (`search_email`, `get_email`, `list_folders`,
+  `list_calendars`, `list_events`, `list_contacts`, `list_sieve`, `history`)
+  and write tools for all four resources (`create_draft`, `move_email`,
+  `delete_email`, `update_email_flags`, `create_event`, `update_event`,
+  `delete_event`, `create_contact`, `update_contact`, `delete_contact`,
+  `install_sieve_script`, `update_sieve_script`, `delete_sieve_script`).
+- **Restore** — dry-run + apply tool pairs for contacts, sieve, calendar
+  events, mail, and arbitrary paths, all gated by a content-derived
+  `plan_token`.
+- **Permission model** — flat and scoped (per-folder / per-calendar-id)
+  forms, with a path-safe deny guard for the test suite.
+
+See [PLAN.md](PLAN.md) for the full design and phased implementation, and
+[DESIGN.md](DESIGN.md) for deeper rationale on the trickier decisions.
 
 Contributions welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md).
 
