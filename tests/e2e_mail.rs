@@ -252,6 +252,163 @@ async fn mail_move_back_to_original_folder() {
     .expect("cleanup");
 }
 
+/// Restore re-append: create → snapshot → delete → restore → verify
+/// a new message with same content appears.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn mail_restore_reappend_after_delete() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e mail reappend");
+    let subject = format!("e2e_reappend_{}", std::process::id());
+    let msg_id = create_test_message(&ctx, &subject).await;
+    let rest_source = RestMailSource::new(ctx.client.clone());
+
+    let _ = pull_mail(
+        &rest_source,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        "e2e",
+        "e2e@pimsteward.local",
+    )
+    .await
+    .expect("baseline");
+    let good_sha = current_head(&ctx.repo);
+
+    // Delete the message
+    write::mail::delete_message(
+        &rest_source,
+        &rest_source,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        "INBOX",
+        &msg_id,
+    )
+    .await
+    .expect("delete");
+
+    // Plan restore — should be Append (message was deleted)
+    let (plan, token) = restore::mail::plan_mail(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        "INBOX",
+        &msg_id,
+        &good_sha,
+    )
+    .await
+    .expect("plan");
+    assert!(
+        matches!(
+            plan.operation,
+            restore::mail::MailOperation::Append { .. }
+        ),
+        "expected Append op, got {:?}",
+        plan.operation
+    );
+
+    // Apply
+    restore::mail::apply_mail(
+        &ctx.client,
+        &rest_source,
+        &rest_source,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &plan,
+        &token,
+    )
+    .await
+    .expect("apply reappend");
+
+    // Verify a message with our subject exists in INBOX (new id)
+    let msgs = ctx
+        .client
+        .list_messages_in_folder("INBOX")
+        .await
+        .expect("list");
+    let found = msgs.iter().find(|m| m.subject.contains(&subject));
+    assert!(
+        found.is_some(),
+        "re-appended message should exist in INBOX"
+    );
+
+    // Cleanup
+    let new_id = &found.unwrap().id;
+    write::mail::delete_message(
+        &rest_source,
+        &rest_source,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        "INBOX",
+        new_id,
+    )
+    .await
+    .expect("cleanup");
+}
+
+/// Create a draft email and verify it lands in Drafts.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn mail_create_draft() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e create draft");
+    let rest_source = RestMailSource::new(ctx.client.clone());
+    let subject = format!("e2e_draft_{}", std::process::id());
+
+    let msg = pimsteward::forwardemail::writes::NewMessage {
+        folder: "Drafts".to_string(),
+        to: vec!["draft_test@example.com".to_string()],
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: subject.clone(),
+        text: Some("Draft body from e2e test".to_string()),
+        html: None,
+    };
+
+    let result = write::mail::create_draft(
+        &ctx.client,
+        &rest_source,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &msg,
+    )
+    .await
+    .expect("create draft");
+
+    let draft_id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("draft id");
+
+    // Verify the draft exists live
+    let live = ctx
+        .client
+        .get_message(draft_id)
+        .await
+        .expect("fetch draft");
+    assert_eq!(
+        live.get("folder_path").and_then(|v| v.as_str()),
+        Some("Drafts"),
+        "draft should be in Drafts folder"
+    );
+    assert!(
+        live.get("subject")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains(&subject),
+        "draft subject should match"
+    );
+
+    // Cleanup
+    ctx.client
+        .delete_message(draft_id)
+        .await
+        .expect("cleanup draft");
+}
+
 fn current_head(repo: &pimsteward::store::Repo) -> String {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])

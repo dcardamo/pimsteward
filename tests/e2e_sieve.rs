@@ -147,6 +147,101 @@ async fn sieve_restore_content_change() {
         .expect("cleanup");
 }
 
+/// Restore recreate: install → snapshot → delete → restore → verify
+/// the script exists again with original content.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn sieve_restore_recreate_after_delete() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e sieve recreate");
+    let name = format!("e2e_recreate_{}", std::process::id());
+
+    let content = r#"require ["fileinto"]; fileinto "Archive";"#;
+    let script = write::sieve::install_sieve_script(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &name,
+        content,
+    )
+    .await
+    .expect("install");
+    let script_id = script.id.clone();
+
+    let good_sha = current_head(&ctx.repo);
+
+    // Delete
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &script_id,
+    )
+    .await
+    .expect("delete");
+
+    // Plan restore — should be Recreate
+    let (plan, token) =
+        restore::sieve::plan_sieve(&ctx.client, &ctx.repo, &ctx.alias_slug(), &name, &good_sha)
+            .await
+            .expect("plan");
+    assert!(
+        matches!(
+            plan.operation,
+            restore::sieve::SieveOperation::Recreate { .. }
+        ),
+        "expected Recreate op, got {:?}",
+        plan.operation
+    );
+
+    // Apply
+    restore::sieve::apply_sieve(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &plan,
+        &token,
+    )
+    .await
+    .expect("apply recreate");
+
+    // Verify live — list_sieve_scripts may not include content, so
+    // find by name then get the full script for content assertion.
+    let scripts = ctx
+        .client
+        .list_sieve_scripts()
+        .await
+        .expect("list after recreate");
+    let found = scripts.iter().find(|s| s.name == name);
+    assert!(found.is_some(), "script should exist after recreate");
+    let new_id = &found.unwrap().id;
+    let full = ctx
+        .client
+        .get_sieve_script(new_id)
+        .await
+        .expect("get recreated script");
+    assert_eq!(
+        full.content.as_deref(),
+        Some(content),
+        "recreated content should match original"
+    );
+
+    // Cleanup
+    let new_id = &found.unwrap().id;
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        new_id,
+    )
+    .await
+    .expect("cleanup");
+}
+
 fn current_head(repo: &pimsteward::store::Repo) -> String {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])

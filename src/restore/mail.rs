@@ -19,6 +19,7 @@ use crate::restore::read_git_blob;
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailRestorePlan {
@@ -58,8 +59,79 @@ pub async fn plan_mail(
     at_sha: &str,
 ) -> Result<(MailRestorePlan, String), Error> {
     let folder_safe = folder.replace('/', "_");
-    let meta_path =
-        format!("sources/forwardemail/{alias}/mail/{folder_safe}/{message_id}.meta.json");
+
+    // message_id can be either a canonical id (16-char hex hash) or a
+    // source-specific id (REST ObjectId, imap-<uid>). Try direct path
+    // first; if not found, scan meta.json files in the folder to find
+    // one whose `id` field matches. This handles both canonical-named
+    // and legacy source-named backup trees.
+    let meta_path = {
+        let direct =
+            format!("sources/forwardemail/{alias}/mail/{folder_safe}/{message_id}.meta.json");
+        if read_git_blob(repo, at_sha, &direct).is_ok() {
+            direct
+        } else {
+            // Scan ALL folder dirs at HEAD for a meta.json whose `id`
+            // field matches the source id. The message may currently be
+            // in a different folder than `folder` (e.g. after a move),
+            // but the historical path (at_sha) uses the specified folder.
+            let mail_root = repo
+                .root()
+                .join(format!("sources/forwardemail/{alias}/mail"));
+            let mut found = None;
+            'outer: for folder_entry in std::fs::read_dir(&mail_root).into_iter().flatten().flatten() {
+                let fname = folder_entry.file_name().into_string().unwrap_or_default();
+                if fname == "_attachments" || !folder_entry.path().is_dir() {
+                    continue;
+                }
+                for entry in std::fs::read_dir(folder_entry.path()).into_iter().flatten().flatten() {
+                    let name = entry.file_name().into_string().unwrap_or_default();
+                    if !name.ends_with(".meta.json") || name == "_folder.json" {
+                        continue;
+                    }
+                    if let Ok(bytes) = std::fs::read(entry.path()) {
+                        if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if meta.get("id").and_then(|v| v.as_str()) == Some(message_id) {
+                                let stem = name.trim_end_matches(".meta.json");
+                                // Use the REQUESTED folder (from the historical
+                                // path at at_sha), not the current folder.
+                                found = Some(format!(
+                                    "sources/forwardemail/{alias}/mail/{folder_safe}/{stem}.meta.json"
+                                ));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+            // If HEAD scan failed (message deleted), scan at at_sha using
+            // git ls-tree to find meta.json files in the historical folder.
+            if found.is_none() {
+                let tree_path =
+                    format!("sources/forwardemail/{alias}/mail/{folder_safe}");
+                if let Ok(out) = Command::new("git")
+                    .args(["ls-tree", "--name-only", at_sha, &format!("{tree_path}/")])
+                    .current_dir(repo.root())
+                    .output()
+                {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        if !line.ends_with(".meta.json") || line.ends_with("_folder.json") {
+                            continue;
+                        }
+                        if let Ok(blob) = read_git_blob(repo, at_sha, line) {
+                            if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&blob) {
+                                if meta.get("id").and_then(|v| v.as_str()) == Some(message_id) {
+                                    found = Some(line.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            found.unwrap_or(direct)
+        }
+    };
     let historical_meta_bytes = read_git_blob(repo, at_sha, &meta_path)?;
     let historical_meta: serde_json::Value = serde_json::from_slice(&historical_meta_bytes)?;
     let historical_flags: Vec<String> = historical_meta
@@ -72,14 +144,21 @@ pub async fn plan_mail(
         })
         .unwrap_or_default();
 
-    // Fetch live state
-    let live = client.get_message(message_id).await;
+    // The source-specific id (REST ObjectId or imap-<uid>) is needed
+    // for API calls. It's stored in the meta.json `id` field.
+    let source_id = historical_meta
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(message_id);
+
+    // Fetch live state using the source-specific id.
+    let live = client.get_message(source_id).await;
     let (operation, human_summary) = match live {
         Err(Error::Api { status: 404, .. }) | Err(Error::Api { status: 410, .. }) => {
             // Message is gone from forwardemail. Read the historical
             // .eml from git at at_sha and plan an Append.
-            let eml_path =
-                format!("sources/forwardemail/{alias}/mail/{folder_safe}/{message_id}.eml");
+            // Derive eml path from the meta path (same stem, .eml extension).
+            let eml_path = meta_path.replace(".meta.json", ".eml");
             let raw_bytes = read_git_blob(repo, at_sha, &eml_path)?;
             let size = raw_bytes.len();
             (
@@ -143,7 +222,8 @@ pub async fn plan_mail(
         path: meta_path,
         at_sha: at_sha.to_string(),
         folder: folder.to_string(),
-        message_id: message_id.to_string(),
+        // Store the source-specific id — apply_mail needs it for API calls.
+        message_id: source_id.to_string(),
         operation,
         human_summary,
     };

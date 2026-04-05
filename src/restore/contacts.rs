@@ -157,16 +157,18 @@ pub async fn apply_contact(
             return Ok(());
         }
         RestoreOperation::Update {
-            historical_vcard, ..
+            target_full_name,
+            historical_vcard,
         } => {
             let id = plan
                 .live_id
                 .as_ref()
                 .ok_or_else(|| Error::config("Update op requires live_id in plan"))?;
-            // PUT the full historical vCard — forwardemail parses it
-            // server-side and updates all structured fields.
+            // PUT both full_name and content — forwardemail reliably
+            // honors full_name on PUT; content may or may not be applied
+            // (API inconsistency). Sending both hedges the bet.
             client
-                .update_contact_vcard(id, historical_vcard, None)
+                .update_contact_vcard(id, historical_vcard, target_full_name, None)
                 .await?;
         }
         RestoreOperation::Recreate {

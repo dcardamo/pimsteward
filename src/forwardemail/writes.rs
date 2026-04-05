@@ -53,15 +53,20 @@ impl Client {
         self.post_json("/v1/contacts", &body).await
     }
 
-    /// PUT /v1/contacts/:id with raw vCard content — full update that
-    /// preserves all vCard fields, not just the full_name.
+    /// PUT /v1/contacts/:id with raw vCard content + full_name extracted
+    /// from the vCard. forwardemail's PUT endpoint reliably accepts
+    /// `full_name` but may silently ignore `content` (it only fully
+    /// supports `content` on POST). Sending both hedges: if `content`
+    /// is honored, all fields restore; if not, at least the name is
+    /// correct.
     pub async fn update_contact_vcard(
         &self,
         id: &str,
         vcard: &str,
+        full_name: &str,
         if_match: Option<&str>,
     ) -> Result<Contact, Error> {
-        let body = json!({"content": vcard});
+        let body = json!({"full_name": full_name, "content": vcard});
         self.put_json(&format!("/v1/contacts/{id}"), &body, if_match)
             .await
     }

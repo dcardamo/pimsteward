@@ -217,6 +217,165 @@ async fn contact_restore_undoes_a_bad_rename() {
     .expect("cleanup");
 }
 
+/// Restore recreate: create → snapshot → delete → restore from snapshot →
+/// verify the contact exists again with all vCard fields intact.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn contact_restore_recreate_after_delete() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e contact recreate");
+
+    let marker = format!("e2e-recreate-{}", std::process::id());
+    let created = write::contacts::create_contact(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &marker,
+        &[("home", "recreate_test@example.com")],
+    )
+    .await
+    .expect("create");
+    let contact_id = created.id.clone();
+    let contact_uid = created.uid.clone();
+
+    let good_sha = current_head(&ctx.repo);
+
+    // Delete
+    write::contacts::delete_contact(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &contact_id,
+    )
+    .await
+    .expect("delete");
+
+    // Plan restore — should be Recreate
+    let (plan, token) = restore::contacts::plan_contact(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &contact_uid,
+        &good_sha,
+    )
+    .await
+    .expect("plan");
+    assert!(
+        matches!(
+            plan.operation,
+            restore::contacts::RestoreOperation::Recreate { .. }
+        ),
+        "expected Recreate op, got {:?}",
+        plan.operation
+    );
+
+    // Apply
+    restore::contacts::apply_contact(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &plan,
+        &token,
+    )
+    .await
+    .expect("apply recreate");
+
+    // Verify the contact exists live with the original name
+    let live = ctx
+        .client
+        .list_contacts()
+        .await
+        .expect("list after recreate");
+    let found = live.iter().find(|c| c.full_name == marker);
+    assert!(
+        found.is_some(),
+        "contact should exist after recreate restore"
+    );
+    // Verify the vCard content was preserved (not a placeholder)
+    assert!(
+        found.unwrap().content.contains(&marker),
+        "recreated vCard should contain the original full_name"
+    );
+
+    // Cleanup — new id after recreate
+    let new_id = &found.unwrap().id;
+    write::contacts::delete_contact(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        new_id,
+    )
+    .await
+    .expect("cleanup");
+}
+
+/// vCard round-trip: create from raw vCard, verify all fields, update
+/// via raw vCard, verify the update.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn contact_vcard_round_trip() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e vcard round-trip");
+
+    let marker = format!("e2e-vcard-{}", std::process::id());
+    let vcard = format!(
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{marker}\r\n\
+         EMAIL;TYPE=home:vcard_test@example.com\r\n\
+         TEL;TYPE=cell:+15551234567\r\n\
+         ORG:Test Corp\r\n\
+         NOTE:e2e test contact\r\nEND:VCARD"
+    );
+
+    let created = ctx
+        .client
+        .create_contact_from_vcard(&vcard)
+        .await
+        .expect("create from vcard");
+    assert_eq!(created.full_name, marker);
+    let contact_id = created.id.clone();
+
+    // Verify the live vCard has all the fields we sent
+    let live = ctx.client.list_contacts().await.expect("list");
+    let found = live.iter().find(|c| c.id == contact_id).expect("found");
+    assert!(found.content.contains("TEL"), "vCard should have phone");
+    assert!(found.content.contains("Test Corp"), "vCard should have org");
+
+    // Update via vCard — change the phone number
+    let updated_vcard = format!(
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{marker}\r\n\
+         EMAIL;TYPE=home:vcard_test@example.com\r\n\
+         TEL;TYPE=cell:+15559999999\r\n\
+         ORG:Test Corp\r\n\
+         NOTE:updated by e2e\r\nEND:VCARD"
+    );
+    ctx.client
+        .update_contact_vcard(&contact_id, &updated_vcard, &marker, None)
+        .await
+        .expect("update vcard");
+
+    let live2 = ctx.client.list_contacts().await.expect("list after update");
+    let found2 = live2.iter().find(|c| c.id == contact_id).expect("found2");
+    assert!(
+        found2.content.contains("+15559999999"),
+        "updated phone should be in vCard"
+    );
+
+    // Cleanup
+    write::contacts::delete_contact(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &contact_id,
+    )
+    .await
+    .expect("cleanup");
+}
+
 fn current_head(repo: &pimsteward::store::Repo) -> String {
     let out = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
