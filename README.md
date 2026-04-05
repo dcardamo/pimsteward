@@ -367,7 +367,12 @@ with a structured attribution block — `git log` is your audit log, and the
 git author name tells you the provenance at a glance:
 
 - `pimsteward-pull` — the pull daemon reconciled remote state into the tree.
-- `ai` (or whatever caller name the MCP session set) — an AI-driven write.
+- `ai` (the default for AI-driven writes), or a custom name set via the
+  `PIMSTEWARD_CALLER` environment variable when the MCP server is
+  launched. Use this to distinguish multiple assistants sharing one
+  backup repo — e.g. `PIMSTEWARD_CALLER=claude-desktop` vs
+  `PIMSTEWARD_CALLER=rockycc` — so `git log --author='^claude-desktop$'`
+  narrows to one assistant's writes.
 - Anything else — a human-initiated write you kicked off yourself.
 
 ### Commit shape
@@ -376,17 +381,25 @@ Every mutation commit embeds a YAML-ish attribution block delimited by
 `---` lines in the commit body. The subject line is the human summary.
 
 ```
-contacts: update_contact abc123
+contacts: update abc123 (vcard, full_name=Alex Kim)
 
 ---
-tool: update_contact
+tool: update_contact_vcard
 resource: contacts
 resource_id: abc123
 caller: ai
 reason: "user asked me to fix Alex Kim's phone number"
-args: {"full_name":"Alex Kim","phone":"+1-555-0142"}
+args: {"full_name":"Alex Kim","if_match":null,"vcard_bytes":487}
 ---
 ```
+
+`update_contact` has two modes: pass `full_name` alone for a rename, or
+pass a full `vcard` replacement to edit structured fields like phones,
+emails, addresses, or notes. The audit trailer records which path was
+taken — `tool: update_contact_name` for the rename path, `tool:
+update_contact_vcard` for the vCard path — and for the vCard path logs
+`vcard_bytes` rather than the full card to keep commit messages compact
+(the card itself lands in git via the follow-up pull).
 
 `tool:` names the MCP tool that was invoked. `resource:` is one of `email`,
 `calendar`, `contacts`, `sieve`. `resource_id:` is the forwardemail id of
