@@ -358,24 +358,48 @@ pimsteward is explicitly NOT:
 - **A rate-limit bypass.** All AI reads and writes still count against
   your alias's API quota. pimsteward just mediates them.
 
+## Resolved since initial v1
+
+Items that were deferred in earlier revisions of this document and have
+since been built. Listed here so the delta is traceable.
+
+| Was deferred                          | Resolved by |
+| ------------------------------------- | ----------- |
+| Per-folder / per-calendar permissions | **V2.1** — `EmailPermission::Scoped` + `CalendarPermission::Scoped` with per-folder and per-calendar-id overrides, back-compat with flat TOML |
+| True `.eml` write-once store          | **V2.3** — Forwardemail's REST response already includes a `raw` field by default; pull loop extracts it into `<id>.eml` with a sidecar `meta.json` |
+| Native mail source fallback           | **V2.2** — `MailSource` trait + `ImapMailSource` using `async-imap` + `tokio-rustls`, verified live against `imap.forwardemail.net:993` |
+
 ## Deferred (and why)
 
-Items that were in the plan or considered during design but deliberately
-left out of v1. Each is a reasonable v2 item when the need is concrete.
+Items that are still deliberately out of scope. Each is a reasonable
+future improvement when the need is concrete.
 
-| Deferred                              | Reason                                                                |
-| ------------------------------------- | --------------------------------------------------------------------- |
-| Per-folder / per-calendar permissions | Coarse + obvious is safer; mis-config is silent over-share            |
-| Native CalDAV/CardDAV/IMAP fallback   | REST is fast enough; add when REST polling actually costs something   |
-| True `.eml` write-once store          | Forwardemail's GET returns parsed JSON, not raw RFC822; JSON captures everything the API exposes |
-| Attachment dedup (`_attachments/<sha>`) | Forwardemail's message response references attachments but doesn't expose them as separable blobs |
-| Automated mail body re-APPEND on restore | Could be built on top of `POST /v1/messages` with the stored JSON; not common enough to justify the complexity yet |
-| Retention / pruning                   | Disk is cheap, history is the product. Revisit if the repo ever becomes a problem size |
-| Weekly `git gc` timer                 | Worth adding when the repo actually gets fragmented; not on day one   |
-| Richer contact restore recreate       | Current recreate uses placeholder email; full vCard re-hydration needs a parser |
-| Calendar event optimistic concurrency | Forwardemail's calendar events don't expose an ETag; last-writer-wins is the API's behaviour |
-| Webhook-driven push ingest            | Would require a public HTTPS endpoint (attack surface) and a partial delivery story; polling is simpler and sufficient |
-| Multi-alias support                   | One alias per instance in v1; run two instances if you have two       |
+### From the original list
+
+| # | Deferred                              | Reason |
+| - | ------------------------------------- | ------ |
+| 1 | **Native CalDAV source** (calendar)   | V2.2 shipped IMAP for mail only. CalDAV for calendars follows the same trait pattern but isn't built. REST calendar polling is fine at current scale. |
+| 2 | **Native CardDAV source** (contacts)  | Same — trait pattern ready, implementation not built. |
+| 3 | **Attachment dedup (`_attachments/<sha256>`)** | Forwardemail's REST references attachments in the `nodemailer` parse but doesn't expose them as separable binary blobs. IMAP could reach individual parts via `BODYSTRUCTURE` + `BODY[N]`, but nobody has asked for it. |
+| 4 | **Automated re-APPEND on mail restore** | `MailOperation::Unrestorable` surfaces the limitation cleanly. Could be built on top of `POST /v1/messages` with the stored `.eml` bytes from git. |
+| 5 | **Retention / pruning of git history** | Disk is cheap, history is the product. Revisit only if the repo becomes a problem size. |
+| 6 | **Weekly `git gc --auto` timer**      | Worth adding when fragmentation is observable — small systemd-style addition to the daemon. |
+| 7 | **Richer contact restore recreate**   | Current `Recreate` uses a placeholder email and only preserves `full_name`. Full vCard re-hydration needs a proper parser. Common case (undo a rename) is fully covered. |
+| 8 | **Calendar event optimistic concurrency (If-Match)** | Forwardemail's calendar events don't return an ETag header — API limitation, not a pimsteward gap. Contacts *do* support If-Match and pimsteward uses it. |
+| 9 | **Webhook-driven push ingest**        | Would require a public HTTPS endpoint (attack surface) and a partial delivery model. Forwardemail's storage is zero-knowledge so server-side push isn't architecturally possible. |
+| 10 | **Multi-alias support in one instance** | One alias per daemon. Run two if you need two. |
+| 11 | **Explicit adaptive rate-limit backoff** | `X-RateLimit-Remaining` is parsed and tracked atomically but the pull loop doesn't throttle. 1000/window is generous vs current usage. |
+| 12 | **Dedicated `get_*` MCP tools**       | `list_*` tools return full content for contacts/events/sieve; individual `get_*` would be redundant. `search_email` covers the mail case. |
+| 13 | **`CONTRIBUTING.md`**                 | Cosmetic. README + DESIGN.md + PLAN.md have enough. |
+
+### Discovered during V2.x work
+
+| # | Deferred                              | Reason |
+| - | ------------------------------------- | ------ |
+| 14 | **IMAP `CHANGEDSINCE` filtering**     | `ImapMailSource` exposes `modseq` per message but still does a full `FETCH 1:*`. CONDSTORE `CHANGEDSINCE` would skip unchanged messages server-side. Real win at high volume; not needed at current scale. |
+| 15 | **IMAP `IDLE` for push notifications** | Would give sub-minute latency for new mail and flag changes without polling. Meaningful v3 feature if sub-5-minute latency matters. |
+| 16 | **IMAP write path**                   | Writes always go through REST (flag updates, folder moves, deletes, creates). Mixing IMAP writes with REST writes complicates audit attribution. Only needed if a future backend lacks a REST write API. |
+| 17 | **Canonical cross-source message id** | REST uses forwardemail's ObjectId (`69d1…`); IMAP uses `imap-<uid>`. You can't switch `mail_source` against the same backup tree without wiping `mail/`. A canonical id (e.g. `Message-ID` header hash) would allow hot-swapping backends. Documented as a warning on the config field. |
 
 ## Open-source friendly
 
