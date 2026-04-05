@@ -12,7 +12,8 @@
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::Result;
-use pimsteward::{forwardemail::Client, pull, store::Repo, Config};
+use pimsteward::{forwardemail::Client, mcp::PimstewardServer, pull, store::Repo, Config};
+use rmcp::{transport::stdio, ServiceExt};
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -55,6 +56,11 @@ enum Command {
     /// Run all pull cycles in sequence.
     PullAll,
 
+    /// Run the MCP server over stdio — exposes read tools to an AI assistant.
+    /// Pipe its stdin/stdout to any MCP-compatible client (Claude Desktop,
+    /// Cursor, etc.) via their server configuration.
+    Mcp,
+
     /// Long-running daemon mode (pull timers + MCP server). NOT YET IMPLEMENTED.
     Daemon,
 }
@@ -62,9 +68,17 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+    // Always write logs to stderr so stdout is clean for JSON-RPC (MCP) or
+    // JSON output from pull-* subcommands. A real MCP client parses stdout
+    // strictly and would choke on log lines mixed in.
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer().with_target(true).with_line_number(true))
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_line_number(true)
+                .with_writer(std::io::stderr),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -198,6 +212,17 @@ async fn main() -> Result<()> {
                 tracing::info!(summary = %s, "pull-mail done");
                 println!("{s}");
             }
+        }
+        Command::Mcp => {
+            let (user, pass) = cfg.load_credentials()?;
+            let alias = alias_from_user(&user);
+            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let server =
+                PimstewardServer::new(client, repo, cfg.permissions.clone(), alias.clone());
+            tracing::info!(alias = %alias, "mcp server starting over stdio");
+            let running = server.serve(stdio()).await?;
+            running.waiting().await?;
         }
         Command::Daemon => {
             pimsteward::run(cfg).await?;

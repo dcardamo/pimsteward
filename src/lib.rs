@@ -4,6 +4,7 @@
 pub mod config;
 pub mod error;
 pub mod forwardemail;
+pub mod mcp;
 pub mod permission;
 pub mod pull;
 pub mod store;

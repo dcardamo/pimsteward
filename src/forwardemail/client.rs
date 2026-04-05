@@ -63,6 +63,13 @@ impl Client {
         serde_json::from_slice(&bytes).map_err(Error::from)
     }
 
+    /// Same as `get_json` but returns a [`serde_json::Value`] — used by the
+    /// MCP `search_email` tool which passes through arbitrary query strings
+    /// and doesn't benefit from typed deserialization.
+    pub async fn raw_get_json(&self, path: &str) -> Result<serde_json::Value, Error> {
+        self.get_json(path).await
+    }
+
     async fn send(&self, method: Method, path: &str) -> Result<Response, Error> {
         let url = format!("{}{}", self.api_base, path);
         let resp = self
