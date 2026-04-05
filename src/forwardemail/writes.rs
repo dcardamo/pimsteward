@@ -141,6 +141,53 @@ impl Client {
         self.post_json("/v1/messages", &body).await
     }
 
+    /// POST /v1/emails — send an outgoing email via forwardemail's SMTP
+    /// bridge. Same alias credentials as every other REST call (Basic
+    /// Auth), but this is a distinct capability: delivery to a third
+    /// party over the public internet, not a mailbox mutation.
+    ///
+    /// Forwardemail handles the SMTP handshake, envelope construction,
+    /// DKIM signing (if the sending domain has DKIM configured), and
+    /// persists a copy to the alias's `Sent` folder on success — so the
+    /// next pull will capture the full outgoing message into git
+    /// automatically.
+    ///
+    /// Returns the JSON response body verbatim (contains the new message
+    /// `id` plus metadata). Callers SHOULD compute and log a hash of the
+    /// body bytes at the pimsteward write layer rather than trusting the
+    /// returned record to stay byte-stable under later API revisions.
+    ///
+    /// The `from` field is set to the authenticated alias — forwardemail
+    /// requires an explicit envelope sender on POST /v1/emails and
+    /// rejects the request with HTTP 403 "Envelope MAIL FROM header
+    /// could not be parsed or was missing." if it's absent. SMTP auth
+    /// would also reject a mismatched from, so we just use the alias
+    /// we're already authenticated as.
+    pub async fn send_email(
+        &self,
+        msg: &NewMessage,
+    ) -> Result<serde_json::Value, Error> {
+        let mut body = json!({
+            "from": self.alias_user(),
+            "to": msg.to,
+            "subject": msg.subject,
+        });
+        let obj = body.as_object_mut().expect("just created");
+        if !msg.cc.is_empty() {
+            obj.insert("cc".into(), json!(msg.cc));
+        }
+        if !msg.bcc.is_empty() {
+            obj.insert("bcc".into(), json!(msg.bcc));
+        }
+        if let Some(ref t) = msg.text {
+            obj.insert("text".into(), json!(t));
+        }
+        if let Some(ref h) = msg.html {
+            obj.insert("html".into(), json!(h));
+        }
+        self.post_json("/v1/emails", &body).await
+    }
+
     /// POST /v1/messages with structured fields — creates a new message in
     /// the specified folder. Forwardemail constructs the RFC822 envelope and
     /// body server-side from the structured fields (to, cc, bcc, subject,

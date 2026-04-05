@@ -31,6 +31,15 @@ pub enum Error {
         granted: crate::permission::Access,
     },
 
+    /// Send-email permission is separate from read/write on the email
+    /// resource because sending over SMTP is irreversible in a way that
+    /// read_write on a mailbox folder isn't. Denial surfaces its own
+    /// variant so the MCP layer can produce a specific error rather than
+    /// overloading `PermissionDenied`'s Access fields with a synthetic
+    /// encoding.
+    #[error("permission denied: email_send requires 'allowed' but config grants 'denied' — set [permissions] email_send = \"allowed\" to enable (explicit opt-in; read_write does NOT imply send)")]
+    SendDenied,
+
     #[error("git store: {0}")]
     Store(String),
 

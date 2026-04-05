@@ -183,11 +183,53 @@ impl CalendarPermission {
     }
 }
 
+/// Send-email permission. Orthogonal to the read/write `email` field
+/// because sending over SMTP is a different, strictly more consequential
+/// capability than mutating mailbox state:
+///
+/// * Mailbox mutations stay inside the alias and are reversible via git
+///   restore — the worst a bad move/delete can do is shuffle bytes around
+///   a tree pimsteward owns.
+/// * `POST /v1/emails` bridges to forwardemail's outgoing SMTP relay. Once
+///   it returns success the message has been accepted for delivery to a
+///   third party and there is no restore. The worst a bad send can do is
+///   put words in your mouth on an audit-visible wire.
+///
+/// Because of that asymmetry, `email = "read_write"` deliberately does
+/// NOT imply send. Send is always opt-in, and the default is `Denied`.
+/// The MCP `send_email` tool calls [`Permissions::check_email_send`]
+/// independently of any email read/write check.
+///
+/// Note that forwardemail uses one alias credential for both IMAP/REST
+/// mailbox access and SMTP sending — pimsteward enforces the split at
+/// the policy layer, not at the transport layer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendPermission {
+    /// Default. `send_email` is not exposed and any direct call is refused.
+    #[default]
+    Denied,
+    /// Send is allowed. `send_email` is exposed as an MCP tool and every
+    /// invocation is recorded in git with a `tool: send_email` audit
+    /// trailer carrying recipients, subject, and body sha256.
+    Allowed,
+}
+
+impl SendPermission {
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
 /// Full permission matrix.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Permissions {
     #[serde(default)]
     pub email: EmailPermission,
+    /// Send-email permission — see [`SendPermission`] for why this is a
+    /// separate field rather than a level inside `email`.
+    #[serde(default)]
+    pub email_send: SendPermission,
     #[serde(default)]
     pub calendar: CalendarPermission,
     #[serde(default)]
@@ -273,6 +315,17 @@ impl Permissions {
         }
     }
 
+    /// Gate an outgoing SMTP send. Independent of `email` read/write
+    /// because the blast radius of a send is strictly larger than any
+    /// mailbox mutation — see [`SendPermission`].
+    pub fn check_email_send(&self) -> Result<(), crate::Error> {
+        if self.email_send.is_allowed() {
+            Ok(())
+        } else {
+            Err(crate::Error::SendDenied)
+        }
+    }
+
     /// Gate a write with an optional scope override.
     pub fn check_write_scoped(&self, scope: &Scope<'_>) -> Result<(), crate::Error> {
         let granted = self.get_scoped(scope);
@@ -333,6 +386,7 @@ mod tests {
     ) -> Permissions {
         Permissions {
             email: EmailPermission::Flat(email),
+            email_send: SendPermission::Denied,
             calendar: CalendarPermission::Flat(calendar),
             contacts,
             sieve,
@@ -366,6 +420,59 @@ mod tests {
         ] {
             assert!(p.check_read(r).is_err(), "{r} should default to deny");
             assert!(p.check_write(r).is_err(), "{r} should default to deny");
+        }
+        // Send is a separate capability; default must also be deny.
+        assert!(p.check_email_send().is_err(), "send defaults to denied");
+    }
+
+    // ── Send permission ────────────────────────────────────────────
+    //
+    // send is orthogonal to read/write on the email resource. The
+    // invariant the tests below protect: read_write on email NEVER
+    // implies send — you must explicitly set email_send = "allowed".
+
+    #[test]
+    fn send_denied_by_default_even_with_email_read_write() {
+        let p = Permissions {
+            email: EmailPermission::Flat(Access::ReadWrite),
+            ..Permissions::default()
+        };
+        assert!(
+            p.check_email_send().is_err(),
+            "read_write on email must NOT grant send — send is its own opt-in"
+        );
+    }
+
+    #[test]
+    fn send_allowed_when_explicitly_set() {
+        let p = Permissions {
+            email_send: SendPermission::Allowed,
+            ..Permissions::default()
+        };
+        assert!(p.check_email_send().is_ok());
+    }
+
+    #[test]
+    fn send_allowed_works_even_when_email_is_none() {
+        // Weird but legal: you can grant send without read_write. The
+        // AI could compose a message via its own tool context and ask
+        // pimsteward to transmit it without ever reading the mailbox.
+        // pimsteward should not second-guess this config — the user
+        // said what they meant.
+        let p = Permissions {
+            email: EmailPermission::Flat(Access::None),
+            email_send: SendPermission::Allowed,
+            ..Permissions::default()
+        };
+        assert!(p.check_email_send().is_ok());
+    }
+
+    #[test]
+    fn send_denied_error_is_its_own_variant() {
+        let p = Permissions::default();
+        match p.check_email_send() {
+            Err(crate::Error::SendDenied) => {}
+            other => panic!("expected SendDenied, got {other:?}"),
         }
     }
 
@@ -528,6 +635,37 @@ sieve = "none"
         assert_eq!(p.calendar.default_access(), Access::ReadWrite);
         assert_eq!(p.contacts, Access::ReadWrite);
         assert_eq!(p.sieve, Access::None);
+        // email_send is absent from this config — must default to denied.
+        assert_eq!(p.email_send, SendPermission::Denied);
+    }
+
+    #[test]
+    fn toml_email_send_roundtrip() {
+        // Default (absent): denied.
+        let p: Permissions = toml::from_str("").unwrap();
+        assert_eq!(p.email_send, SendPermission::Denied);
+
+        // Explicit denied.
+        let p: Permissions = toml::from_str(r#"email_send = "denied""#).unwrap();
+        assert_eq!(p.email_send, SendPermission::Denied);
+        assert!(p.check_email_send().is_err());
+
+        // Explicit allowed.
+        let p: Permissions = toml::from_str(r#"email_send = "allowed""#).unwrap();
+        assert_eq!(p.email_send, SendPermission::Allowed);
+        assert!(p.check_email_send().is_ok());
+
+        // Combined with a read-only email config — the common
+        // "agent can draft but also send" shape.
+        let p: Permissions = toml::from_str(
+            r#"
+email = "read"
+email_send = "allowed"
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.email.default_access(), Access::Read);
+        assert_eq!(p.email_send, SendPermission::Allowed);
     }
 
     #[test]

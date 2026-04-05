@@ -96,6 +96,16 @@ impl PimstewardServer {
             .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
     }
 
+    /// Gate an outgoing SMTP send. Deliberately separate from
+    /// `check_write_scoped(Scope::Email { ... })` because send is its
+    /// own permission — `read_write` on email does NOT imply send.
+    fn check_email_send(&self) -> Result<(), McpError> {
+        self.inner
+            .permissions
+            .check_email_send()
+            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+    }
+
     /// Look up a message's current folder and source-specific id from
     /// the backup tree's meta.json. The `id` parameter is the canonical
     /// id (filename stem) as seen in the backup. Returns (folder, source_id).
@@ -306,6 +316,32 @@ pub struct CreateDraftParams {
     pub html: Option<String>,
     /// Free-text reason why you're creating this draft. Ends up in the
     /// git commit message for audit purposes.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SendEmailParams {
+    /// Recipient email addresses (To:). Must be non-empty.
+    pub to: Vec<String>,
+    /// CC recipients. Optional.
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// BCC recipients. Optional.
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    /// Email subject line.
+    pub subject: String,
+    /// Plain-text body. At least one of `text` or `html` must be provided.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// HTML body. Optional.
+    #[serde(default)]
+    pub html: Option<String>,
+    /// Free-text reason explaining *why* this message is being sent. This
+    /// is required-by-convention (not schema): send is an irreversible
+    /// outbound action and the reason lands in the git audit trail so you
+    /// can reconstruct the intent later. Set it.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -880,6 +916,72 @@ impl PimstewardServer {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         Ok(format!("draft created: {id} in {folder}"))
+    }
+
+    #[tool(
+        name = "send_email",
+        description = "Send an email over SMTP via forwardemail's outgoing bridge. IRREVERSIBLE: once this returns success, the message has been accepted for delivery to third parties and there is no 'undo'. A copy is saved to the Sent folder automatically and captured into git on the next pull. Every send is recorded in the git audit log with tool=send_email plus recipients, subject, and body sha256 — `git log --grep='tool: send_email'` enumerates them.\n\nRequires the separate `email_send` permission (default: denied). Granting `email = \"read_write\"` does NOT grant send — you must set `email_send = \"allowed\"` in [permissions] explicitly. If you only want the assistant to prepare outgoing mail for human review, use `create_draft` instead; drafts are safely reversible."
+    )]
+    async fn send_email(
+        &self,
+        Parameters(p): Parameters<SendEmailParams>,
+    ) -> Result<String, McpError> {
+        // Independent permission check — does NOT piggyback on email
+        // read/write. See permission::SendPermission for the rationale.
+        self.check_email_send()?;
+
+        // Minimal structural validation at the MCP layer so the model
+        // gets a useful error instead of a 400 from forwardemail.
+        if p.to.is_empty() {
+            return Err(McpError::invalid_params(
+                "send_email: `to` must contain at least one recipient",
+                None,
+            ));
+        }
+        if p.text.is_none() && p.html.is_none() {
+            return Err(McpError::invalid_params(
+                "send_email: at least one of `text` or `html` must be provided",
+                None,
+            ));
+        }
+        if p.subject.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "send_email: `subject` must not be empty",
+                None,
+            ));
+        }
+
+        let attr = self.attribution(None, p.reason);
+        let msg = crate::forwardemail::writes::NewMessage {
+            // `folder` is unused by the send path — forwardemail writes
+            // to Sent automatically — but the NewMessage struct is shared
+            // with create_draft, so we set it for completeness.
+            folder: "Sent".to_string(),
+            to: p.to,
+            cc: p.cc,
+            bcc: p.bcc,
+            subject: p.subject,
+            text: p.text,
+            html: p.html,
+        };
+        let result = crate::write::mail::send_email(
+            &self.inner.client,
+            self.inner.mail_source.as_ref(),
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &msg,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let id = result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        Ok(format!(
+            "sent: {id} → {:?} — recorded in git with tool: send_email",
+            msg.to
+        ))
     }
 
     #[tool(

@@ -51,6 +51,13 @@ impl Client {
         self.rate_remaining.load(Ordering::Relaxed)
     }
 
+    /// The authenticated alias email address. Exposed so the send_email
+    /// write path can populate `from` on POST /v1/emails without
+    /// duplicating credential storage.
+    pub fn alias_user(&self) -> &str {
+        &self.alias_user
+    }
+
     /// Cheap keepalive / auth probe.
     pub async fn account(&self) -> Result<serde_json::Value, Error> {
         self.get_json("/v1/account").await
