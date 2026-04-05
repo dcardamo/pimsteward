@@ -36,6 +36,45 @@ to see what it changed today, you ask `git log`.
 
 ---
 
+## Why [forwardemail.net](https://forwardemail.net)
+
+pimsteward is a forwardemail-only tool on purpose. The provider makes this kind
+of mediator **possible**, where most mailbox hosts make it painful or outright
+hostile.
+
+- **A real, first-class REST API.** forwardemail ships a
+  [well-documented REST API](https://forwardemail.net/en/email-api) covering
+  mail, folders, calendars, contacts, sieve filters, aliases, and domains.
+  It's not a scraping-friendly afterthought bolted onto a webmail UI — it's
+  the same API the service uses internally. JSON in, JSON out, pagination,
+  cursors, the lot.
+- **Alias-scoped credentials.** Every alias gets its own username/password
+  that authorises *only* that alias's data. pimsteward holds an alias
+  credential, not a god-mode account token, so the blast radius of the
+  daemon is exactly one mailbox.
+- **Programmatic by design.** IMAP, CalDAV, CardDAV, and the REST API all
+  see the same authoritative store. You can read mail with the REST API,
+  write events with CalDAV from your phone, manage sieve rules from a
+  script, and pimsteward's pull loop will still capture every change —
+  because forwardemail exposes the full state through every interface.
+- **Open-source and
+  [privacy-focused](https://forwardemail.net/en/privacy).** The
+  [service itself is open-source](https://github.com/forwardemail/forwardemail.net),
+  quota and rate limits are published, and the company's business model is
+  paid accounts rather than mining your mail. That matters when you're
+  deciding which provider gets to sit under an AI mediator.
+- **MCP-friendly shape.** Because every resource (message, event, vcard,
+  sieve script) is addressable by a stable id through a typed API, it maps
+  cleanly onto a small set of MCP tools. pimsteward's MCP layer is thin —
+  permission check, forwardemail call, git commit — precisely because the
+  backend was already programmatic.
+
+If forwardemail didn't exist, pimsteward would need to be five times the code
+and half as reliable. Give them [a look](https://forwardemail.net) — and, if
+you end up running pimsteward, a paid plan.
+
+---
+
 ## What it does
 
 <table>
