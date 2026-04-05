@@ -79,15 +79,28 @@ fn head_commit_message(repo: &pimsteward::store::Repo) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// List the files changed by the most recent git commit. Used to verify
-/// that an isolated restore only modifies paths belonging to its target —
-/// the git-plumbing-level isolation assertion.
-fn head_commit_changed_files(repo: &pimsteward::store::Repo) -> Vec<String> {
+/// List every file changed between two git shas. Used to verify that an
+/// isolated restore only modifies paths belonging to its target — the
+/// git-plumbing-level isolation assertion.
+///
+/// Note: we must use a range diff rather than inspecting HEAD alone,
+/// because every restore apply runs `pull_*` internally and that pull
+/// typically lands the real file changes in its own commit *before* the
+/// restore audit commit. The restore audit commit itself is therefore
+/// frequently empty (the API call already brought live state in line,
+/// pull picked that up, and commit_all found nothing left to stage).
+/// Asserting about HEAD would miss the pull's changed files and over-
+/// index on the audit commit.
+fn files_changed_between(
+    repo: &pimsteward::store::Repo,
+    from_sha: &str,
+    to_ref: &str,
+) -> Vec<String> {
     let out = std::process::Command::new("git")
-        .args(["show", "--pretty=format:", "--name-only", "HEAD"])
+        .args(["diff", "--name-only", from_sha, to_ref])
         .current_dir(repo.root())
         .output()
-        .expect("git show");
+        .expect("git diff");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -787,7 +800,10 @@ async fn cross_resource_isolation_contact_restore_leaves_calendar_alone() {
     .await
     .expect("post-snapshot event update");
 
-    // Restore the contact only.
+    // Restore the contact only. Capture sha BEFORE apply so we can
+    // diff the full range of changes the restore caused — see
+    // `files_changed_between` for why HEAD alone isn't enough.
+    let pre_apply_sha = current_head(&ctx.repo);
     let (plan, token) = restore::contacts::plan_contact(
         &ctx.client,
         &ctx.repo,
@@ -837,28 +853,31 @@ async fn cross_resource_isolation_contact_restore_leaves_calendar_alone() {
         live_event.ical
     );
 
-    // I7 — verify the commit that landed this restore touched only contact paths.
-    let changed = head_commit_changed_files(&ctx.repo);
+    // I3/I7 — every file changed by the restore (across every commit the
+    // apply produced, including its internal pull) must be under a
+    // contact path. A single calendar/sieve/mail path in this diff would
+    // prove cross-resource leakage.
+    let changed = files_changed_between(&ctx.repo, &pre_apply_sha, "HEAD");
     assert!(
         !changed.is_empty(),
-        "restore apply should have produced a commit with file changes"
+        "restore should have changed at least one file (contact vcard)"
     );
     for path in &changed {
         assert!(
             path.contains("/contacts/"),
-            "restore commit should only touch contact paths, but changed: {path}"
+            "restore diff should only touch contact paths, but changed: {path}"
         );
         assert!(
             !path.contains("/calendars/"),
-            "restore commit must not touch calendar paths, but changed: {path}"
+            "restore diff must not touch calendar paths, but changed: {path}"
         );
         assert!(
             !path.contains("/sieve/"),
-            "restore commit must not touch sieve paths, but changed: {path}"
+            "restore diff must not touch sieve paths, but changed: {path}"
         );
         assert!(
             !path.contains("/mail/"),
-            "restore commit must not touch mail paths, but changed: {path}"
+            "restore diff must not touch mail paths, but changed: {path}"
         );
     }
 

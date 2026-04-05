@@ -1,0 +1,40 @@
+# nextest config for pimsteward.
+#
+# Unit tests run in parallel as usual. The e2e test binaries, however,
+# all share a single forwardemail test alias ($PIMSTEWARD_TEST_ALIAS_USER)
+# and must run one at a time.
+#
+# # Why every e2e test is serialised
+#
+# forwardemail is a real, shared, stateful service. A single alias is a
+# single mutable resource, not a sharded database. Multiple concurrent
+# tests writing to the same alias produce failure modes that are
+# genuinely impossible to avoid from the client side:
+#
+#   * Sieve POST returns 201 Created with an id, and a subsequent PUT to
+#     that id returns 404 "Sieve script not found." — appears to be an
+#     internal per-alias sieve write lock timing out contenders.
+#
+#   * Mail flag updates return 404 "Message does not exist." on ids that
+#     a prior successful create just returned, when several mail tests
+#     are creating/mutating messages in parallel.
+#
+#   * Bulk restore plans enumerate resources from the alias backup tree,
+#     which can include resources created by *other* tests running in
+#     parallel. Bulk apply then tries to operate on ids that are already
+#     gone by the time the apply runs.
+#
+# None of these are bugs in pimsteward. They are a property of running
+# destructive tests against a live service with a single-alias test
+# account. The fix is to serialise, not to retry.
+#
+# Individual unit tests (`#[cfg(test)]` in src/) and the wiremock-based
+# integration tests (tests/integration_test.rs) still run fully parallel
+# — this group only applies to tests/e2e_*.rs.
+
+[test-groups]
+e2e_shared_alias = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(~e2e_)'
+test-group = 'e2e_shared_alias'
