@@ -392,7 +392,6 @@ future improvement when the need is concrete.
 
 | # | Deferred                              | Reason |
 | - | ------------------------------------- | ------ |
-| 10 | **Multi-alias support in one instance** | One alias per daemon. Run two if you need two. |
 | 12 | **Dedicated `get_*` MCP tools**       | `list_*` tools return full content for contacts/events/sieve; individual `get_*` would be redundant. `search_email` covers the mail case. |
 
 ### Design decisions (not planned)
@@ -403,6 +402,7 @@ Deliberate architectural choices, not gaps.
 | - | ------------------------------------- | --------- |
 | 5 | **No retention / pruning of git history** | Disk is cheap, history is the product. The backup repo is append-only by design; `git gc --auto` handles object compaction. If a repo grows unwieldy, `git filter-repo` is the manual escape hatch. |
 | 9 | **No webhook-driven push ingest**     | IMAP IDLE (`imap_idle = true`) provides sub-minute push notifications without exposing a public HTTPS endpoint. Webhooks would add attack surface, require partial-delivery handling, and duplicate what IDLE already does better. |
+| 10 | **One alias per daemon instance**    | Clean isolation: each alias gets its own git repo, credentials, permission matrix, and systemd unit. No cross-alias data leakage. NixOS containers make per-alias instances cheap. Multiple aliases = multiple instances. |
 
 ## Open-source friendly
 
