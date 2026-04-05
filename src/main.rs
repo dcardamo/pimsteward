@@ -132,7 +132,11 @@ enum Command {
     /// Cursor, etc.) via their server configuration.
     Mcp,
 
-    /// Long-running daemon mode (pull timers + MCP server). NOT YET IMPLEMENTED.
+    /// Long-running daemon: runs a per-resource pull timer for every
+    /// resource granted at least `read` in config, plus a weekly
+    /// `git gc --auto` on the backup repo. The MCP server is a separate
+    /// stdio subcommand (`pimsteward mcp`) spawned by your MCP client —
+    /// the daemon does not host it.
     Daemon,
 }
 

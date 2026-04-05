@@ -176,9 +176,13 @@ reversible, everything is attributable.**
 
 ## Architecture
 
-pimsteward is a single daemon that owns your forwardemail credentials and sits
-between the AI assistant and the service. It exposes an MCP server upward, a
-git repository sideways, and the forwardemail REST API downward.
+pimsteward is a **two-process** system that owns your forwardemail credentials
+and sits between the AI assistant and the service. A long-running daemon
+(`pimsteward daemon`) runs the pull loop and weekly `git gc`; a short-lived
+`pimsteward mcp` child is spawned by your MCP client (Claude Desktop, Claude
+Code, etc.) for each session and handles the AI's read, write, and restore
+calls. Both processes share one on-disk git repo, which is how the AI's
+writes and the daemon's pulls reconcile.
 
 ```mermaid
 flowchart TB
@@ -266,8 +270,8 @@ sequenceDiagram
         MCP-->>AI: error — permission
     else allowed
         P-->>MCP: allowed
-        MCP->>FE: POST /calendars/events
-        FE-->>MCP: 201 Created, uid
+        MCP->>FE: POST /v1/calendar-events
+        FE-->>MCP: 201 Created, event_id
         MCP->>FE: re-pull the calendar
         MCP->>G: commit (tool, resource, caller, reason, args)
         MCP-->>AI: ok (uid, commit sha)
@@ -515,9 +519,11 @@ it's the fact that **every mutation is still committed to git with AI
 attribution**, and the restore MCP tools can rewind any path to any point in
 time. Sends are the one exception that can't be rewound, but they can still
 be audited: every `send_email` call lands a commit with the full recipient
-list, subject, and a sha256 of the body that was transmitted. You are
-trading convenience for the need to occasionally audit a `git log`, not for
-blind faith.
+list, subject, and a sha256 of the body as submitted to forwardemail (the
+client-side text/html fields — this hash does not cover DKIM headers or any
+rewriting forwardemail does downstream of the API). You are trading
+convenience for the need to occasionally audit a `git log`, not for blind
+faith.
 
 ### The rest of the config
 
@@ -638,11 +644,17 @@ args: {"to":["alice@example.com"],"cc":[],"bcc":[],
 ---
 ```
 
-The full body bytes land in git a few seconds later via the automatic pull
-that captures the Sent folder. The `body_sha256` in the audit trailer binds
-the commit to the exact bytes that were transmitted — so even if the Sent
-copy is later deleted, the hash in the audit log still proves what went
-out. Enumerate every send with `git log --grep='tool: send_email'`.
+The full body bytes land in git via the post-write mail refresh that the
+`send_email` tool runs synchronously before returning (the same refresh
+pattern every other mail write uses — the daemon's periodic pull is a
+fallback, not the primary capture path). The `body_sha256` in the audit
+trailer binds the commit to the exact bytes pimsteward submitted to
+forwardemail's `POST /v1/emails` endpoint — so even if the Sent copy is
+later deleted, the hash in the audit log still proves what we handed the
+API. Note that this hash covers only the client-side `text`/`html` fields:
+forwardemail may add DKIM headers or other rewrites before the message
+actually leaves the SMTP relay, and those are not in the hash. Enumerate
+every send with `git log --grep='tool: send_email'`.
 
 If you want the AI to compose outgoing mail without being trusted to put
 it on the wire, set `email_send = "denied"` (the default) and use
