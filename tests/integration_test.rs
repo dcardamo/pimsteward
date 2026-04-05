@@ -280,9 +280,17 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         "subject": "hello",
         "flags": [],
         "modseq": 5,
-        "raw": "From: sender@example.com\r\nTo: alice@test.example\r\nSubject: hello\r\n\r\noriginal body",
+        "raw": "From: sender@example.com\r\nTo: alice@test.example\r\nSubject: hello\r\nMessage-ID: <test-m1@example.com>\r\n\r\noriginal body",
+        "header_message_id": "<test-m1@example.com>",
         "nodemailer": {"text": "original body"}
     });
+    // Canonical id = sha256("<test-m1@example.com>")[..16]
+    let canonical_m1 = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"<test-m1@example.com>");
+        format!("{:x}", h.finalize())[..16].to_string()
+    };
     Mock::given(method("GET"))
         .and(path("/v1/messages/m1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(msg_full_v1))
@@ -302,9 +310,11 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
     .unwrap();
     assert_eq!(s1.added, 1, "first pull adds one message");
     assert!(s1.commit_sha.is_some());
-    // raw RFC822 is written as <id>.eml
+    // raw RFC822 is written as <canonical_id>.eml
     let eml = repo
-        .read_file("sources/forwardemail/test-alias/mail/INBOX/m1.eml")
+        .read_file(format!(
+            "sources/forwardemail/test-alias/mail/INBOX/{canonical_m1}.eml"
+        ))
         .unwrap();
     let eml_str = std::str::from_utf8(&eml).unwrap();
     assert!(eml_str.contains("Subject: hello"));
@@ -330,7 +340,8 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         "flags": ["\\Seen", "\\Flagged"],
         "modseq": 6,
         "subject": "hello",
-        "raw": "From: sender@example.com\r\nTo: alice@test.example\r\nSubject: hello\r\n\r\noriginal body",
+        "raw": "From: sender@example.com\r\nTo: alice@test.example\r\nSubject: hello\r\nMessage-ID: <test-m1@example.com>\r\n\r\noriginal body",
+        "header_message_id": "<test-m1@example.com>",
         "nodemailer": {"text": "original body"}
     });
     Mock::given(method("GET"))

@@ -43,12 +43,20 @@ use std::path::PathBuf;
 /// folder, modseq, uid, thread_id, labels, etc. The pull loop reads this
 /// to decide whether a full re-fetch is needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MessageMeta {
-    id: String,
+pub(crate) struct MessageMeta {
+    /// Source-specific id: REST ObjectId or `imap-<uid>`. Used for API
+    /// calls (MailWriter). Not the filename — see `canonical_id`.
+    pub id: String,
+    /// Canonical identifier: `sha256(Message-ID header)[..16]`. This is
+    /// the filename stem for .eml, .meta.json, .attachments.json. Source-
+    /// agnostic so switching between REST and IMAP backends against the
+    /// same backup tree preserves file identity.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
     #[serde(default)]
     folder_id: Option<String>,
     #[serde(default)]
-    folder_path: Option<String>,
+    pub folder_path: Option<String>,
     #[serde(default)]
     thread_id: Option<String>,
     #[serde(default)]
@@ -118,6 +126,7 @@ impl MessageMeta {
 
         Self {
             id: s.id.clone(),
+            canonical_id: None, // Set by caller after derive_canonical_id
             folder_id: Some(s.folder_id.clone()).filter(|v| !v.is_empty()),
             folder_path: extra
                 .and_then(|e| string_at(e, "folder_path"))
@@ -170,6 +179,14 @@ pub async fn pull_mail(
         );
         let local_meta = read_local_message_meta(repo, &folder_dir)?;
 
+        // Build a reverse index: source-specific id → canonical filename
+        // stem. This lets us match remote summaries (keyed by source id)
+        // to local files (keyed by canonical id).
+        let source_to_canonical: HashMap<String, String> = local_meta
+            .iter()
+            .map(|(canonical, meta)| (filename_safe(&meta.id), canonical.clone()))
+            .collect();
+
         // Read the previous _folder.json (if any) to recover the last
         // observed uid_validity + modify_index. These drive CONDSTORE
         // delta sync on sources that support it. If uid_validity has
@@ -181,8 +198,9 @@ pub async fn pull_mail(
 
         // 3. Detect changes and re-fetch full bodies where needed.
         for msg in &list_result.changed {
-            let id = filename_safe(&msg.id);
-            let prev = local_meta.get(&id);
+            let source_id = filename_safe(&msg.id);
+            let prev_canonical = source_to_canonical.get(&source_id);
+            let prev = prev_canonical.and_then(|c| local_meta.get(c));
             let needs_refetch = match prev {
                 None => true,
                 Some(p) => p.modseq != msg.modseq || p.flags != msg.flags,
@@ -196,22 +214,38 @@ pub async fn pull_mail(
             // response; IMAP uses `UID FETCH BODY[]`. Both return raw
             // RFC822 bytes in FetchedMessage.raw.
             let fetched = source.fetch_message(&f.path, &msg.id).await?;
+            let canonical = derive_canonical_id(&fetched);
 
-            let eml_path = format!("{folder_dir}/{id}.eml");
+            let eml_path = format!("{folder_dir}/{canonical}.eml");
             repo.write_file(&eml_path, &fetched.raw)?;
 
-            // Remove any legacy .json sidecar left over from earlier versions.
-            let legacy_json = repo.root().join(format!("{folder_dir}/{id}.json"));
-            let _ = std::fs::remove_file(legacy_json);
+            // Remove any legacy file using the old source-specific id as
+            // filename stem (migration from pre-canonical naming).
+            if prev_canonical.is_none() {
+                let _ = std::fs::remove_file(
+                    repo.root().join(format!("{folder_dir}/{source_id}.eml")),
+                );
+                let _ = std::fs::remove_file(
+                    repo.root().join(format!("{folder_dir}/{source_id}.meta.json")),
+                );
+                let _ = std::fs::remove_file(
+                    repo.root().join(format!("{folder_dir}/{source_id}.json")),
+                );
+                let _ = std::fs::remove_file(
+                    repo.root()
+                        .join(format!("{folder_dir}/{source_id}.attachments.json")),
+                );
+            }
 
-            let meta = MessageMeta::from_fetched(&fetched);
-            let meta_path = format!("{folder_dir}/{id}.meta.json");
+            let mut meta = MessageMeta::from_fetched(&fetched);
+            meta.canonical_id = Some(canonical.clone());
+            let meta_path = format!("{folder_dir}/{canonical}.meta.json");
             repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
 
             // Attachment index: parse nodemailer.attachments[], write each
             // blob to _attachments/<sha256>, and write the reference list as
             // a sidecar. REST-only — IMAP's `extra` is None.
-            let attachments_sidecar = format!("{folder_dir}/{id}.attachments.json");
+            let attachments_sidecar = format!("{folder_dir}/{canonical}.attachments.json");
             let attachments_sidecar_fs = repo.root().join(&attachments_sidecar);
             match extract_attachments(&fetched, alias, repo)? {
                 Some(refs) if !refs.is_empty() => {
@@ -221,7 +255,6 @@ pub async fn pull_mail(
                     )?;
                 }
                 _ => {
-                    // No attachments on this revision — remove any stale sidecar.
                     let _ = std::fs::remove_file(attachments_sidecar_fs);
                 }
             }
@@ -233,26 +266,29 @@ pub async fn pull_mail(
             }
         }
 
-        // 4. Detect deletions. `all_ids` is authoritative even when
-        //    `changed` was CHANGEDSINCE-filtered.
-        let remote_ids: HashSet<String> = list_result
+        // 4. Detect deletions. Build the set of source ids currently on
+        //    the remote, then find local entries whose source id is no
+        //    longer present.
+        let remote_source_ids: HashSet<String> = list_result
             .all_ids
             .iter()
             .map(|id| filename_safe(id))
             .collect();
-        for local_id in local_meta.keys() {
-            if !remote_ids.contains(local_id) {
-                let _ =
-                    std::fs::remove_file(repo.root().join(format!("{folder_dir}/{local_id}.eml")));
-                let _ =
-                    std::fs::remove_file(repo.root().join(format!("{folder_dir}/{local_id}.json")));
+        for (canonical, meta) in &local_meta {
+            let source_id = filename_safe(&meta.id);
+            if !remote_source_ids.contains(&source_id) {
                 let _ = std::fs::remove_file(
-                    repo.root()
-                        .join(format!("{folder_dir}/{local_id}.meta.json")),
+                    repo.root().join(format!("{folder_dir}/{canonical}.eml")),
+                );
+                let _ = std::fs::remove_file(
+                    repo.root().join(format!("{folder_dir}/{canonical}.json")),
+                );
+                let _ = std::fs::remove_file(
+                    repo.root().join(format!("{folder_dir}/{canonical}.meta.json")),
                 );
                 let _ = std::fs::remove_file(
                     repo.root()
-                        .join(format!("{folder_dir}/{local_id}.attachments.json")),
+                        .join(format!("{folder_dir}/{canonical}.attachments.json")),
                 );
                 summary.deleted += 1;
             }
@@ -355,6 +391,71 @@ fn cleanup_removed_folders(repo: &Repo, alias: &str, folders: &[Folder]) -> Resu
         }
     }
     Ok(())
+}
+
+/// Derive a canonical message identifier from the RFC822 Message-ID
+/// header. Source-agnostic: the same email produces the same canonical
+/// ID regardless of whether it was pulled via REST or IMAP.
+///
+/// Returns a 16-hex-char (8-byte) sha256 prefix. At typical mailbox
+/// sizes (<100k messages) the collision probability is negligible.
+///
+/// Falls back to hashing the source-specific id if no Message-ID header
+/// is available (drafts, broken mailers).
+fn derive_canonical_id(fetched: &crate::source::FetchedMessage) -> String {
+    // Try REST's parsed header_message_id first.
+    if let Some(mid) = fetched
+        .extra
+        .as_ref()
+        .and_then(|e| e.get("header_message_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return hash_to_canonical(mid);
+    }
+    // Parse from raw RFC822 bytes (IMAP path, or REST fallback).
+    if let Some(mid) = extract_message_id_header(&fetched.raw) {
+        return hash_to_canonical(&mid);
+    }
+    // Last resort: hash the source-specific id.
+    hash_to_canonical(&fetched.summary.id)
+}
+
+fn hash_to_canonical(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let hash = hasher.finalize();
+    // 16 hex chars = 8 bytes. Unique enough for mailbox-scale collections.
+    format!("{:x}", hash)[..16].to_string()
+}
+
+/// Extract the Message-ID header value from raw RFC822 bytes. Handles
+/// folded headers (continuation lines starting with whitespace). Returns
+/// the angle-bracketed value (e.g. `<abc@example.com>`) trimmed.
+fn extract_message_id_header(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let mut in_header = false;
+    let mut value = String::new();
+    for line in text.lines() {
+        // Blank line = end of headers.
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with("Message-ID:") || line.starts_with("Message-Id:") || line.starts_with("message-id:") {
+            value = line.split_once(':')?.1.trim().to_string();
+            in_header = true;
+        } else if in_header && (line.starts_with(' ') || line.starts_with('\t')) {
+            // Folded header continuation.
+            value.push_str(line.trim());
+        } else {
+            in_header = false;
+        }
+    }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 /// Pull `nodemailer.attachments[]` out of a fetched REST message, write each
@@ -571,6 +672,61 @@ mod tests {
         let repo = Repo::open_or_init(tmp.path()).unwrap();
         let (uv, mi) = read_prev_folder_state(&repo, "sources/forwardemail/alias/mail/INBOX");
         assert_eq!((uv, mi), (None, None));
+    }
+
+    #[test]
+    fn canonical_id_from_message_id_header() {
+        let fetched = FetchedMessage {
+            summary: blank_summary(),
+            raw: b"Message-ID: <abc@example.com>\r\nSubject: test\r\n\r\nbody".to_vec(),
+            extra: None,
+        };
+        let c1 = derive_canonical_id(&fetched);
+        assert_eq!(c1.len(), 16, "canonical id should be 16 hex chars");
+
+        // Same Message-ID from REST extra field should produce same hash.
+        let fetched_rest = FetchedMessage {
+            summary: blank_summary(),
+            raw: b"".to_vec(),
+            extra: Some(serde_json::json!({"header_message_id": "<abc@example.com>"})),
+        };
+        let c2 = derive_canonical_id(&fetched_rest);
+        assert_eq!(c1, c2, "IMAP and REST should produce the same canonical id");
+    }
+
+    #[test]
+    fn canonical_id_falls_back_to_source_id() {
+        let fetched = FetchedMessage {
+            summary: blank_summary(),
+            raw: b"Subject: no message-id\r\n\r\nbody".to_vec(),
+            extra: None,
+        };
+        let c = derive_canonical_id(&fetched);
+        assert_eq!(c.len(), 16);
+    }
+
+    #[test]
+    fn extract_message_id_from_raw() {
+        let raw = b"From: a@b.com\r\nMessage-ID: <test-123@x.com>\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(
+            extract_message_id_header(raw),
+            Some("<test-123@x.com>".into())
+        );
+    }
+
+    #[test]
+    fn extract_message_id_handles_folded_header() {
+        let raw = b"From: a@b.com\r\nMessage-ID:\r\n <folded@x.com>\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(
+            extract_message_id_header(raw),
+            Some("<folded@x.com>".into())
+        );
+    }
+
+    #[test]
+    fn extract_message_id_missing_returns_none() {
+        let raw = b"From: a@b.com\r\nSubject: hi\r\n\r\nbody";
+        assert_eq!(extract_message_id_header(raw), None);
     }
 
     #[test]

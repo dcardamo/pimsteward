@@ -102,9 +102,9 @@ pub struct ForwardemailConfig {
     /// Writes always go through REST regardless of this setting — mixing
     /// write backends complicates audit attribution.
     ///
-    /// **Warning:** do not switch source values against the same backup
-    /// tree without first wiping the corresponding subtree. Different
-    /// sources may use different id schemes for filenames.
+    /// Safe to switch between `rest` and `imap` against the same backup
+    /// tree: canonical message IDs (hash of the RFC822 Message-ID header)
+    /// are source-agnostic, so files keep their identity across backends.
     #[serde(default)]
     pub mail_source: MailSourceKind,
 

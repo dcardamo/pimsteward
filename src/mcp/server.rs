@@ -96,30 +96,58 @@ impl PimstewardServer {
             .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
     }
 
-    /// Look up a message's current folder via forwardemail's REST API.
-    /// Used by email write tools that take a bare message id so the
-    /// permission check can be scoped to the folder that actually contains
-    /// the message. A message that doesn't exist or lacks a `folder_path`
-    /// field is surfaced as an invalid-params error, same as a permission
-    /// denial — callers shouldn't be able to mutate something we can't
-    /// identify.
-    async fn lookup_message_folder(&self, id: &str) -> Result<String, McpError> {
-        let full = self
+    /// Look up a message's current folder and source-specific id from
+    /// the backup tree's meta.json. The `id` parameter is the canonical
+    /// id (filename stem) as seen in the backup. Returns (folder, source_id).
+    fn lookup_message_meta(
+        &self,
+        canonical_id: &str,
+    ) -> Result<crate::pull::mail::MessageMeta, McpError> {
+        // Scan all folder directories for a meta.json matching this canonical id.
+        let mail_root = self
             .inner
-            .client
-            .get_message(id)
-            .await
-            .map_err(|e| self.api_error(e))?;
-        full.get("folder_path")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .ok_or_else(|| {
-                McpError::invalid_params(
-                    format!("message {id} has no folder_path — cannot scope permission check"),
-                    None,
-                )
-            })
+            .repo
+            .root()
+            .join(format!("sources/forwardemail/{}/mail", self.inner.alias));
+        if !mail_root.exists() {
+            return Err(McpError::invalid_params(
+                format!("no mail tree for alias {}", self.inner.alias),
+                None,
+            ));
+        }
+        for folder_entry in std::fs::read_dir(&mail_root).map_err(|e| {
+            McpError::internal_error(format!("readdir {}: {e}", mail_root.display()), None)
+        })? {
+            let folder_entry = folder_entry.map_err(|e| {
+                McpError::internal_error(format!("dir entry: {e}"), None)
+            })?;
+            let name = folder_entry.file_name().into_string().unwrap_or_default();
+            if name == "_attachments" {
+                continue;
+            }
+            let meta_path = folder_entry
+                .path()
+                .join(format!("{canonical_id}.meta.json"));
+            if meta_path.exists() {
+                let bytes = std::fs::read(&meta_path).map_err(|e| {
+                    McpError::internal_error(format!("read {}: {e}", meta_path.display()), None)
+                })?;
+                let meta: crate::pull::mail::MessageMeta =
+                    serde_json::from_slice(&bytes).map_err(|e| {
+                        McpError::internal_error(
+                            format!("parse {}: {e}", meta_path.display()),
+                            None,
+                        )
+                    })?;
+                return Ok(meta);
+            }
+        }
+        Err(McpError::invalid_params(
+            format!("message {canonical_id} not found in backup tree"),
+            None,
+        ))
     }
+
 
     fn api_error(&self, e: crate::Error) -> McpError {
         McpError::internal_error(format!("forwardemail: {e}"), None)
@@ -772,9 +800,10 @@ impl PimstewardServer {
         // write access *to that folder*. This makes per-folder overrides
         // (e.g. default=read + Drafts=read_write) actually work for flag
         // updates, which don't carry a folder in their params.
-        let folder = self.lookup_message_folder(&p.id).await?;
+        let meta = self.lookup_message_meta(&p.id)?;
+        let folder = meta.folder_path.as_deref().unwrap_or("INBOX");
         self.check_write_scoped(Scope::Email {
-            folder: Some(&folder),
+            folder: Some(folder),
         })?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::update_flags(
@@ -783,8 +812,8 @@ impl PimstewardServer {
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            &folder,
-            &p.id,
+            folder,
+            &meta.id,
             &p.flags,
         )
         .await
@@ -804,9 +833,10 @@ impl PimstewardServer {
         // message) and the target folder (adding it). Check both. The
         // source folder is looked up from the message; the target comes
         // from params.
-        let source_folder = self.lookup_message_folder(&p.id).await?;
+        let meta = self.lookup_message_meta(&p.id)?;
+        let source_folder = meta.folder_path.as_deref().unwrap_or("INBOX");
         self.check_write_scoped(Scope::Email {
-            folder: Some(&source_folder),
+            folder: Some(source_folder),
         })?;
         self.check_write_scoped(Scope::Email {
             folder: Some(&p.folder),
@@ -818,8 +848,8 @@ impl PimstewardServer {
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            &source_folder,
-            &p.id,
+            source_folder,
+            &meta.id,
             &p.folder,
         )
         .await
@@ -835,9 +865,10 @@ impl PimstewardServer {
         // Scoped-only: delete is a write on the folder currently holding
         // the message. Look it up and gate per-folder so Trash=none (or
         // any other per-folder rule) is actually honoured.
-        let folder = self.lookup_message_folder(&p.id).await?;
+        let meta = self.lookup_message_meta(&p.id)?;
+        let folder = meta.folder_path.as_deref().unwrap_or("INBOX");
         self.check_write_scoped(Scope::Email {
-            folder: Some(&folder),
+            folder: Some(folder),
         })?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::delete_message(
@@ -846,8 +877,8 @@ impl PimstewardServer {
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            &folder,
-            &p.id,
+            folder,
+            &meta.id,
         )
         .await
         .map_err(|e| self.api_error(e))?;
