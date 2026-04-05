@@ -135,7 +135,7 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
                     // INBOX is where new mail lands; IDLE there covers the
                     // overwhelming majority of push-worthy events. Non-INBOX
                     // changes fall through to the periodic ticker.
-                    idle_loop(idle_cfg, "INBOX".to_string(), notify_clone).await;
+                    idle_loop(idle_cfg, "INBOX".to_string(), notify_clone, None).await;
                 }
                 .instrument(span),
             ));

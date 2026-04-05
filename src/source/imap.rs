@@ -529,12 +529,23 @@ fn parse_imap_uid(id: &str) -> Result<u32, Error> {
 /// Errors (disconnects, TLS handshake failures, login failures) are
 /// logged and retried with exponential backoff capped at 5 minutes so a
 /// flaky network doesn't hammer the server.
-pub async fn idle_loop(config: ImapConfig, folder: String, notify: Arc<Notify>) {
+/// Optional one-shot signal fired when the IDLE connection is first
+/// established and ready to receive notifications. Used by tests to
+/// avoid a fragile sleep before creating trigger messages; production
+/// callers pass `None`.
+pub type IdleReady = Option<Arc<Notify>>;
+
+pub async fn idle_loop(
+    config: ImapConfig,
+    folder: String,
+    notify: Arc<Notify>,
+    ready: IdleReady,
+) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(5 * 60);
 
     loop {
-        match run_one_idle_connection(&config, &folder, &notify).await {
+        match run_one_idle_connection(&config, &folder, &notify, &ready).await {
             Ok(()) => {
                 // Clean exit from the inner loop shouldn't happen except on
                 // shutdown — reset the backoff and start a new connection.
@@ -556,6 +567,7 @@ async fn run_one_idle_connection(
     config: &ImapConfig,
     folder: &str,
     notify: &Notify,
+    ready: &IdleReady,
 ) -> Result<(), Error> {
     // Connect using the same TLS path as ImapMailSource::connect. This is
     // a dedicated connection; the puller's session is untouched.
@@ -591,12 +603,22 @@ async fn run_one_idle_connection(
     // The inner loop: init IDLE, wait for a notification or timeout, DONE,
     // repeat. On any IMAP-layer error we bubble up so the outer loop
     // reconnects.
+    let mut first_idle = true;
     loop {
         let mut handle = session.idle();
         handle
             .init()
             .await
             .map_err(|e| Error::store(format!("IDLE init: {e}")))?;
+
+        // Signal readiness after the first successful IDLE init so tests
+        // can create trigger messages without a fragile sleep.
+        if first_idle {
+            if let Some(r) = ready {
+                r.notify_one();
+            }
+            first_idle = false;
+        }
 
         let (idle_fut, _stop) = handle.wait();
         let result = idle_fut.await;
