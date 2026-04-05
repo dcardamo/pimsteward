@@ -60,10 +60,10 @@
     <text x="370" y="170" font-size="110" font-weight="800" fill="#f8fafc" letter-spacing="-3">
       pim<tspan fill="#38bdf8">steward</tspan>
     </text>
-    <text x="374" y="222" font-size="28" font-weight="500" fill="#94a3b8">
+    <text x="374" y="220" font-size="23" font-weight="500" fill="#94a3b8" textLength="750" lengthAdjust="spacingAndGlyphs">
       A permission-aware MCP mediator for your mail, calendar &amp; contacts.
     </text>
-    <text x="374" y="262" font-size="24" font-weight="400" fill="#64748b">
+    <text x="374" y="258" font-size="21" font-weight="400" fill="#64748b" textLength="660" lengthAdjust="spacingAndGlyphs">
       Every change captured in git. Time-travel restore built in.
     </text>
   </g>
