@@ -368,6 +368,11 @@ since been built. Listed here so the delta is traceable.
 | Per-folder / per-calendar permissions | **V2.1** — `EmailPermission::Scoped` + `CalendarPermission::Scoped` with per-folder and per-calendar-id overrides, back-compat with flat TOML |
 | True `.eml` write-once store          | **V2.3** — Forwardemail's REST response already includes a `raw` field by default; pull loop extracts it into `<id>.eml` with a sidecar `meta.json` |
 | Native mail source fallback           | **V2.2** — `MailSource` trait + `ImapMailSource` using `async-imap` + `tokio-rustls`, verified live against `imap.forwardemail.net:993` |
+| Native CalDAV source                  | **V2.4** — `DavCalendarSource` using raw HTTP PROPFIND/REPORT via reqwest + quick-xml, verified live against `caldav.forwardemail.net` |
+| Native CardDAV source                 | **V2.4** — `DavContactsSource` sibling implementation, verified live against `carddav.forwardemail.net` (different subdomain from CalDAV) |
+| Automated re-APPEND on mail restore   | **V2.4** — `MailOperation::Append { target_folder, raw_bytes }` reads the `.eml` from git at `at_sha` and POSTs it via `Client::append_raw_message`; the `Unrestorable` variant is gone |
+| Weekly `git gc --auto` timer          | **V2.4** — `daemon::spawn_gc_timer` runs `git gc --auto` on a 7-day tokio interval against the backup repo |
+| `CONTRIBUTING.md`                     | **V2.4** — added with build/test/style instructions and the safety guardrail requirement for e2e tests |
 
 ## Deferred (and why)
 
@@ -378,19 +383,14 @@ future improvement when the need is concrete.
 
 | # | Deferred                              | Reason |
 | - | ------------------------------------- | ------ |
-| 1 | **Native CalDAV source** (calendar)   | V2.2 shipped IMAP for mail only. CalDAV for calendars follows the same trait pattern but isn't built. REST calendar polling is fine at current scale. |
-| 2 | **Native CardDAV source** (contacts)  | Same — trait pattern ready, implementation not built. |
 | 3 | **Attachment dedup (`_attachments/<sha256>`)** | Forwardemail's REST references attachments in the `nodemailer` parse but doesn't expose them as separable binary blobs. IMAP could reach individual parts via `BODYSTRUCTURE` + `BODY[N]`, but nobody has asked for it. |
-| 4 | **Automated re-APPEND on mail restore** | `MailOperation::Unrestorable` surfaces the limitation cleanly. Could be built on top of `POST /v1/messages` with the stored `.eml` bytes from git. |
 | 5 | **Retention / pruning of git history** | Disk is cheap, history is the product. Revisit only if the repo becomes a problem size. |
-| 6 | **Weekly `git gc --auto` timer**      | Worth adding when fragmentation is observable — small systemd-style addition to the daemon. |
 | 7 | **Richer contact restore recreate**   | Current `Recreate` uses a placeholder email and only preserves `full_name`. Full vCard re-hydration needs a proper parser. Common case (undo a rename) is fully covered. |
 | 8 | **Calendar event optimistic concurrency (If-Match)** | Forwardemail's calendar events don't return an ETag header — API limitation, not a pimsteward gap. Contacts *do* support If-Match and pimsteward uses it. |
 | 9 | **Webhook-driven push ingest**        | Would require a public HTTPS endpoint (attack surface) and a partial delivery model. Forwardemail's storage is zero-knowledge so server-side push isn't architecturally possible. |
 | 10 | **Multi-alias support in one instance** | One alias per daemon. Run two if you need two. |
 | 11 | **Explicit adaptive rate-limit backoff** | `X-RateLimit-Remaining` is parsed and tracked atomically but the pull loop doesn't throttle. 1000/window is generous vs current usage. |
 | 12 | **Dedicated `get_*` MCP tools**       | `list_*` tools return full content for contacts/events/sieve; individual `get_*` would be redundant. `search_email` covers the mail case. |
-| 13 | **`CONTRIBUTING.md`**                 | Cosmetic. README + DESIGN.md + PLAN.md have enough. |
 
 ### Discovered during V2.x work
 
