@@ -111,6 +111,61 @@ are written back to forwardemail.
 
 ---
 
+## What can you do with this?
+
+Once pimsteward is wired up to your AI assistant, "PIM assistant" stops being
+a demo and starts being a daily driver. Some of the things it's built for:
+
+#### 📬 Mail — triage, search, summarise
+- **"What landed in my inbox this week that I haven't replied to?"** — the AI
+  runs a proper full-text + header search via forwardemail's API, summarises,
+  and proposes next actions.
+- **"Move anything from my accountant into the `taxes/` folder."** — batch
+  label/move operations across folders, logged and reversible.
+- **"Draft a reply to the Monday thread, polite decline."** — the AI writes
+  into your Drafts folder; you hit send.
+- **"Find every email that mentions project Gemini between Feb and April."**
+  — advanced search passed through to forwardemail, with results streamed
+  back over MCP so the assistant can reason across the full corpus.
+
+#### 🧹 Mail filtering — sieve rules as code
+- **"Any email from `@forwardemail.net` should skip the inbox and land in
+  `providers/`."** — the AI proposes a sieve rule; pimsteward previews the
+  diff against your current script, commits it, and uploads it.
+- **"Auto-archive newsletters older than a week."** — pimsteward edits
+  your sieve script, commits to git, and you get a clean rollback path if
+  the rule turns out to be too aggressive.
+- Every sieve change is a git diff you can `blame`, `revert`, or time-travel.
+
+#### 📅 Calendar — scheduling without the dance
+- **"Find me three 30-minute slots next week that don't clash with travel."**
+  — the AI reads your calendars and proposes slots.
+- **"Book it, invite Sam, title 'design review'."** — an actual `create_event`
+  write, committed to git with AI attribution.
+- **"Undo everything the AI moved on my calendar today."** — one restore
+  tool call, dry-run plan first, then apply.
+
+#### 👥 Contacts — dedupe, enrich, tidy
+- **"Merge the two 'Alex Kim' entries and keep the newer phone number."**
+- **"Add everyone I've exchanged more than five emails with this year to my
+  address book."**
+- **"Who on my contact list is missing a company?"** — AI reads, proposes
+  patches, writes vcards on approval.
+
+#### ⏪ Time-travel across all of it
+- **"What did my calendar look like on March 1st before the reorg?"** —
+  pimsteward checks out the git tree at that timestamp and hands it back.
+- **"Show me every change the AI made to my contacts this month."** —
+  `git log` restricted to the contacts path, filtered by the `ai:` commit
+  prefix.
+- **"Restore my `newsletters/` folder to where it was Friday morning."** —
+  dry-run diff, confirm, apply.
+
+The through-line: **everything the AI does is a commit, everything is
+reversible, everything is attributable.**
+
+---
+
 ## Architecture
 
 pimsteward is a single daemon that owns your forwardemail credentials and sits
@@ -232,10 +287,66 @@ sequenceDiagram
 
 ---
 
-## Permission model
+## Permission model — a trust gradient you control
 
-v1 is deliberately **coarse**: one setting per resource type, applied globally.
-Per-folder and per-calendar rules are a v2 question.
+Trust in an AI assistant is not binary, and neither is pimsteward. You set one
+policy per resource type, and you turn the dials up as the assistant earns it.
+
+| Level           | What the AI can do                                                           | Where it makes sense                  |
+| --------------- | ---------------------------------------------------------------------------- | ------------------------------------- |
+| **`none`**      | Resource is invisible — the MCP tools aren't even registered                 | Data you simply don't want AI near    |
+| **`read`**      | Search, read, summarise, quote — zero writes                                 | The safe default for everything       |
+| **`drafts`**    | *(email only)* read + create messages **only in your Drafts folder**         | Letting an AI help write replies      |
+| **`readwrite`** | Full CRUD: create, update, delete, move, send                                | Once the AI has earned it             |
+
+### A typical progression
+
+**Week one — "read-only everywhere that matters."**
+
+```toml
+[permissions]
+email    = "read"        # AI can search and summarise, never modify
+calendar = "readwrite"   # calendar mistakes are cheap and reversible
+contacts = "readwrite"   # same — and dedupe is a great first task
+sieve    = "read"        # look but don't touch your filter rules yet
+```
+
+Your assistant can triage your inbox, summarise threads, find meetings,
+propose sieve rules as *suggestions* — but it cannot touch a single byte of
+mail. This is where most people should start.
+
+**Month two — "you can draft, I'll send."**
+
+```toml
+[permissions]
+email    = "drafts"      # AI writes replies into Drafts only
+calendar = "readwrite"
+contacts = "readwrite"
+sieve    = "readwrite"   # AI now owns your filter rules (every change is a git diff)
+```
+
+The `drafts` tier is the middle step people actually want from an AI mail
+assistant: it can compose, quote, and thread replies into your Drafts folder,
+but it cannot send, delete, move, or modify any existing message. You review
+and hit send yourself.
+
+**Once the AI has earned it — "full trust, with receipts."**
+
+```toml
+[permissions]
+email    = "readwrite"   # full CRUD, including send
+calendar = "readwrite"
+contacts = "readwrite"
+sieve    = "readwrite"
+```
+
+At this point the assistant can autonomously triage, reply, file, and archive.
+The safety net is not the permission bit — it's the fact that **every mutation
+is still committed to git with AI attribution**, and `restore` can rewind any
+path to any point in time. You are trading convenience for the need to
+occasionally audit a `git log`, not for blind faith.
+
+### The rest of the config
 
 ```toml
 # /etc/pimsteward/config.toml
@@ -248,20 +359,15 @@ alias_password_file = "/run/pimsteward-secrets/forwardemail-alias-password"
 [storage]
 repo_path = "/data/Backups/<host>/pimsteward/<alias_slug>"
 
-[permissions]
-# Each: "none" | "read" | "readwrite"
-email    = "read"        # AI can search/read but never modify
-calendar = "readwrite"   # full CRUD
-contacts = "readwrite"
-sieve    = "readwrite"
-
 [mcp]
 listen = "unix:/run/pimsteward/mcp.sock"
 ```
 
 Permission checks happen **before** any API call and **before** any git write.
-A `none` resource is invisible to the AI — the corresponding MCP tools are not
-even registered.
+A `none` resource is invisible to the AI: the corresponding MCP tools are not
+registered at all, so the model never even learns they exist. Per-folder and
+per-calendar rules (e.g. "write to `work-cal` but never `family-cal`") are an
+explicit v2 question — v1 keeps the dials coarse on purpose.
 
 ---
 
