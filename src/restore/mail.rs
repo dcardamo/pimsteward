@@ -151,8 +151,11 @@ pub async fn plan_mail(
     Ok((plan, token))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_mail(
     client: &Client,
+    writer: &dyn crate::source::MailWriter,
+    source: &dyn crate::source::MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
@@ -169,28 +172,29 @@ pub async fn apply_mail(
     match &plan.operation {
         MailOperation::NoOp => return Ok(()),
         MailOperation::RestoreFlags { target_flags } => {
-            client
-                .update_message_flags(&plan.message_id, target_flags)
+            writer
+                .update_flags(&plan.folder, &plan.message_id, target_flags)
                 .await?;
         }
         MailOperation::MoveBack { target_folder } => {
-            client.move_message(&plan.message_id, target_folder).await?;
+            writer
+                .move_message(&plan.folder, &plan.message_id, target_folder)
+                .await?;
         }
         MailOperation::Append {
             target_folder,
             raw_bytes,
         } => {
-            // Re-append the historical message. Forwardemail generates a
-            // new backend id; the pull loop on refresh below will capture
-            // it as a brand-new .eml in the tree (the old id stays gone).
+            // Re-append via REST — IMAP APPEND would need raw RFC822
+            // construction which the MailWriter trait doesn't cover.
+            // This is the one restore op that still needs the REST client.
             client.append_raw_message(target_folder, raw_bytes).await?;
         }
     }
 
-    // Refresh via REST regardless of read source (same rationale as write/mail.rs).
-    let rest_source = crate::source::RestMailSource::new(client.clone());
+    // Refresh using the configured source so IDs stay consistent.
     let _ = pull_mail(
-        &rest_source,
+        source,
         repo,
         alias,
         &attribution.caller,

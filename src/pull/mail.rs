@@ -441,7 +441,8 @@ fn extract_message_id_header(raw: &[u8]) -> Option<String> {
         if line.is_empty() {
             break;
         }
-        if line.starts_with("Message-ID:") || line.starts_with("Message-Id:") || line.starts_with("message-id:") {
+        let lower = line.get(..11).map(|s| s.to_ascii_lowercase());
+        if lower.as_deref() == Some("message-id:") {
             value = line.split_once(':')?.1.trim().to_string();
             in_header = true;
         } else if in_header && (line.starts_with(' ') || line.starts_with('\t')) {

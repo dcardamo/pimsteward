@@ -58,8 +58,7 @@ impl Client {
 
     /// GET + decode JSON. Internal helper used by per-resource modules.
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
-        let resp = self.send(Method::GET, path).await?;
-        let bytes = resp.bytes().await?;
+        let bytes = self.send(Method::GET, path).await?;
         serde_json::from_slice(&bytes).map_err(Error::from)
     }
 
@@ -70,7 +69,10 @@ impl Client {
         self.get_json(path).await
     }
 
-    async fn send(&self, method: Method, path: &str) -> Result<Response, Error> {
+    /// Send a request, consume the response, and return the body bytes on
+    /// success. Non-2xx responses are converted to [`Error::Api`] with the
+    /// full response body included for debugging.
+    async fn send(&self, method: Method, path: &str) -> Result<Vec<u8>, Error> {
         self.backoff_if_throttled().await;
         let url = format!("{}{}", self.api_base, path);
         let resp = self
@@ -80,8 +82,7 @@ impl Client {
             .send()
             .await?;
         self.capture_rate_limit(&resp);
-        self.check_status(&resp)?;
-        Ok(resp)
+        self.consume_and_check(resp).await
     }
 
     /// POST JSON body, decode a typed response.
@@ -90,8 +91,7 @@ impl Client {
         Req: serde::Serialize + ?Sized,
         Resp: DeserializeOwned,
     {
-        let resp = self.send_json(Method::POST, path, body, None).await?;
-        let bytes = resp.bytes().await?;
+        let bytes = self.send_json(Method::POST, path, body, None).await?;
         serde_json::from_slice(&bytes).map_err(Error::from)
     }
 
@@ -106,12 +106,11 @@ impl Client {
         Req: serde::Serialize + ?Sized,
         Resp: DeserializeOwned,
     {
-        let resp = self.send_json(Method::PUT, path, body, if_match).await?;
-        let bytes = resp.bytes().await?;
+        let bytes = self.send_json(Method::PUT, path, body, if_match).await?;
         serde_json::from_slice(&bytes).map_err(Error::from)
     }
 
-    /// DELETE a path. Ignores the response body.
+    /// DELETE a path. Ignores the response body on success.
     pub(crate) async fn delete_path(&self, path: &str) -> Result<(), Error> {
         let _ = self.send(Method::DELETE, path).await?;
         Ok(())
@@ -123,7 +122,7 @@ impl Client {
         path: &str,
         body: &Req,
         if_match: Option<&str>,
-    ) -> Result<Response, Error>
+    ) -> Result<Vec<u8>, Error>
     where
         Req: serde::Serialize + ?Sized,
     {
@@ -140,8 +139,7 @@ impl Client {
         self.backoff_if_throttled().await;
         let resp = req.send().await?;
         self.capture_rate_limit(&resp);
-        self.check_status(&resp)?;
-        Ok(resp)
+        self.consume_and_check(resp).await
     }
 
     /// If the most recently observed `X-RateLimit-Remaining` is low, sleep
@@ -171,17 +169,30 @@ impl Client {
         }
     }
 
-    /// Convert non-2xx responses to [`Error::Api`]. The body is not read
-    /// here (reqwest's `Response` doesn't let us peek without consuming);
-    /// callers that need the body should decode the error separately.
-    fn check_status(&self, resp: &Response) -> Result<(), Error> {
+    /// Consume a response, returning the body bytes on success. Non-2xx
+    /// responses become [`Error::Api`] with the response body included
+    /// (truncated to 500 chars) for actionable error messages from
+    /// forwardemail (e.g. "alias not found", "rate limit exceeded").
+    async fn consume_and_check(&self, resp: Response) -> Result<Vec<u8>, Error> {
         let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::store(format!("reading response body: {e}")))?;
         if status.is_success() {
-            return Ok(());
+            return Ok(bytes.to_vec());
         }
+        let body_str: String = String::from_utf8_lossy(&bytes).chars().take(500).collect();
         Err(Error::Api {
             status: status.as_u16(),
-            message: status.canonical_reason().unwrap_or("unknown").to_string(),
+            message: if body_str.is_empty() {
+                status
+                    .canonical_reason()
+                    .unwrap_or("unknown")
+                    .to_string()
+            } else {
+                body_str
+            },
         })
     }
 }

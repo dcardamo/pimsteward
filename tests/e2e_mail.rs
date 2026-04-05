@@ -124,6 +124,8 @@ async fn mail_flag_update_and_restore() {
 
     restore::mail::apply_mail(
         &ctx.client,
+        &rest_source,
+        &rest_source,
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -219,6 +221,8 @@ async fn mail_move_back_to_original_folder() {
 
     restore::mail::apply_mail(
         &ctx.client,
+        &rest_source,
+        &rest_source,
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,

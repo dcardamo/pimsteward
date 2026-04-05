@@ -432,9 +432,12 @@ impl crate::source::traits::MailWriter for ImapMailSource {
                 .select(&folder)
                 .await
                 .map_err(|e| Error::store(format!("IMAP SELECT {folder}: {e}")))?;
-            // UID COPY + UID STORE \Deleted + EXPUNGE.
-            // RFC 6851 MOVE exists but async-imap doesn't expose it;
-            // COPY+EXPUNGE is the universally supported fallback.
+            // UID COPY + UID STORE \Deleted + UID EXPUNGE (RFC 4315).
+            // RFC 6851 MOVE exists but async-imap doesn't expose it.
+            // UID EXPUNGE only removes messages matching the specified
+            // UID set, unlike plain EXPUNGE which removes ALL \Deleted
+            // messages — critical for safety when other clients may have
+            // flagged messages for deletion concurrently.
             session
                 .uid_copy(uid.to_string(), target_folder)
                 .await
@@ -447,12 +450,12 @@ impl crate::source::traits::MailWriter for ImapMailSource {
                 .await
                 .map_err(|e| Error::store(format!("IMAP STORE collect: {e}")))?;
             session
-                .expunge()
+                .uid_expunge(uid.to_string())
                 .await
-                .map_err(|e| Error::store(format!("IMAP EXPUNGE: {e}")))?
+                .map_err(|e| Error::store(format!("IMAP UID EXPUNGE: {e}")))?
                 .try_collect::<Vec<_>>()
                 .await
-                .map_err(|e| Error::store(format!("IMAP EXPUNGE collect: {e}")))?;
+                .map_err(|e| Error::store(format!("IMAP UID EXPUNGE collect: {e}")))?;
             Ok(())
         }
         .await;
@@ -478,13 +481,15 @@ impl crate::source::traits::MailWriter for ImapMailSource {
                 .try_collect()
                 .await
                 .map_err(|e| Error::store(format!("IMAP STORE collect: {e}")))?;
+            // UID EXPUNGE (RFC 4315) — only removes this specific UID,
+            // not other messages that may be \Deleted concurrently.
             session
-                .expunge()
+                .uid_expunge(uid.to_string())
                 .await
-                .map_err(|e| Error::store(format!("IMAP EXPUNGE: {e}")))?
+                .map_err(|e| Error::store(format!("IMAP UID EXPUNGE: {e}")))?
                 .try_collect::<Vec<_>>()
                 .await
-                .map_err(|e| Error::store(format!("IMAP EXPUNGE collect: {e}")))?;
+                .map_err(|e| Error::store(format!("IMAP UID EXPUNGE collect: {e}")))?;
             Ok(())
         }
         .await;

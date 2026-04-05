@@ -1301,6 +1301,8 @@ impl PimstewardServer {
         let attr = self.attribution(None, p.reason);
         crate::restore::mail::apply_mail(
             &self.inner.client,
+            self.inner.mail_writer.as_ref(),
+            self.inner.mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1436,9 +1438,9 @@ impl ServerHandler for PimstewardServer {
             format!(
                 "pimsteward — permission-aware PIM mediator for forwardemail.net.\n\
                  Alias: {}\n\
-                 This server exposes read-only tools for email, calendar, contacts, \
+                 Read, write, and restore tools for email, calendar, contacts, \
                  and sieve scripts, gated by the configured permission matrix. \
-                 Every mutation (not yet in v1) will produce an attributed git commit.",
+                 Every mutation produces an attributed git commit in the backup repo.",
                 self.inner.alias
             ),
         )

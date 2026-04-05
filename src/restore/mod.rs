@@ -36,6 +36,14 @@ use std::process::Command;
 /// Read a blob from a specific commit via `git show <sha>:<path>`. Shared
 /// helper used by every restore module.
 pub(crate) fn read_git_blob(repo: &Repo, sha: &str, path: &str) -> Result<Vec<u8>, crate::Error> {
+    // Reject path traversal attempts. git show resolves relative to the
+    // repo root so `..` escapes are rejected by git itself, but we
+    // validate here for defense in depth.
+    if path.contains("..") {
+        return Err(crate::Error::config(format!(
+            "path traversal rejected: {path}"
+        )));
+    }
     let out = Command::new("git")
         .args(["show", &format!("{sha}:{path}")])
         .current_dir(repo.root())
