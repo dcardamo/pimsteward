@@ -1,15 +1,17 @@
 //! e2e tests for the IMAP read path against the real forwardemail
 //! IMAP server (`imap.forwardemail.net:993`).
 //!
-//! Read-only: verifies list_folders, list_messages, and fetch_message
-//! return valid data. Does not mutate the mailbox.
+//! Verifies list_folders, list_messages, fetch_message, and IMAP IDLE
+//! push notifications against the real server.
 
 #[path = "common/mod.rs"]
 mod common;
 
 use common::E2eContext;
-use pimsteward::source::imap::{ImapConfig, ImapMailSource};
+use pimsteward::source::imap::{idle_loop, ImapConfig, ImapMailSource};
 use pimsteward::source::MailSource;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Seed a test message via REST so the IMAP tests have something to read.
 /// Returns the forwardemail message id (for cleanup).
@@ -133,5 +135,68 @@ async fn imap_fetch_message_returns_rfc822() {
     assert!(fetched.extra.is_none(), "IMAP extra should be None");
 
     // Cleanup
+    ctx.client.delete_message(&msg_id).await.expect("cleanup");
+}
+
+/// IMAP IDLE push notification: start an IDLE listener on INBOX, create
+/// a message via REST, and verify the Notify fires within a reasonable
+/// timeout. This exercises the full idle_loop → Notify → wake path that
+/// the daemon uses for sub-minute mail sync.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn imap_idle_fires_on_new_message() {
+    let ctx = E2eContext::from_env();
+    let pass = std::fs::read_to_string(
+        std::env::var("PIMSTEWARD_TEST_ALIAS_PASSWORD_FILE")
+            .unwrap_or_else(|_| "/home/dan/.config/secrets/pimsteward-test-alias-password".into()),
+    )
+    .expect("reading password file")
+    .trim()
+    .to_string();
+
+    let idle_cfg = ImapConfig::forwardemail(ctx.alias.clone(), pass);
+    let notify = Arc::new(Notify::new());
+    let notify_clone = notify.clone();
+
+    // Spawn the IDLE listener in a background task.
+    let idle_handle = tokio::spawn(async move {
+        idle_loop(idle_cfg, "INBOX".to_string(), notify_clone).await;
+    });
+
+    // Give the IDLE connection time to establish and enter IDLE state.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Create a message via REST — triggers an IMAP EXISTS notification
+    // which idle_loop translates into a Notify wake.
+    let subject = format!("idle_e2e_{}", std::process::id());
+    let msg = pimsteward::forwardemail::writes::NewMessage {
+        folder: "INBOX".to_string(),
+        to: vec![ctx.alias.clone()],
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject,
+        text: Some("IDLE test body".to_string()),
+        html: None,
+    };
+    let result = ctx.client.create_message(&msg).await.expect("create msg");
+    let msg_id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .expect("msg id")
+        .to_string();
+
+    // Wait for the Notify — 30s timeout is generous; real latency is <2s.
+    let wake = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        notify.notified(),
+    )
+    .await;
+    assert!(
+        wake.is_ok(),
+        "IMAP IDLE should have fired Notify within 30s of new message"
+    );
+
+    // Cleanup
+    idle_handle.abort();
     ctx.client.delete_message(&msg_id).await.expect("cleanup");
 }
