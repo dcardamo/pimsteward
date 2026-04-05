@@ -3,7 +3,7 @@
 //! check on the front and a JSON-ready return value on the back.
 
 use crate::forwardemail::Client;
-use crate::permission::{Permissions, Resource};
+use crate::permission::{Permissions, Resource, Scope};
 use crate::store::Repo;
 use crate::write::audit::Attribution;
 use rmcp::{
@@ -60,6 +60,24 @@ impl PimstewardServer {
         self.inner
             .permissions
             .check_write(resource)
+            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+    }
+
+    /// Scoped read check — per-folder for email, per-calendar for calendar.
+    /// Passing `None` for the scope target behaves identically to
+    /// [`Self::check`].
+    fn check_scoped(&self, scope: Scope<'_>) -> Result<(), McpError> {
+        self.inner
+            .permissions
+            .check_read_scoped(&scope)
+            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+    }
+
+    /// Scoped write check.
+    fn check_write_scoped(&self, scope: Scope<'_>) -> Result<(), McpError> {
+        self.inner
+            .permissions
+            .check_write_scoped(&scope)
             .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
     }
 
@@ -360,7 +378,11 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<SearchEmailParams>,
     ) -> Result<String, McpError> {
-        self.check(Resource::Email)?;
+        // If folder is specified, honor per-folder scoped permission.
+        // If not, fall back to email resource-level default.
+        self.check_scoped(Scope::Email {
+            folder: p.folder.as_deref(),
+        })?;
 
         // Build a query string from the optional params. The pass-through is
         // intentionally simple so the AI can learn the parameter set.
@@ -655,7 +677,13 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<MoveMessageParams>,
     ) -> Result<String, McpError> {
+        // Require write access on the TARGET folder. Source folder is not
+        // known without a message lookup; resource-level write is also
+        // required as a baseline.
         self.check_write(Resource::Email)?;
+        self.check_write_scoped(Scope::Email {
+            folder: Some(&p.folder),
+        })?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::move_message(
             &self.inner.client,
@@ -697,7 +725,10 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<CreateEventParams>,
     ) -> Result<String, McpError> {
-        self.check_write(Resource::Calendar)?;
+        // Per-calendar scoped check: the target calendar id is in the params.
+        self.check_write_scoped(Scope::Calendar {
+            calendar_id: Some(&p.calendar_id),
+        })?;
         let attr = self.attribution(None, p.reason);
         let created = crate::write::calendar::create_event(
             &self.inner.client,
@@ -722,7 +753,17 @@ impl PimstewardServer {
         &self,
         Parameters(p): Parameters<UpdateEventParams>,
     ) -> Result<String, McpError> {
-        self.check_write(Resource::Calendar)?;
+        // If moving to a new calendar, require write access on the target
+        // calendar. Otherwise fall back to resource-level write check since
+        // we don't know the source calendar without a lookup (and don't
+        // want to force an extra API call per mutation).
+        if let Some(ref target) = p.target_calendar_id {
+            self.check_write_scoped(Scope::Calendar {
+                calendar_id: Some(target),
+            })?;
+        } else {
+            self.check_write(Resource::Calendar)?;
+        }
         if p.ical.is_none() && p.target_calendar_id.is_none() {
             return Err(McpError::invalid_params(
                 "update_event requires at least one of `ical` or `target_calendar_id`",

@@ -229,8 +229,8 @@ sieve = "read_write"
         assert_eq!(cfg.log_level, "debug");
         assert_eq!(cfg.forwardemail.api_base, "https://test.example");
         assert_eq!(cfg.storage.repo_path, PathBuf::from("/tmp/repo"));
-        assert_eq!(cfg.permissions.email, Access::Read);
-        assert_eq!(cfg.permissions.calendar, Access::ReadWrite);
+        assert_eq!(cfg.permissions.email.default_access(), Access::Read);
+        assert_eq!(cfg.permissions.calendar.default_access(), Access::ReadWrite);
     }
 
     #[test]

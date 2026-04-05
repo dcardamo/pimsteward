@@ -1,9 +1,55 @@
 //! Permission model.
 //!
-//! v1 is deliberately coarse: one setting per resource type, applied
-//! globally. See PLAN.md § "Permission model" for rationale.
+//! Each resource (email, calendar, contacts, sieve) has a default access
+//! level. Email and calendar additionally support scoped overrides:
+//!
+//! - **Email** can have per-folder rules keyed by folder path ("INBOX",
+//!   "Sent Mail", etc.). If a rule matches, it wins over the default.
+//! - **Calendar** can have per-calendar rules keyed by the forwardemail
+//!   calendar id.
+//!
+//! Contacts and sieve are globally scoped in v2 — forwardemail has one
+//! default address book per alias and a flat namespace of sieve scripts,
+//! so per-item rules add friction without meaningful security value.
+//!
+//! # TOML forms
+//!
+//! Simple (back-compat with v1):
+//!
+//! ```toml
+//! [permissions]
+//! email    = "read"
+//! calendar = "read_write"
+//! contacts = "read_write"
+//! sieve    = "read_write"
+//! ```
+//!
+//! Scoped (v2):
+//!
+//! ```toml
+//! [permissions]
+//! contacts = "read_write"
+//! sieve    = "read_write"
+//!
+//! [permissions.email]
+//! default = "read"
+//! [permissions.email.folders]
+//! "INBOX"     = "read_write"
+//! "Archive"   = "read_write"
+//! "Trash"     = "none"
+//!
+//! [permissions.calendar]
+//! default = "none"
+//! [permissions.calendar.by_id]
+//! "cal-personal-abc" = "read_write"
+//! "cal-work-xyz"     = "read"
+//! ```
+//!
+//! Both forms deserialize into the same [`Permissions`] struct via an
+//! `untagged` enum on each per-resource field.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 
 /// Which forwardemail resource kind a tool or operation touches.
@@ -39,42 +85,151 @@ pub enum Access {
 }
 
 impl Access {
-    /// True if this access level permits reading (read or readwrite).
     pub fn can_read(self) -> bool {
         matches!(self, Self::Read | Self::ReadWrite)
     }
-
-    /// True if this access level permits writing (readwrite only).
     pub fn can_write(self) -> bool {
         matches!(self, Self::ReadWrite)
     }
 }
 
-/// Full permission matrix — one [`Access`] per [`Resource`].
+/// Email permission: either a flat access level or a scoped form with
+/// per-folder overrides. Serialized untagged so `email = "read"` (flat)
+/// and `email.default = "read"` (scoped) both parse as valid TOML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmailPermission {
+    Flat(Access),
+    Scoped(ScopedEmail),
+}
+
+impl Default for EmailPermission {
+    fn default() -> Self {
+        // Default is a flat "none" — denies everything until the user
+        // grants something explicitly. Using Flat here (rather than a
+        // dedicated Unset variant) keeps the enum cleanly serializable
+        // in both directions, which figment needs for its layered merge.
+        Self::Flat(Access::None)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScopedEmail {
+    #[serde(default)]
+    pub default: Access,
+    #[serde(default)]
+    pub folders: HashMap<String, Access>,
+}
+
+impl EmailPermission {
+    pub fn default_access(&self) -> Access {
+        match self {
+            Self::Flat(a) => *a,
+            Self::Scoped(s) => s.default,
+        }
+    }
+
+    /// Access for a specific folder. Per-folder rule wins over the default
+    /// if present.
+    pub fn for_folder(&self, folder: Option<&str>) -> Access {
+        match self {
+            Self::Flat(a) => *a,
+            Self::Scoped(s) => match folder {
+                Some(f) => s.folders.get(f).copied().unwrap_or(s.default),
+                None => s.default,
+            },
+        }
+    }
+}
+
+/// Calendar permission: flat or scoped by calendar id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CalendarPermission {
+    Flat(Access),
+    Scoped(ScopedCalendar),
+}
+
+impl Default for CalendarPermission {
+    fn default() -> Self {
+        Self::Flat(Access::None)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScopedCalendar {
+    #[serde(default)]
+    pub default: Access,
+    #[serde(default)]
+    pub by_id: HashMap<String, Access>,
+}
+
+impl CalendarPermission {
+    pub fn default_access(&self) -> Access {
+        match self {
+            Self::Flat(a) => *a,
+            Self::Scoped(s) => s.default,
+        }
+    }
+
+    pub fn for_calendar(&self, calendar_id: Option<&str>) -> Access {
+        match self {
+            Self::Flat(a) => *a,
+            Self::Scoped(s) => match calendar_id {
+                Some(c) => s.by_id.get(c).copied().unwrap_or(s.default),
+                None => s.default,
+            },
+        }
+    }
+}
+
+/// Full permission matrix.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Permissions {
     #[serde(default)]
-    pub email: Access,
+    pub email: EmailPermission,
     #[serde(default)]
-    pub calendar: Access,
+    pub calendar: CalendarPermission,
     #[serde(default)]
     pub contacts: Access,
     #[serde(default)]
     pub sieve: Access,
 }
 
+/// Scope of a permission check — identifies a specific resource instance
+/// when one is known. `Resource` (no scope) falls back to the default for
+/// that resource type.
+#[derive(Debug, Clone)]
+pub enum Scope<'a> {
+    Email { folder: Option<&'a str> },
+    Calendar { calendar_id: Option<&'a str> },
+    Contacts,
+    Sieve,
+}
+
 impl Permissions {
-    /// Look up the access level for a resource.
+    /// Flat resource-level access (default for the resource).
     pub fn get(&self, resource: Resource) -> Access {
         match resource {
-            Resource::Email => self.email,
-            Resource::Calendar => self.calendar,
+            Resource::Email => self.email.default_access(),
+            Resource::Calendar => self.calendar.default_access(),
             Resource::Contacts => self.contacts,
             Resource::Sieve => self.sieve,
         }
     }
 
-    /// Gate a read operation. Returns an error if the resource isn't readable.
+    /// Scoped access lookup. If a scope override applies, returns that;
+    /// otherwise returns the resource default.
+    pub fn get_scoped(&self, scope: &Scope<'_>) -> Access {
+        match scope {
+            Scope::Email { folder } => self.email.for_folder(*folder),
+            Scope::Calendar { calendar_id } => self.calendar.for_calendar(*calendar_id),
+            Scope::Contacts => self.contacts,
+            Scope::Sieve => self.sieve,
+        }
+    }
+
+    /// Gate a resource-level read.
     pub fn check_read(&self, resource: Resource) -> Result<(), crate::Error> {
         let granted = self.get(resource);
         if granted.can_read() {
@@ -88,7 +243,7 @@ impl Permissions {
         }
     }
 
-    /// Gate a write operation. Returns an error if the resource isn't writable.
+    /// Gate a resource-level write.
     pub fn check_write(&self, resource: Resource) -> Result<(), crate::Error> {
         let granted = self.get(resource);
         if granted.can_write() {
@@ -101,11 +256,52 @@ impl Permissions {
             })
         }
     }
+
+    /// Gate a read with an optional scope override (per-folder, per-calendar).
+    /// If the scope is `None` for its resource, behaves identically to
+    /// [`check_read`].
+    pub fn check_read_scoped(&self, scope: &Scope<'_>) -> Result<(), crate::Error> {
+        let granted = self.get_scoped(scope);
+        if granted.can_read() {
+            Ok(())
+        } else {
+            Err(crate::Error::PermissionDenied {
+                resource: scope_resource(scope),
+                required: Access::Read,
+                granted,
+            })
+        }
+    }
+
+    /// Gate a write with an optional scope override.
+    pub fn check_write_scoped(&self, scope: &Scope<'_>) -> Result<(), crate::Error> {
+        let granted = self.get_scoped(scope);
+        if granted.can_write() {
+            Ok(())
+        } else {
+            Err(crate::Error::PermissionDenied {
+                resource: scope_resource(scope),
+                required: Access::ReadWrite,
+                granted,
+            })
+        }
+    }
+}
+
+fn scope_resource(scope: &Scope<'_>) -> Resource {
+    match scope {
+        Scope::Email { .. } => Resource::Email,
+        Scope::Calendar { .. } => Resource::Calendar,
+        Scope::Contacts => Resource::Contacts,
+        Scope::Sieve => Resource::Sieve,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Access basics ───────────────────────────────────────────────
 
     #[test]
     fn access_ordering() {
@@ -127,14 +323,25 @@ mod tests {
         assert!(Access::ReadWrite.can_write());
     }
 
+    // ── Resource-level checks (back-compat with v1 API) ────────────
+
+    fn flat_permissions(
+        email: Access,
+        calendar: Access,
+        contacts: Access,
+        sieve: Access,
+    ) -> Permissions {
+        Permissions {
+            email: EmailPermission::Flat(email),
+            calendar: CalendarPermission::Flat(calendar),
+            contacts,
+            sieve,
+        }
+    }
+
     #[test]
     fn check_read_allows_read_and_readwrite() {
-        let p = Permissions {
-            email: Access::Read,
-            calendar: Access::ReadWrite,
-            contacts: Access::None,
-            sieve: Access::None,
-        };
+        let p = flat_permissions(Access::Read, Access::ReadWrite, Access::None, Access::None);
         assert!(p.check_read(Resource::Email).is_ok());
         assert!(p.check_read(Resource::Calendar).is_ok());
         assert!(p.check_read(Resource::Contacts).is_err());
@@ -143,15 +350,8 @@ mod tests {
 
     #[test]
     fn check_write_requires_readwrite() {
-        let p = Permissions {
-            email: Access::Read,
-            calendar: Access::ReadWrite,
-            contacts: Access::None,
-            sieve: Access::None,
-        };
-        // read-only on email: write blocked
+        let p = flat_permissions(Access::Read, Access::ReadWrite, Access::None, Access::None);
         assert!(p.check_write(Resource::Email).is_err());
-        // readwrite on calendar: write allowed
         assert!(p.check_write(Resource::Calendar).is_ok());
     }
 
@@ -169,19 +369,182 @@ mod tests {
         }
     }
 
+    // ── Scoped checks ──────────────────────────────────────────────
+
     #[test]
-    fn roundtrip_toml() {
+    fn email_scoped_default_applies_when_no_folder() {
         let p = Permissions {
-            email: Access::Read,
-            calendar: Access::ReadWrite,
-            contacts: Access::ReadWrite,
-            sieve: Access::None,
+            email: EmailPermission::Scoped(ScopedEmail {
+                default: Access::Read,
+                folders: HashMap::new(),
+            }),
+            ..Permissions::default()
         };
-        let s = toml::to_string(&p).unwrap();
-        let back: Permissions = toml::from_str(&s).unwrap();
-        assert_eq!(back.email, Access::Read);
-        assert_eq!(back.calendar, Access::ReadWrite);
-        assert_eq!(back.contacts, Access::ReadWrite);
-        assert_eq!(back.sieve, Access::None);
+        assert!(p.check_read_scoped(&Scope::Email { folder: None }).is_ok());
+        assert!(p
+            .check_write_scoped(&Scope::Email { folder: None })
+            .is_err());
+    }
+
+    #[test]
+    fn email_per_folder_override_wins() {
+        let mut folders = HashMap::new();
+        folders.insert("INBOX".to_string(), Access::ReadWrite);
+        folders.insert("Trash".to_string(), Access::None);
+        let p = Permissions {
+            email: EmailPermission::Scoped(ScopedEmail {
+                default: Access::Read,
+                folders,
+            }),
+            ..Permissions::default()
+        };
+
+        // INBOX: overridden to readwrite
+        assert!(p
+            .check_write_scoped(&Scope::Email {
+                folder: Some("INBOX")
+            })
+            .is_ok());
+        // Trash: overridden to none — not even readable
+        assert!(p
+            .check_read_scoped(&Scope::Email {
+                folder: Some("Trash")
+            })
+            .is_err());
+        // Unknown folder: falls through to default=read
+        assert!(p
+            .check_read_scoped(&Scope::Email {
+                folder: Some("SomeOtherFolder")
+            })
+            .is_ok());
+        assert!(p
+            .check_write_scoped(&Scope::Email {
+                folder: Some("SomeOtherFolder")
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn calendar_scoped_per_id_override() {
+        let mut by_id = HashMap::new();
+        by_id.insert("cal-1".to_string(), Access::ReadWrite);
+        by_id.insert("cal-2".to_string(), Access::None);
+        let p = Permissions {
+            calendar: CalendarPermission::Scoped(ScopedCalendar {
+                default: Access::Read,
+                by_id,
+            }),
+            ..Permissions::default()
+        };
+
+        assert!(p
+            .check_write_scoped(&Scope::Calendar {
+                calendar_id: Some("cal-1")
+            })
+            .is_ok());
+        assert!(p
+            .check_read_scoped(&Scope::Calendar {
+                calendar_id: Some("cal-2")
+            })
+            .is_err());
+        // Unknown id falls back to default
+        assert!(p
+            .check_read_scoped(&Scope::Calendar {
+                calendar_id: Some("unknown")
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn flat_email_permission_ignores_folder_scope() {
+        let p = Permissions {
+            email: EmailPermission::Flat(Access::ReadWrite),
+            ..Permissions::default()
+        };
+        // Flat permissions return the same access regardless of folder
+        assert!(p
+            .check_write_scoped(&Scope::Email {
+                folder: Some("INBOX")
+            })
+            .is_ok());
+        assert!(p
+            .check_write_scoped(&Scope::Email {
+                folder: Some("Trash")
+            })
+            .is_ok());
+    }
+
+    // ── TOML roundtrip — back-compat and new scoped form ──────────
+
+    #[test]
+    fn toml_flat_form_parses_as_v1_did() {
+        let toml_str = r#"
+email = "read"
+calendar = "read_write"
+contacts = "read_write"
+sieve = "none"
+"#;
+        let p: Permissions = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.email.default_access(), Access::Read);
+        assert_eq!(p.calendar.default_access(), Access::ReadWrite);
+        assert_eq!(p.contacts, Access::ReadWrite);
+        assert_eq!(p.sieve, Access::None);
+    }
+
+    #[test]
+    fn toml_scoped_email_form_parses() {
+        let toml_str = r#"
+contacts = "read_write"
+sieve = "read_write"
+
+[email]
+default = "read"
+folders = { INBOX = "read_write", Trash = "none" }
+
+[calendar]
+default = "read"
+by_id = { "cal-abc" = "read_write" }
+"#;
+        let p: Permissions = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.email.default_access(), Access::Read);
+        assert_eq!(
+            p.email.for_folder(Some("INBOX")),
+            Access::ReadWrite,
+            "INBOX override should win"
+        );
+        assert_eq!(p.email.for_folder(Some("Trash")), Access::None);
+        assert_eq!(
+            p.email.for_folder(Some("Unknown")),
+            Access::Read,
+            "unknown folder should fall back to default"
+        );
+        assert_eq!(p.calendar.for_calendar(Some("cal-abc")), Access::ReadWrite);
+        assert_eq!(
+            p.calendar.for_calendar(Some("cal-xyz")),
+            Access::Read,
+            "unknown cal id falls back to default"
+        );
+    }
+
+    #[test]
+    fn toml_mixed_flat_and_scoped() {
+        // Email flat, calendar scoped — both should work in one doc.
+        let toml_str = r#"
+email = "read"
+contacts = "read_write"
+sieve = "none"
+
+[calendar]
+default = "none"
+by_id = { "work" = "read" }
+"#;
+        let p: Permissions = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.email.default_access(), Access::Read);
+        assert_eq!(p.calendar.for_calendar(Some("work")), Access::Read);
+        assert_eq!(
+            p.calendar.for_calendar(Some("personal")),
+            Access::None,
+            "unknown cal should fall through to calendar.default=none"
+        );
     }
 }
