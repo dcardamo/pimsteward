@@ -27,12 +27,14 @@
 use crate::error::Error;
 use crate::forwardemail::mail::{Folder, MessageSummary};
 use crate::source::traits::{FetchedMessage, ListResult, MailSource};
+use async_imap::extensions::idle::IdleResponse;
 use async_imap::Session;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
@@ -379,5 +381,125 @@ impl MailSource for ImapMailSource {
             *guard = None;
         }
         result
+    }
+}
+
+/// Run a standalone IMAP IDLE listener forever. Each iteration:
+///
+///   1. Open a fresh connection + log in (not shared with the puller's
+///      session — IDLE monopolises its connection so it must be its own).
+///   2. EXAMINE the chosen folder (INBOX by default; forwardemail's mail
+///      volume is overwhelmingly INBOX-bound in the typical consumer use
+///      case this daemon targets).
+///   3. Issue IDLE and block on the server's response channel. On any
+///      NewData response or server keepalive, signal the caller via
+///      `notify.notify_one()` so the mail puller wakes up and does a
+///      full sync pass.
+///   4. RFC 2177 requires re-issuing IDLE at least every 29 minutes;
+///      async-imap's default timeout respects this. On timeout we DONE
+///      and loop back to a fresh IDLE.
+///
+/// Errors (disconnects, TLS handshake failures, login failures) are
+/// logged and retried with exponential backoff capped at 5 minutes so a
+/// flaky network doesn't hammer the server.
+pub async fn idle_loop(config: ImapConfig, folder: String, notify: Arc<Notify>) {
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(5 * 60);
+
+    loop {
+        match run_one_idle_connection(&config, &folder, &notify).await {
+            Ok(()) => {
+                // Clean exit from the inner loop shouldn't happen except on
+                // shutdown — reset the backoff and start a new connection.
+                backoff = Duration::from_secs(1);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, backoff_secs = backoff.as_secs(), "IMAP IDLE error, reconnecting");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// One IDLE lifecycle: connect, login, examine, enter the IDLE-wait loop,
+/// return an error on any failure so the outer loop can back off and
+/// reconnect. Returning `Ok(())` also restarts, but with backoff reset.
+async fn run_one_idle_connection(
+    config: &ImapConfig,
+    folder: &str,
+    notify: &Notify,
+) -> Result<(), Error> {
+    // Connect using the same TLS path as ImapMailSource::connect. This is
+    // a dedicated connection; the puller's session is untouched.
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(tls_config));
+
+    let tcp = TcpStream::connect((config.host.as_str(), config.port))
+        .await
+        .map_err(|e| Error::config(format!("IDLE TCP connect: {e}")))?;
+    let server_name = ServerName::try_from(config.host.clone())
+        .map_err(|e| Error::config(format!("IDLE server name: {e}")))?;
+    let tls = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| Error::config(format!("IDLE TLS handshake: {e}")))?;
+
+    let client = async_imap::Client::new(tls);
+    let mut session = client
+        .login(&config.user, &config.password)
+        .await
+        .map_err(|(e, _)| Error::config(format!("IDLE login: {e}")))?;
+
+    session
+        .examine(folder)
+        .await
+        .map_err(|e| Error::store(format!("IDLE EXAMINE {folder}: {e}")))?;
+    tracing::info!(folder, "IMAP IDLE connection established");
+
+    // The inner loop: init IDLE, wait for a notification or timeout, DONE,
+    // repeat. On any IMAP-layer error we bubble up so the outer loop
+    // reconnects.
+    loop {
+        let mut handle = session.idle();
+        handle
+            .init()
+            .await
+            .map_err(|e| Error::store(format!("IDLE init: {e}")))?;
+
+        let (idle_fut, _stop) = handle.wait();
+        let result = idle_fut.await;
+
+        // Whatever the outcome, we must DONE to return the session to a
+        // usable state before the next iteration.
+        session = handle
+            .done()
+            .await
+            .map_err(|e| Error::store(format!("IDLE done: {e}")))?;
+
+        match result {
+            Ok(IdleResponse::NewData(_)) => {
+                tracing::debug!(folder, "IMAP IDLE: new data, waking puller");
+                notify.notify_one();
+            }
+            Ok(IdleResponse::Timeout) => {
+                // 29-minute keepalive — server expects us to DONE and
+                // re-IDLE. No wake signal; nothing changed.
+                tracing::trace!(folder, "IMAP IDLE: keepalive timeout, re-idling");
+            }
+            Ok(IdleResponse::ManualInterrupt) => {
+                // We don't drive a manual interrupt anywhere, but if the
+                // stream closes cleanly, surface it as an error so the
+                // outer loop reconnects.
+                return Err(Error::store("IDLE stream closed unexpectedly"));
+            }
+            Err(e) => {
+                return Err(Error::store(format!("IDLE wait: {e}")));
+            }
+        }
     }
 }

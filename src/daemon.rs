@@ -14,12 +14,14 @@ use crate::forwardemail::Client;
 use crate::permission::Resource;
 use crate::pull;
 use crate::source::{
-    imap::ImapConfig, CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource,
-    ImapMailSource, MailSource, RestCalendarSource, RestContactsSource, RestMailSource,
+    imap::{idle_loop, ImapConfig},
+    CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource, ImapMailSource,
+    MailSource, RestCalendarSource, RestContactsSource, RestMailSource,
 };
 use crate::store::Repo;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::time::interval;
 use tracing::Instrument;
 
@@ -109,11 +111,45 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
                 }))
             }
         };
+
+        // If IMAP IDLE is enabled (only meaningful with mail_source=imap),
+        // spawn a dedicated IDLE listener on its own connection and wire a
+        // Notify to wake the puller when new data arrives. The periodic
+        // ticker still runs as a safety net: if the IDLE connection dies
+        // the puller keeps syncing on its interval.
+        let idle_notify = if cfg.forwardemail.imap_idle
+            && matches!(cfg.forwardemail.mail_source, MailSourceKind::Imap)
+        {
+            let notify = Arc::new(Notify::new());
+            let (u, p) = cfg.load_credentials()?;
+            let idle_cfg = ImapConfig {
+                host: cfg.forwardemail.imap_host.clone(),
+                port: cfg.forwardemail.imap_port,
+                user: u,
+                password: p,
+            };
+            let notify_clone = notify.clone();
+            let span = tracing::info_span!("imap_idle");
+            handles.push(tokio::spawn(
+                async move {
+                    // INBOX is where new mail lands; IDLE there covers the
+                    // overwhelming majority of push-worthy events. Non-INBOX
+                    // changes fall through to the periodic ticker.
+                    idle_loop(idle_cfg, "INBOX".to_string(), notify_clone).await;
+                }
+                .instrument(span),
+            ));
+            Some(notify)
+        } else {
+            None
+        };
+
         let h = spawn_mail_puller(
             Duration::from_secs(cfg.pull.mail_interval_seconds),
             mail_source,
             repo.clone(),
             alias.clone(),
+            idle_notify,
         );
         handles.push(h);
     }
@@ -259,18 +295,42 @@ fn spawn_mail_puller(
     source: Arc<dyn MailSource>,
     repo: Arc<Repo>,
     alias: String,
+    idle_notify: Option<Arc<Notify>>,
 ) -> tokio::task::JoinHandle<()> {
     let span = tracing::info_span!("puller", resource = "mail");
     tokio::spawn(
         async move {
             let mut ticker = interval(period);
+            // The first tick fires immediately, so we always do an initial
+            // pull on startup regardless of whether IDLE is wired up.
             tracing::info!(
                 period_secs = period.as_secs(),
                 source = source.tag(),
+                idle = idle_notify.is_some(),
                 "mail puller started"
             );
             loop {
-                ticker.tick().await;
+                // Wake on whichever fires first: the periodic ticker, or
+                // (when IDLE is enabled) a signal from the idle listener.
+                // `Notify` semantics: a notify_one() that arrives while
+                // nobody is notified().await-ing is latched, so we never
+                // miss an event between pulls.
+                match &idle_notify {
+                    Some(n) => {
+                        tokio::select! {
+                            _ = ticker.tick() => {
+                                tracing::trace!("mail pull: ticker fired");
+                            }
+                            _ = n.notified() => {
+                                tracing::debug!("mail pull: IDLE wake");
+                            }
+                        }
+                    }
+                    None => {
+                        ticker.tick().await;
+                    }
+                }
+
                 let result = pull::mail::pull_mail(
                     source.as_ref(),
                     &repo,

@@ -130,6 +130,15 @@ pub struct ForwardemailConfig {
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
 
+    /// Use IMAP IDLE to push-notify the mail puller when new messages
+    /// arrive, instead of only waking on the periodic `mail_interval_seconds`
+    /// ticker. Only applies when `mail_source = "imap"`. When enabled, a
+    /// dedicated IDLE connection runs alongside the puller — on any mailbox
+    /// change the puller is signalled to run immediately, and the periodic
+    /// ticker still acts as a safety net in case the IDLE connection drops.
+    #[serde(default)]
+    pub imap_idle: bool,
+
     /// CalDAV base URL (no trailing slash) — used only when
     /// `calendar_source = "caldav"`.
     #[serde(default = "default_caldav_base_url")]
@@ -192,6 +201,7 @@ impl Default for ForwardemailConfig {
             contacts_source: ContactsSourceKind::default(),
             imap_host: default_imap_host(),
             imap_port: default_imap_port(),
+            imap_idle: false,
             caldav_base_url: default_caldav_base_url(),
             carddav_base_url: default_carddav_base_url(),
         }
@@ -323,6 +333,29 @@ sieve = "read_write"
         assert_eq!(cfg.storage.repo_path, PathBuf::from("/tmp/repo"));
         assert_eq!(cfg.permissions.email.default_access(), Access::Read);
         assert_eq!(cfg.permissions.calendar.default_access(), Access::ReadWrite);
+    }
+
+    #[test]
+    fn imap_idle_defaults_off_and_respects_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&dir.path().join("none.toml")).unwrap();
+        assert!(!cfg.forwardemail.imap_idle);
+
+        let p = dir.path().join("idle.toml");
+        std::fs::write(
+            &p,
+            r#"
+[forwardemail]
+mail_source = "imap"
+imap_idle = true
+
+[storage]
+repo_path = "/tmp/repo"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.forwardemail.imap_idle);
     }
 
     #[test]
