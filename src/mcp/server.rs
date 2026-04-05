@@ -273,6 +273,18 @@ pub struct DeleteSieveParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetEmailParams {
+    /// Canonical message id (the filename stem from the backup tree,
+    /// e.g. as returned in search_email results or history).
+    pub id: String,
+    /// If true, include the raw RFC822 .eml bytes in the response
+    /// (base64-encoded). Default false — returns parsed headers + meta
+    /// only, which is usually enough for an AI agent.
+    #[serde(default)]
+    pub include_raw: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CreateDraftParams {
     /// Recipient email addresses (To:).
     pub to: Vec<String>,
@@ -472,7 +484,7 @@ pub struct RestorePathApplyParams {
 impl PimstewardServer {
     #[tool(
         name = "search_email",
-        description = "Search email messages via forwardemail's native search. Filter by folder, date range, subject, from, or free-text. Returns message summaries without bodies — use get_email for the full content (not yet implemented in v1)."
+        description = "Search email messages via forwardemail's native search. Filter by folder, date range, subject, from, or free-text. Returns message summaries without bodies — use get_email for full content."
     )]
     async fn search_email(
         &self,
@@ -516,6 +528,88 @@ impl PimstewardServer {
             .await
             .map_err(|e| self.api_error(e))?;
         serde_json::to_string_pretty(&v).map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "get_email",
+        description = "Get a single email message by canonical id. Returns parsed headers, metadata (flags, folder, modseq), and optionally the raw RFC822 bytes. The canonical id is the filename stem from the backup tree (16 hex chars)."
+    )]
+    async fn get_email(
+        &self,
+        Parameters(p): Parameters<GetEmailParams>,
+    ) -> Result<String, McpError> {
+        let meta = self.lookup_message_meta(&p.id)?;
+        let folder = meta.folder_path.as_deref().unwrap_or("INBOX");
+        self.check_scoped(Scope::Email {
+            folder: Some(folder),
+        })?;
+
+        // Find the .eml in the backup tree.
+        let mail_root = self
+            .inner
+            .repo
+            .root()
+            .join(format!("sources/forwardemail/{}/mail", self.inner.alias));
+        let folder_safe = folder.replace('/', "_");
+        let eml_path = mail_root.join(&folder_safe).join(format!("{}.eml", p.id));
+
+        let mut result = serde_json::json!({
+            "canonical_id": p.id,
+            "source_id": meta.id,
+            "folder": folder,
+            "flags": meta.flags,
+            "modseq": meta.modseq,
+            "uid": meta.uid,
+        });
+        let obj = result.as_object_mut().expect("just created");
+
+        // Parse key headers from the .eml for the AI without needing
+        // the full raw bytes.
+        if let Ok(raw) = std::fs::read(&eml_path) {
+            if let Ok(text) = std::str::from_utf8(&raw) {
+                let mut headers = serde_json::Map::new();
+                for line in text.lines() {
+                    if line.is_empty() {
+                        break; // end of headers
+                    }
+                    if let Some((key, val)) = line.split_once(':') {
+                        let k = key.trim().to_lowercase();
+                        if matches!(
+                            k.as_str(),
+                            "from" | "to" | "cc" | "subject" | "date" | "message-id" | "in-reply-to" | "references"
+                        ) {
+                            headers.insert(k, serde_json::Value::String(val.trim().to_string()));
+                        }
+                    }
+                }
+                obj.insert("headers".into(), serde_json::Value::Object(headers));
+
+                // Extract plain-text body (everything after the blank line
+                // separating headers from body). For MIME messages this is
+                // a simplification — the full .eml is available via
+                // include_raw for proper MIME parsing.
+                if let Some(body_start) = text.find("\r\n\r\n").or_else(|| text.find("\n\n")) {
+                    let offset = if text[body_start..].starts_with("\r\n\r\n") { 4 } else { 2 };
+                    let body = &text[body_start + offset..];
+                    // Truncate to ~4k chars to avoid blowing up the MCP response.
+                    let truncated = if body.len() > 4096 {
+                        format!("{}…[truncated, {} bytes total]", &body[..4096], body.len())
+                    } else {
+                        body.to_string()
+                    };
+                    obj.insert("body_preview".into(), serde_json::Value::String(truncated));
+                }
+
+                if p.include_raw {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+                    obj.insert("raw_base64".into(), serde_json::Value::String(b64));
+                }
+            }
+        }
+
+        serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     #[tool(

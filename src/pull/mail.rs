@@ -58,21 +58,21 @@ pub(crate) struct MessageMeta {
     #[serde(default)]
     pub folder_path: Option<String>,
     #[serde(default)]
-    thread_id: Option<String>,
+    pub thread_id: Option<String>,
     #[serde(default)]
-    uid: Option<i64>,
+    pub uid: Option<i64>,
     #[serde(default)]
-    modseq: Option<i64>,
+    pub modseq: Option<i64>,
     #[serde(default)]
-    size: Option<u64>,
+    pub size: Option<u64>,
     #[serde(default)]
-    updated_at: Option<String>,
+    pub updated_at: Option<String>,
     #[serde(default)]
-    internal_date: Option<String>,
+    pub internal_date: Option<String>,
     #[serde(default)]
-    flags: Vec<String>,
+    pub flags: Vec<String>,
     #[serde(default)]
-    labels: Vec<String>,
+    pub labels: Vec<String>,
 }
 
 /// One entry in `<id>.attachments.json`. The raw bytes live at

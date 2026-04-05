@@ -382,6 +382,7 @@ since been built. Listed here so the delta is traceable.
 | Calendar event If-Match via CalDAV etags | **V2.5** — `CalendarEvent.etag` populated from CalDAV getetag; `EventMeta` persists it; `update_calendar_event` accepts `if_match` parameter; MCP `update_event` tool exposes it |
 | IMAP write path                        | **V2.5** — `MailWriter` trait with REST + IMAP impls; IMAP uses UID STORE/COPY+EXPUNGE for flags/moves/deletes; MCP server holds `Arc<dyn MailWriter>` |
 | Canonical cross-source message id      | **V2.5** — `sha256(Message-ID header)[..16]` as filename stem; source-specific id preserved in `meta.json`; safe to switch `mail_source` between REST and IMAP without wiping |
+| `get_email` MCP tool                   | **V2.5** — reads .eml + meta.json from backup tree by canonical id; returns parsed headers, metadata, body preview, and optional raw base64. No extra API call needed. `list_*` for contacts/events/sieve already return full content so `get_*` is only needed for mail. |
 
 ## Deferred (and why)
 
@@ -390,9 +391,8 @@ future improvement when the need is concrete.
 
 ### From the original list
 
-| # | Deferred                              | Reason |
-| - | ------------------------------------- | ------ |
-| 12 | **Dedicated `get_*` MCP tools**       | `list_*` tools return full content for contacts/events/sieve; individual `get_*` would be redundant. `search_email` covers the mail case. |
+No items remain deferred. All original plan items are either shipped or
+documented as design decisions below.
 
 ### Design decisions (not planned)
 
@@ -403,6 +403,7 @@ Deliberate architectural choices, not gaps.
 | 5 | **No retention / pruning of git history** | Disk is cheap, history is the product. The backup repo is append-only by design; `git gc --auto` handles object compaction. If a repo grows unwieldy, `git filter-repo` is the manual escape hatch. |
 | 9 | **No webhook-driven push ingest**     | IMAP IDLE (`imap_idle = true`) provides sub-minute push notifications without exposing a public HTTPS endpoint. Webhooks would add attack surface, require partial-delivery handling, and duplicate what IDLE already does better. |
 | 10 | **One alias per daemon instance**    | Clean isolation: each alias gets its own git repo, credentials, permission matrix, and systemd unit. No cross-alias data leakage. NixOS containers make per-alias instances cheap. Multiple aliases = multiple instances. |
+| 12 | **No `get_*` for contacts/events/sieve** | `list_*` tools return full content (complete vCard, iCal, script text). A separate `get_*` per resource would be redundant. `get_email` is the exception — `search_email` returns summaries only, so a dedicated tool reads the full message from the backup tree. |
 
 ## Open-source friendly
 
