@@ -261,6 +261,7 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         "subject": "hello",
         "flags": [],
         "modseq": 5,
+        "raw": "From: sender@example.com\r\nTo: alice@test.example\r\nSubject: hello\r\n\r\noriginal body",
         "nodemailer": {"text": "original body"}
     });
     Mock::given(method("GET"))
@@ -276,12 +277,13 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         .unwrap();
     assert_eq!(s1.added, 1, "first pull adds one message");
     assert!(s1.commit_sha.is_some());
-    let body = repo
-        .read_file("sources/forwardemail/test-alias/mail/INBOX/m1.json")
+    // raw RFC822 is written as <id>.eml
+    let eml = repo
+        .read_file("sources/forwardemail/test-alias/mail/INBOX/m1.eml")
         .unwrap();
-    assert!(std::str::from_utf8(&body)
-        .unwrap()
-        .contains("original body"));
+    let eml_str = std::str::from_utf8(&eml).unwrap();
+    assert!(eml_str.contains("Subject: hello"));
+    assert!(eml_str.contains("original body"));
 
     // --- Second pull: same message, flags updated (modseq bumps) ---
     let msgs_v2 = serde_json::json!([
@@ -303,6 +305,7 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         "flags": ["\\Seen", "\\Flagged"],
         "modseq": 6,
         "subject": "hello",
+        "raw": "From: sender@example.com\r\nTo: alice@test.example\r\nSubject: hello\r\n\r\noriginal body",
         "nodemailer": {"text": "original body"}
     });
     Mock::given(method("GET"))
@@ -333,7 +336,7 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         .unwrap();
     assert_eq!(s3.deleted, 1, "missing-from-remote detected as deletion");
     assert!(repo
-        .read_file("sources/forwardemail/test-alias/mail/INBOX/m1.json")
+        .read_file("sources/forwardemail/test-alias/mail/INBOX/m1.eml")
         .is_err());
 }
 

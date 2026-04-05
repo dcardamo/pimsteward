@@ -1,22 +1,31 @@
 //! Mail pull loop.
 //!
-//! Strategy for v1:
+//! Strategy:
 //!
 //! 1. List all folders.
 //! 2. For each folder, list message summaries (paginated).
 //! 3. Diff against local cache: a message is "changed" if its `modseq`
 //!    differs, or if it's new entirely. Messages missing from the remote
 //!    list are deleted.
-//! 4. For each changed message, fetch the full JSON and write to
-//!    `mail/<folder_path>/<msg_id>.json`. The folder path is used (not the
-//!    folder id) because it's stable and human-readable in git history.
+//! 4. For each changed message, fetch the full response, extract the
+//!    `raw` field (byte-identical RFC822), write it to
+//!    `mail/<folder_path>/<msg_id>.eml` (write-once, immutable). Write the
+//!    mutable metadata (flags, folder, modseq, uid, updated_at, etc.) to
+//!    a sidecar `<msg_id>.meta.json`.
 //! 5. Atomic commit.
 //!
+//! Historical note: earlier pimsteward versions stored the entire message
+//! response including the parsed `nodemailer` field to a single
+//! `<msg_id>.json`. The current layout is cleaner because the .eml is the
+//! authoritative bytes and nodemailer can always be re-parsed from it.
+//! The pull loop transparently migrates any legacy `.json` files it finds
+//! on disk by extracting the `raw` field into a new `.eml` and replacing
+//! the JSON with the trimmed meta form.
+//!
 //! This is a full-snapshot strategy, not true CONDSTORE delta sync. It works
-//! because forwardemail's message list is cheap (the smoke test showed
-//! sub-50ms for empty folders) and modseq lets us skip per-message GETs on
-//! the common "no changes" path. Real CONDSTORE/modseq > N filtering can be
-//! added later if it becomes expensive.
+//! because forwardemail's message list is cheap and modseq lets us skip
+//! per-message GETs on the common "no changes" path. Real CONDSTORE/modseq
+//! > N filtering via native IMAP is a v2.2 concern.
 
 use crate::error::Error;
 use crate::forwardemail::mail::{Folder, MessageSummary};
@@ -27,16 +36,77 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-/// Sidecar metadata written alongside the raw JSON. The raw JSON is the
-/// source of truth; this struct exists so we can read the tiny meta file
-/// to decide whether a full re-fetch is needed, without parsing the entire
-/// message JSON on every pull.
+/// Sidecar metadata written alongside the raw .eml. Captures the mutable
+/// forwardemail-specific fields that aren't in the RFC822 itself: flags,
+/// folder, modseq, uid, thread_id, labels, etc. The pull loop reads this
+/// to decide whether a full re-fetch is needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageMeta {
     id: String,
+    #[serde(default)]
+    folder_id: Option<String>,
+    #[serde(default)]
+    folder_path: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    uid: Option<i64>,
+    #[serde(default)]
     modseq: Option<i64>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
     updated_at: Option<String>,
+    #[serde(default)]
+    internal_date: Option<String>,
+    #[serde(default)]
     flags: Vec<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+impl MessageMeta {
+    /// Build a MessageMeta from the list summary + full response JSON. Fields
+    /// present in the summary are preferred because they're canonical; extra
+    /// fields come from the full response.
+    fn from_response(summary: &MessageSummary, full: &serde_json::Value) -> Self {
+        fn string_at(v: &serde_json::Value, key: &str) -> Option<String> {
+            v.get(key).and_then(|x| x.as_str()).map(String::from)
+        }
+        fn u64_at(v: &serde_json::Value, key: &str) -> Option<u64> {
+            v.get(key).and_then(|x| x.as_u64())
+        }
+        fn string_array_at(v: &serde_json::Value, key: &str) -> Vec<String> {
+            v.get(key)
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| e.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        Self {
+            id: summary.id.clone(),
+            folder_id: Some(summary.folder_id.clone()).filter(|s| !s.is_empty()),
+            folder_path: string_at(full, "folder_path"),
+            thread_id: string_at(full, "thread_id"),
+            uid: summary.uid,
+            modseq: summary.modseq,
+            size: Some(summary.size)
+                .filter(|s| *s > 0)
+                .or_else(|| u64_at(full, "size")),
+            updated_at: summary.updated_at.clone(),
+            internal_date: string_at(full, "internal_date"),
+            flags: if summary.flags.is_empty() {
+                string_array_at(full, "flags")
+            } else {
+                summary.flags.clone()
+            },
+            labels: string_array_at(full, "labels"),
+        }
+    }
 }
 
 pub async fn pull_mail(
@@ -91,16 +161,29 @@ pub async fn pull_mail(
                 continue;
             }
 
+            // Fetch the full response, extract the raw RFC822 bytes.
+            // Forwardemail returns `raw` as a string in the JSON by default;
+            // see docs/api-findings.md.
             let full = client.get_message(&msg.id).await?;
-            let raw_path = format!("{folder_dir}/{id}.json");
-            repo.write_file(&raw_path, serde_json::to_vec_pretty(&full)?.as_slice())?;
+            let raw_bytes = full
+                .get("raw")
+                .and_then(|v| v.as_str())
+                .map(|s| s.as_bytes().to_vec())
+                .ok_or_else(|| {
+                    Error::store(format!(
+                        "forwardemail response for message {} missing `raw` field",
+                        msg.id
+                    ))
+                })?;
 
-            let meta = MessageMeta {
-                id: msg.id.clone(),
-                modseq: msg.modseq,
-                updated_at: msg.updated_at.clone(),
-                flags: msg.flags.clone(),
-            };
+            let eml_path = format!("{folder_dir}/{id}.eml");
+            repo.write_file(&eml_path, &raw_bytes)?;
+
+            // Remove any legacy .json sidecar left over from earlier versions.
+            let legacy_json = repo.root().join(format!("{folder_dir}/{id}.json"));
+            let _ = std::fs::remove_file(legacy_json);
+
+            let meta = MessageMeta::from_response(msg, &full);
             let meta_path = format!("{folder_dir}/{id}.meta.json");
             repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
 
@@ -118,6 +201,8 @@ pub async fn pull_mail(
             .collect();
         for local_id in local_meta.keys() {
             if !remote_ids.contains(local_id) {
+                let _ =
+                    std::fs::remove_file(repo.root().join(format!("{folder_dir}/{local_id}.eml")));
                 let _ =
                     std::fs::remove_file(repo.root().join(format!("{folder_dir}/{local_id}.json")));
                 let _ = std::fs::remove_file(
