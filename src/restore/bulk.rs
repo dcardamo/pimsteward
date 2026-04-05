@@ -51,6 +51,21 @@ impl BulkRestorePlan {
 /// Walk the backup tree at `at_sha` under `path_prefix`, compute a
 /// per-resource sub-plan for each file found, and return the aggregated
 /// plan plus a deterministic token.
+/// Validate a `path_prefix` argument. Pure string check, no IO, so it can
+/// be unit-tested exhaustively without a Client. Callers must invoke this
+/// before passing the prefix to any filesystem or git operation.
+pub(crate) fn validate_path_prefix(prefix: &str) -> Result<(), Error> {
+    // Reject path traversal. git ls-tree and git show both resolve paths
+    // relative to the repo root, so `..` could escape the sandbox of a
+    // single resource tree and enumerate unrelated files. Defense in depth:
+    // gix and the kernel would catch most of this, but the guard makes the
+    // intent explicit and fails fast with a clear error.
+    if prefix.contains("..") {
+        return Err(Error::config("path_prefix must not contain '..'"));
+    }
+    Ok(())
+}
+
 pub async fn plan_bulk(
     client: &Client,
     repo: &Repo,
@@ -58,10 +73,7 @@ pub async fn plan_bulk(
     path_prefix: &str,
     at_sha: &str,
 ) -> Result<(BulkRestorePlan, String), Error> {
-    // Path traversal guard.
-    if path_prefix.contains("..") {
-        return Err(Error::config("path_prefix must not contain '..'"));
-    }
+    validate_path_prefix(path_prefix)?;
 
     // List files at `at_sha` under the prefix using `git ls-tree`. We want
     // every file that identifies a resource (one .vcf per contact, one
@@ -317,5 +329,34 @@ mod tests {
             extract_sieve_name("sources/forwardemail/test/contacts/default/uid.vcf", "test"),
             None
         );
+    }
+
+    // --- validate_path_prefix: path traversal safety ---
+    //
+    // These are the I8 (Path traversal safety) unit tests. Pure logic,
+    // no network — they prove that plan_bulk's entry guard rejects `..`
+    // before any filesystem or git command runs.
+
+    #[test]
+    fn validate_path_prefix_accepts_normal_paths() {
+        assert!(validate_path_prefix("sources/forwardemail/foo/contacts/").is_ok());
+        assert!(validate_path_prefix("sources/forwardemail/foo/").is_ok());
+        assert!(validate_path_prefix("").is_ok()); // whole repo
+        assert!(validate_path_prefix("sources/forwardemail/foo/calendars/cal-1/events/").is_ok());
+    }
+
+    #[test]
+    fn validate_path_prefix_rejects_parent_dir_escape() {
+        assert!(validate_path_prefix("..").is_err());
+        assert!(validate_path_prefix("../etc/passwd").is_err());
+        assert!(validate_path_prefix("sources/../../../etc").is_err());
+    }
+
+    #[test]
+    fn validate_path_prefix_rejects_embedded_dotdot() {
+        // Even as a substring — we don't try to be clever about trailing
+        // slashes or normalized forms, we just refuse any occurrence.
+        assert!(validate_path_prefix("sources/..hidden/").is_err());
+        assert!(validate_path_prefix("sources/forwardemail/../other/").is_err());
     }
 }
