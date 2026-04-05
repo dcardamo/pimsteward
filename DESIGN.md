@@ -373,6 +373,11 @@ since been built. Listed here so the delta is traceable.
 | Automated re-APPEND on mail restore   | **V2.4** — `MailOperation::Append { target_folder, raw_bytes }` reads the `.eml` from git at `at_sha` and POSTs it via `Client::append_raw_message`; the `Unrestorable` variant is gone |
 | Weekly `git gc --auto` timer          | **V2.4** — `daemon::spawn_gc_timer` runs `git gc --auto` on a 7-day tokio interval against the backup repo |
 | `CONTRIBUTING.md`                     | **V2.4** — added with build/test/style instructions and the safety guardrail requirement for e2e tests |
+| Attachment dedup `_attachments/<sha256>` | **V2.5** — `extract_attachments` parses `nodemailer.attachments[]`, writes content-addressed blobs to `_attachments/<sha256>`, sidecar `<id>.attachments.json` references them |
+| Explicit adaptive rate-limit backoff  | **V2.5** — `backoff_for_remaining()` pure helper + `backoff_if_throttled()` in `send()`/`send_json()`. Tiered thresholds: <100→500ms, <50→2s, <10→10s, 0→30s |
+| IMAP `CHANGEDSINCE` filtering         | **V2.5** — `MailSource::list_messages` returns `ListResult` with `all_ids` + `changed`. IMAP source issues `FETCH 1:* (...) (CHANGEDSINCE <m>)` when UIDVALIDITY matches stored value; `_folder.json` persists `modify_index`/`uid_validity` between pulls |
+| IMAP `IDLE` for push notifications    | **V2.5** — `idle_loop()` runs a dedicated IMAP IDLE connection on INBOX, signals the mail puller via `tokio::sync::Notify`. Opt-in via `forwardemail.imap_idle = true`. Periodic ticker remains as safety net |
+| Scoped email write permissions + `create_draft` tool | **V2.5** — removed resource-level baseline gate so per-folder overrides are authoritative; `create_draft` tool saves structured messages to Drafts folder |
 
 ## Deferred (and why)
 
@@ -383,23 +388,26 @@ future improvement when the need is concrete.
 
 | # | Deferred                              | Reason |
 | - | ------------------------------------- | ------ |
-| 3 | **Attachment dedup (`_attachments/<sha256>`)** | Forwardemail's REST references attachments in the `nodemailer` parse but doesn't expose them as separable binary blobs. IMAP could reach individual parts via `BODYSTRUCTURE` + `BODY[N]`, but nobody has asked for it. |
-| 5 | **Retention / pruning of git history** | Disk is cheap, history is the product. Revisit only if the repo becomes a problem size. |
 | 7 | **Richer contact restore recreate**   | Current `Recreate` uses a placeholder email and only preserves `full_name`. Full vCard re-hydration needs a proper parser. Common case (undo a rename) is fully covered. |
 | 8 | **Calendar event optimistic concurrency (If-Match)** | Forwardemail's calendar events don't return an ETag header — API limitation, not a pimsteward gap. Contacts *do* support If-Match and pimsteward uses it. |
 | 9 | **Webhook-driven push ingest**        | Would require a public HTTPS endpoint (attack surface) and a partial delivery model. Forwardemail's storage is zero-knowledge so server-side push isn't architecturally possible. |
 | 10 | **Multi-alias support in one instance** | One alias per daemon. Run two if you need two. |
-| 11 | **Explicit adaptive rate-limit backoff** | `X-RateLimit-Remaining` is parsed and tracked atomically but the pull loop doesn't throttle. 1000/window is generous vs current usage. |
 | 12 | **Dedicated `get_*` MCP tools**       | `list_*` tools return full content for contacts/events/sieve; individual `get_*` would be redundant. `search_email` covers the mail case. |
 
 ### Discovered during V2.x work
 
 | # | Deferred                              | Reason |
 | - | ------------------------------------- | ------ |
-| 14 | **IMAP `CHANGEDSINCE` filtering**     | `ImapMailSource` exposes `modseq` per message but still does a full `FETCH 1:*`. CONDSTORE `CHANGEDSINCE` would skip unchanged messages server-side. Real win at high volume; not needed at current scale. |
-| 15 | **IMAP `IDLE` for push notifications** | Would give sub-minute latency for new mail and flag changes without polling. Meaningful v3 feature if sub-5-minute latency matters. |
 | 16 | **IMAP write path**                   | Writes always go through REST (flag updates, folder moves, deletes, creates). Mixing IMAP writes with REST writes complicates audit attribution. Only needed if a future backend lacks a REST write API. |
 | 17 | **Canonical cross-source message id** | REST uses forwardemail's ObjectId (`69d1…`); IMAP uses `imap-<uid>`. You can't switch `mail_source` against the same backup tree without wiping `mail/`. A canonical id (e.g. `Message-ID` header hash) would allow hot-swapping backends. Documented as a warning on the config field. |
+
+### Known limitations
+
+Not planned. These are architectural choices, not gaps.
+
+| # | Limitation                            | Rationale |
+| - | ------------------------------------- | --------- |
+| 5 | **No retention / pruning of git history** | Disk is cheap, history is the product. The backup repo is append-only by design; `git gc --auto` handles object compaction. If a repo grows unwieldy, `git filter-repo` is the manual escape hatch. |
 
 ## Open-source friendly
 
