@@ -46,6 +46,15 @@ enum Command {
     /// Run one pull cycle for sieve scripts and commit.
     PullSieve,
 
+    /// Run one pull cycle for mail (folders + messages) and commit.
+    PullMail,
+
+    /// Run one pull cycle for calendars and calendar events and commit.
+    PullCalendar,
+
+    /// Run all pull cycles in sequence.
+    PullAll,
+
     /// Long-running daemon mode (pull timers + MCP server). NOT YET IMPLEMENTED.
     Daemon,
 }
@@ -108,6 +117,87 @@ async fn main() -> Result<()> {
             .await?;
             tracing::info!(summary = %summary, "pull-sieve done");
             println!("{summary}");
+        }
+        Command::PullMail => {
+            cfg.permissions.check_read(pimsteward::Resource::Email)?;
+            let (user, pass) = cfg.load_credentials()?;
+            let alias = alias_from_user(&user);
+            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let summary = pull::mail::pull_mail(
+                &client,
+                &repo,
+                &alias,
+                "pimsteward-pull",
+                "pull@pimsteward.local",
+            )
+            .await?;
+            tracing::info!(summary = %summary, "pull-mail done");
+            println!("{summary}");
+        }
+        Command::PullCalendar => {
+            cfg.permissions.check_read(pimsteward::Resource::Calendar)?;
+            let (user, pass) = cfg.load_credentials()?;
+            let alias = alias_from_user(&user);
+            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let summary = pull::calendar::pull_calendar(
+                &client,
+                &repo,
+                &alias,
+                "pimsteward-pull",
+                "pull@pimsteward.local",
+            )
+            .await?;
+            tracing::info!(summary = %summary, "pull-calendar done");
+            println!("{summary}");
+        }
+        Command::PullAll => {
+            let (user, pass) = cfg.load_credentials()?;
+            let alias = alias_from_user(&user);
+            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let author = ("pimsteward-pull", "pull@pimsteward.local");
+
+            // Each is independently gated; skip the ones the config denies.
+            if cfg
+                .permissions
+                .check_read(pimsteward::Resource::Contacts)
+                .is_ok()
+            {
+                let s = pull::contacts::pull_contacts(&client, &repo, &alias, author.0, author.1)
+                    .await?;
+                tracing::info!(summary = %s, "pull-contacts done");
+                println!("{s}");
+            }
+            if cfg
+                .permissions
+                .check_read(pimsteward::Resource::Sieve)
+                .is_ok()
+            {
+                let s = pull::sieve::pull_sieve(&client, &repo, &alias, author.0, author.1).await?;
+                tracing::info!(summary = %s, "pull-sieve done");
+                println!("{s}");
+            }
+            if cfg
+                .permissions
+                .check_read(pimsteward::Resource::Calendar)
+                .is_ok()
+            {
+                let s = pull::calendar::pull_calendar(&client, &repo, &alias, author.0, author.1)
+                    .await?;
+                tracing::info!(summary = %s, "pull-calendar done");
+                println!("{s}");
+            }
+            if cfg
+                .permissions
+                .check_read(pimsteward::Resource::Email)
+                .is_ok()
+            {
+                let s = pull::mail::pull_mail(&client, &repo, &alias, author.0, author.1).await?;
+                tracing::info!(summary = %s, "pull-mail done");
+                println!("{s}");
+            }
         }
         Command::Daemon => {
             pimsteward::run(cfg).await?;

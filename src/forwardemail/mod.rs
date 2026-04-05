@@ -12,8 +12,10 @@
 //! client parses and surfaces via [`Client::rate_limit_remaining`] so a
 //! calling loop can back off when it's running low.
 
+pub mod calendar;
 pub mod client;
 pub mod contacts;
+pub mod mail;
 pub mod sieve;
 
 // Shared error helpers / response wrapping lives on Client itself.

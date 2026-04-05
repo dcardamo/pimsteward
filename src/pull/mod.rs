@@ -2,7 +2,9 @@
 //! pure async function that reads from a [`Client`], diffs against the
 //! [`Repo`] contents, writes updated files, and commits.
 
+pub mod calendar;
 pub mod contacts;
+pub mod mail;
 pub mod sieve;
 
 use crate::error::Error;
