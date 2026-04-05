@@ -71,6 +71,7 @@ impl Client {
     }
 
     async fn send(&self, method: Method, path: &str) -> Result<Response, Error> {
+        self.backoff_if_throttled().await;
         let url = format!("{}{}", self.api_base, path);
         let resp = self
             .http
@@ -136,10 +137,27 @@ impl Client {
         if let Some(etag) = if_match {
             req = req.header("If-Match", etag);
         }
+        self.backoff_if_throttled().await;
         let resp = req.send().await?;
         self.capture_rate_limit(&resp);
         self.check_status(&resp)?;
         Ok(resp)
+    }
+
+    /// If the most recently observed `X-RateLimit-Remaining` is low, sleep
+    /// before issuing the next request. Tiered thresholds keep pull loops
+    /// polite without serializing every call. -1 (unknown) is a no-op so the
+    /// first request proceeds immediately.
+    async fn backoff_if_throttled(&self) {
+        let remaining = self.rate_remaining.load(Ordering::Relaxed);
+        if let Some(delay) = backoff_for_remaining(remaining) {
+            tracing::warn!(
+                remaining,
+                delay_ms = delay.as_millis() as u64,
+                "forwardemail rate limit low, sleeping before next request"
+            );
+            tokio::time::sleep(delay).await;
+        }
     }
 
     fn capture_rate_limit(&self, resp: &Response) {
@@ -165,5 +183,62 @@ impl Client {
             status: status.as_u16(),
             message: status.canonical_reason().unwrap_or("unknown").to_string(),
         })
+    }
+}
+
+/// Pure helper: given a most-recently-observed `X-RateLimit-Remaining` value,
+/// return the duration to sleep before the next request. `None` means no
+/// backoff. -1 signals "unknown" (no request made yet) and is also a no-op.
+///
+/// Tiers:
+/// - 0 or less → 30s (fully exhausted; give the bucket time to refill)
+/// - 1..=9   → 10s
+/// - 10..=49 → 2s
+/// - 50..=99 → 500ms
+/// - ≥100     → no backoff
+fn backoff_for_remaining(remaining: i64) -> Option<Duration> {
+    if remaining < 0 {
+        return None;
+    }
+    if remaining == 0 {
+        return Some(Duration::from_secs(30));
+    }
+    if remaining < 10 {
+        return Some(Duration::from_secs(10));
+    }
+    if remaining < 50 {
+        return Some(Duration::from_secs(2));
+    }
+    if remaining < 100 {
+        return Some(Duration::from_millis(500));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_unknown_is_noop() {
+        assert_eq!(backoff_for_remaining(-1), None);
+    }
+
+    #[test]
+    fn backoff_plenty_is_noop() {
+        assert_eq!(backoff_for_remaining(100), None);
+        assert_eq!(backoff_for_remaining(500), None);
+        assert_eq!(backoff_for_remaining(i64::MAX), None);
+    }
+
+    #[test]
+    fn backoff_tiered_thresholds() {
+        assert_eq!(backoff_for_remaining(99), Some(Duration::from_millis(500)));
+        assert_eq!(backoff_for_remaining(50), Some(Duration::from_millis(500)));
+        assert_eq!(backoff_for_remaining(49), Some(Duration::from_secs(2)));
+        assert_eq!(backoff_for_remaining(10), Some(Duration::from_secs(2)));
+        assert_eq!(backoff_for_remaining(9), Some(Duration::from_secs(10)));
+        assert_eq!(backoff_for_remaining(1), Some(Duration::from_secs(10)));
+        assert_eq!(backoff_for_remaining(0), Some(Duration::from_secs(30)));
     }
 }
