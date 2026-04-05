@@ -161,9 +161,9 @@ async fn contact_restore_undoes_a_bad_rename() {
     assert!(
         matches!(
             plan.operation,
-            restore::contacts::RestoreOperation::UpdateName { .. }
+            restore::contacts::RestoreOperation::Update { .. }
         ),
-        "expected UpdateName op, got {:?}",
+        "expected Update op, got {:?}",
         plan.operation
     );
 

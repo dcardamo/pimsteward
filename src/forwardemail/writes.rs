@@ -44,6 +44,28 @@ impl Client {
         self.post_json("/v1/contacts", &body).await
     }
 
+    /// POST /v1/contacts with raw vCard content — re-creates a contact
+    /// preserving all fields (emails, phones, addresses, notes, org, etc.)
+    /// without needing a vCard parser. Forwardemail parses the vCard
+    /// server-side and populates all structured fields from it.
+    pub async fn create_contact_from_vcard(&self, vcard: &str) -> Result<Contact, Error> {
+        let body = json!({"content": vcard});
+        self.post_json("/v1/contacts", &body).await
+    }
+
+    /// PUT /v1/contacts/:id with raw vCard content — full update that
+    /// preserves all vCard fields, not just the full_name.
+    pub async fn update_contact_vcard(
+        &self,
+        id: &str,
+        vcard: &str,
+        if_match: Option<&str>,
+    ) -> Result<Contact, Error> {
+        let body = json!({"content": vcard});
+        self.put_json(&format!("/v1/contacts/{id}"), &body, if_match)
+            .await
+    }
+
     /// PUT /v1/contacts/:id — update a contact. Pass the current etag in
     /// `if_match` for optimistic concurrency; a stale etag returns 412.
     pub async fn update_contact_name(

@@ -31,9 +31,20 @@ pub struct RestorePlan {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestoreOperation {
     /// Contact existed at `at_sha` and exists now but differs.
-    UpdateName { target_full_name: String },
-    /// Contact existed at `at_sha` but has been deleted live.
-    Recreate { full_name: String },
+    Update {
+        target_full_name: String,
+        /// Raw vCard 3.0 text from the historical backup. Used for a
+        /// full-field restore (not just the name) via PUT {content}.
+        historical_vcard: String,
+    },
+    /// Contact existed at `at_sha` but has been deleted live. Carries
+    /// the full historical vCard so re-creation preserves all fields
+    /// (emails, phones, addresses, notes, org, etc.), not just full_name.
+    Recreate {
+        full_name: String,
+        /// Raw vCard 3.0 text from the historical backup.
+        historical_vcard: String,
+    },
     /// Nothing to do — live state already matches the historical state.
     NoOp,
 }
@@ -75,25 +86,31 @@ pub async fn plan_contact(
         None => {
             let op = RestoreOperation::Recreate {
                 full_name: historical_full_name.clone(),
+                historical_vcard: historical_vcf.clone(),
             };
             let summary = format!(
                 "Contact '{historical_full_name}' was deleted from forwardemail. \
-                 Restore will re-create it with the historical full_name."
+                 Restore will re-create it from the full historical vCard."
             );
             (op, summary, None)
         }
-        Some(live) if live.full_name == historical_full_name => (
+        // Compare the full vCard content, not just the name. If the
+        // live vCard matches the historical one byte-for-byte, there's
+        // nothing to do. If only the name or any other field differs,
+        // we restore the full historical vCard.
+        Some(live) if live.content == historical_vcf => (
             RestoreOperation::NoOp,
             format!("Contact '{historical_full_name}' already matches — nothing to do."),
             Some(live.id.clone()),
         ),
         Some(live) => {
-            let op = RestoreOperation::UpdateName {
+            let op = RestoreOperation::Update {
                 target_full_name: historical_full_name.clone(),
+                historical_vcard: historical_vcf.clone(),
             };
             let summary = format!(
-                "Contact live full_name='{}' differs from historical '{historical_full_name}'. \
-                 Restore will update the live full_name to match the historical value.",
+                "Contact '{}' differs from historical '{historical_full_name}'. \
+                 Restore will update to the full historical vCard.",
                 live.full_name
             );
             (op, summary, Some(live.id.clone()))
@@ -139,22 +156,27 @@ pub async fn apply_contact(
             tracing::info!(contact = %plan.contact_uid, "restore is a no-op");
             return Ok(());
         }
-        RestoreOperation::UpdateName { target_full_name } => {
+        RestoreOperation::Update {
+            historical_vcard, ..
+        } => {
             let id = plan
                 .live_id
                 .as_ref()
-                .ok_or_else(|| Error::config("UpdateName op requires live_id in plan"))?;
+                .ok_or_else(|| Error::config("Update op requires live_id in plan"))?;
+            // PUT the full historical vCard — forwardemail parses it
+            // server-side and updates all structured fields.
             client
-                .update_contact_name(id, target_full_name, None)
+                .update_contact_vcard(id, historical_vcard, None)
                 .await?;
         }
-        RestoreOperation::Recreate { full_name } => {
-            // Re-create from the historical vCard if possible. For v1 we only
-            // copy the full_name + a single placeholder email; the AI can
-            // explain the loss to the user. A richer implementation would
-            // parse the vCard and re-create every field.
+        RestoreOperation::Recreate {
+            historical_vcard, ..
+        } => {
+            // POST the raw historical vCard — forwardemail creates the
+            // contact with all fields intact (emails, phones, addresses,
+            // notes, org, etc.), no placeholder needed.
             client
-                .create_contact(full_name, &[("restored", "restored@pimsteward.local")])
+                .create_contact_from_vcard(historical_vcard)
                 .await?;
         }
     }
@@ -218,8 +240,9 @@ mod tests {
             path: "a/b.vcf".into(),
             at_sha: "abc123".into(),
             contact_uid: "uid1".into(),
-            operation: RestoreOperation::UpdateName {
+            operation: RestoreOperation::Update {
                 target_full_name: "X".into(),
+                historical_vcard: "BEGIN:VCARD\nFN:X\nEND:VCARD".into(),
             },
             live_id: Some("fel-1".into()),
             human_summary: "test".into(),
