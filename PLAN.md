@@ -44,12 +44,12 @@ README will say this in the first sentence so nobody on GitHub is confused.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  AI assistant (rockycc, Claude Desktop, any MCP client)         │
+│  AI assistant (ai-assistant-container, Claude Desktop, any MCP client)         │
 │      │  MCP: search_email, list_events, create_event, …         │
 │      ▼                                                          │
 │  ┌──────────────────────────────────────────────────┐           │
 │  │  pimsteward  (daemon, own nspawn container       │           │
-│  │   on saturn, owns forwardemail credentials)      │           │
+│  │   on the host, owns forwardemail credentials)      │           │
 │  │    ├─ MCP server  — high-level, safe tools       │           │
 │  │    ├─ Permissions — per-resource none/read/rw    │           │
 │  │    ├─ Pull loop   — forwardemail → diff → git    │           │
@@ -58,8 +58,8 @@ README will say this in the first sentence so nobody on GitHub is confused.
 │  └──────────────────────────────────────────────────┘           │
 │      │ REST (alias-auth)         │ git (gix)                    │
 │      ▼                           ▼                              │
-│   forwardemail.net      /data/Backups/saturn/pimsteward/        │
-│   (authoritative)       dan_hld_ca/   (Filen-mirrored offsite)  │
+│   forwardemail.net      /data/Backups/<host>/pimsteward/        │
+│   (authoritative)       <alias_slug>/   (offsite-mirrored by the host's disk backup)  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -70,14 +70,14 @@ README will say this in the first sentence so nobody on GitHub is confused.
 | Pull    | systemd timer       | poll forwardemail, diff against git tree, commit new state   |
 | Write   | MCP tool call       | stage intended change, apply via API, commit with attribution |
 | Restore | MCP tool or CLI     | read git tree @ T, compute diff vs live, apply as new commit |
-| GC      | weekly systemd timer| `git gc --auto` so Filen offsite stays compact               |
+| GC      | weekly systemd timer| `git gc --auto` so offsite backup stays compact               |
 
 ### Storage layout
 
 ```
-/data/Backups/saturn/pimsteward/dan_hld_ca/
+/data/Backups/<host>/pimsteward/<alias_slug>/
 ├── .git/
-├── sources/forwardemail/dan-hld/
+├── sources/forwardemail/<alias_slug>/
 │   ├── calendars/<cal_id>/_meta.json
 │   ├── calendars/<cal_id>/events/<uid>.ics
 │   ├── contacts/<book_id>/_meta.json
@@ -105,10 +105,10 @@ the analysis of when jj-lib does pay off — not this.
 
 ### Why not push to gitsrv
 
-`/data/Backups/saturn/` is already rclone→Filen-mirrored offsite, so the git
+`/data/Backups/<host>/` is already rclone→offsite-mirrored by the host's disk backup, so the git
 repo gets offsite backup for free. A gitsrv remote would add credential
 handling inside the daemon, a push loop, and create a second copy reachable
-by any machine that has Dan's gitsrv SSH key. Not worth the complexity.
+by any machine that has the operator's gitsrv SSH key. Not worth the complexity.
 
 ---
 
@@ -127,7 +127,7 @@ alias_user_file     = "/run/pimsteward-secrets/forwardemail-alias-user"
 alias_password_file = "/run/pimsteward-secrets/forwardemail-alias-password"
 
 [storage]
-repo_path = "/data/Backups/saturn/pimsteward/dan_hld_ca"
+repo_path = "/data/Backups/<host>/pimsteward/<alias_slug>"
 
 [permissions]
 # Each: "none" | "read" | "readwrite"
@@ -144,7 +144,7 @@ email_interval_seconds    = 300
 
 [mcp]
 # Where the MCP server listens. Defaults to stdio for CLI use; pimsteward also
-# supports a loopback/Tailscale HTTP mode so rockycc can reach it from its
+# supports a loopback/loopback HTTP mode so ai-assistant-container can reach it from its
 # container.
 listen = "unix:/run/pimsteward/mcp.sock"
 # OR: listen = "http://127.0.0.1:8765"
@@ -232,14 +232,14 @@ Every write creates a git commit with:
   ---
   tool: update_event
   resource: calendars/1234/events/abc-def-ghi.ics
-  caller: rockycc
+  caller: ai-assistant-container
   session_id: 2026-04-04T23:45:00Z-a7f3
   reason: "User asked to move appointment from 10am to 2pm"
   api_response_etag: "W/\"a3b1c\""
   ---
   ```
 
-`git log --author=rockycc -- calendars/` then reveals every event the AI has
+`git log --author=ai-assistant-container -- calendars/` then reveals every event the AI has
 ever touched, with full context.
 
 ---
@@ -283,15 +283,15 @@ assumes the worst case and will be refined.
 
 ## Credential isolation
 
-pimsteward is a new dotvault target, mirroring the rockycc refactor that was
+pimsteward is a new dotvault target, mirroring the ai-assistant-container refactor that was
 just landed as task #2 (commit 5f9f83a in dotfiles).
 
 ```
 /var/lib/pimsteward-secrets/
 ├── .config/age/key.txt                      # pimsteward's age private key
 └── .config/secrets/
-    ├── forwardemail-dan-hld-alias-user
-    ├── forwardemail-dan-hld-alias-password
+    ├── forwardemail-prod-alias-user
+    ├── forwardemail-prod-alias-password
     └── env
 ```
 
@@ -301,23 +301,23 @@ Manifest additions:
 # secrets/manifest.nix
 machines.pimsteward = "age1…";
 
-secrets.forwardemail-dan-hld-alias-user = {
-  source = ".config/secrets/forwardemail-dan-hld-alias-user";
-  target = ".config/secrets/forwardemail-dan-hld-alias-user";
+secrets.forwardemail-prod-alias-user = {
+  source = ".config/secrets/forwardemail-prod-alias-user";
+  target = ".config/secrets/forwardemail-prod-alias-user";
   mode = "0600";
-  authorities = ["saturn"];
-  targets = ["pimsteward"];  # ONLY pimsteward. Not saturn, not rockycc.
+  authorities = ["<host>"];
+  targets = ["pimsteward"];  # ONLY pimsteward. Not <host>, not ai-assistant-container.
 };
-# forwardemail-dan-hld-alias-password — same
+# forwardemail-prod-alias-password — same
 ```
 
 Targets = `["pimsteward"]` means:
 
-- rockycc cannot decrypt these even though it has its own dotvault key.
-- saturn's dan user cannot decrypt these with `dotvault import` because saturn
-  is not a recipient. (Dan can still reach them by sudo'ing into
+- ai-assistant-container cannot decrypt these even though it has its own dotvault key.
+- the host's regular user cannot decrypt these with `dotvault import` because that host
+  is not a recipient. (the operator can still reach them by sudo'ing into
   `/var/lib/pimsteward-secrets/` if ever needed — file-level permission, not
-  cryptographic, since saturn is the authority that originally encrypted
+  cryptographic, since <host> is the authority that originally encrypted
   them.)
 
 The nspawn container bind-mounts `/var/lib/pimsteward-secrets/.config/secrets`
@@ -328,7 +328,7 @@ process reads credentials from there at startup.
 
 ## Container + deployment
 
-Mirrors the rockycc pattern. New file: `nixos/saturn/pimsteward.nix`.
+Mirrors the ai-assistant-container pattern. New file: `nixos/<host>/pimsteward.nix`.
 
 ```nix
 containers.pimsteward = {
@@ -343,7 +343,7 @@ containers.pimsteward = {
       isReadOnly = true;
     };
     "/var/lib/pimsteward" = {
-      hostPath = "/data/Backups/saturn/pimsteward/dan_hld_ca";
+      hostPath = "/data/Backups/<host>/pimsteward/<alias_slug>";
       isReadOnly = false;
     };
   };
@@ -352,8 +352,8 @@ containers.pimsteward = {
 };
 ```
 
-Rockycc (or any other MCP client on the tailnet) reaches pimsteward via
-`http://10.0.102.2:8765` or a Tailscale name, depending on final choice.
+Any MCP client on the local network reaches pimsteward via
+`http://10.0.102.2:8765` or a loopback socket, depending on final choice.
 
 ---
 
@@ -365,7 +365,7 @@ Three tiers, strict boundaries (matches dotfiles CLAUDE.md):
 | ----------- | --------------------- | --------- | ------------------------------------------------------------ |
 | unit        | `src/**/*.rs`         | allowed   | canonicalisation, config loading, permission gate, git path mapping |
 | integration | `tests/*.rs`          | wiremock  | full pull loop against a wiremock-scripted forwardemail, real git repo |
-| e2e         | `tests/e2e/*.rs`      | **zero**  | against the real `dotfiles_mcp_test@purpose.dev` test alias, gated by `E2E=1` |
+| e2e         | `tests/e2e/*.rs`      | **zero**  | against the real `test_alias@example.com` test alias, gated by `E2E=1` |
 
 All three must pass before pimsteward ships.
 
@@ -394,13 +394,13 @@ Using the real test alias:
 6. Clean up.
 
 E2e tests are destructive (they create and delete real items) so they run
-against the isolated test alias, never against dan@hld.ca.
+against the isolated test alias, never against production_alias@example.com.
 
 ---
 
 ## Implementation phases
 
-This is one shipment (per Dan's instruction), but internally I'll sequence
+This is one shipment (per the operator's instruction), but internally I'll sequence
 the work so each phase is independently compilable + testable. Rough order:
 
 ### Phase A — Foundations
@@ -469,11 +469,11 @@ the work so each phase is independently compilable + testable. Rough order:
 ### Phase H — Deployment
 
 1. `nix/module.nix` — copy template, customise for pimsteward.
-2. `nixos/saturn/pimsteward.nix` — container wiring.
+2. `nixos/<host>/pimsteward.nix` — container wiring.
 3. Add `pimsteward` target + the two forwardemail secrets to
    `secrets/manifest.nix`.
 4. `bin/update.sh` — add third dotvault import for `pimsteward` target
-   (mirrors rockycc).
+   (mirrors ai-assistant-container).
 
 ### Phase I — Open source polish
 
@@ -484,14 +484,14 @@ the work so each phase is independently compilable + testable. Rough order:
    up, how to restore, explicit non-goals.
 3. Neutral "AI assistant" phrasing throughout — no "rocky", no "claude".
 4. `CONTRIBUTING.md` — minimal, just the test tiers.
-5. GitHub mirror setup (push main to `gitsrv:dan/pimsteward` AND
+5. GitHub mirror setup (push main to the self-hosted git server AND
    `github:<user>/pimsteward`).
 
 ### Phase J — E2e test pass + ship
 
-1. Run the full e2e suite against `dotfiles_mcp_test@purpose.dev`.
+1. Run the full e2e suite against `test_alias@example.com`.
 2. Fix whatever breaks.
-3. Deploy to saturn via `make update`.
+3. Deploy to <host> via `make update`.
 4. Observe for 24h. Commit any follow-ups.
 5. Close task #6.
 
@@ -526,10 +526,10 @@ the work so each phase is independently compilable + testable. Rough order:
 | ------------------------------------------------------------ | --------------------------------------------------------------------------------- |
 | Forwardemail API changes break pimsteward                    | Integration test suite against wiremock catches behaviour changes; e2e catches protocol changes; pin the smoke-test findings in `docs/api-findings.md` for future comparison |
 | AI assistant manipulates restore tool to undo safeguards     | `plan_token` binding between dry-run and confirm; every restore is itself a git commit with `author=<ai>`, so it's visible in history |
-| Git repo corruption                                          | `git gc --auto` weekly, integrity check on every pull loop start, Filen offsite via `/data/Backups` |
+| Git repo corruption                                          | `git gc --auto` weekly, integrity check on every pull loop start, offsite backup via `/data/Backups` |
 | Credential leak via MCP error messages                       | `Error` enum never wraps credential values; `tracing` uses `#[tracing::instrument(skip(password))]` |
 | iCal/vCard canonicalisation strips a semantically important field | Store original bytes; canonicalisation only affects *hash-for-diff*, restoration writes the original back |
-| Saturn dies with uncommitted state                           | Pull loop commits atomically (nothing is in a "half-applied" state); write loop commits before returning success to the MCP client |
+| The host dies with uncommitted state                           | Pull loop commits atomically (nothing is in a "half-applied" state); write loop commits before returning success to the MCP client |
 
 ---
 
@@ -538,8 +538,8 @@ the work so each phase is independently compilable + testable. Rough order:
 pimsteward v1 is "done" when:
 
 - [ ] Pull loop runs on a 5-minute systemd timer and captures all resource
-      changes for `dan@hld.ca` into git.
-- [ ] At least one AI client (rockycc) is wired up and can successfully
+      changes for `production_alias@example.com` into git.
+- [ ] At least one AI client (ai-assistant-container) is wired up and can successfully
       list/read/write calendar events and contacts via the MCP tools.
 - [ ] Permission config enforces `email = "read"` — writes to email return
       an error through the MCP tool, not a silent success.
@@ -547,6 +547,6 @@ pimsteward v1 is "done" when:
       executes it; both are visible in git history.
 - [ ] All three test tiers pass in CI.
 - [ ] GitHub mirror is published with README, LICENSE, and neutral phrasing.
-- [ ] No pimsteward credential is reachable from inside the rockycc
+- [ ] No pimsteward credential is reachable from inside the ai-assistant-container
       container. (Verified by `cat /config/secrets/forwardemail-*`
       returning ENOENT.)

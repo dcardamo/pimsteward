@@ -1,6 +1,6 @@
 # forwardemail.net API findings
 
-_Smoke-tested 2026-04-05 against `dotfiles_mcp_test@purpose.dev` on the live
+_Smoke-tested 2026-04-05 against `a dedicated test alias (name contains `_test` per the safety guardrail)` on the live
 `https://api.forwardemail.net` instance. These findings drive the pimsteward
 implementation — revisit if forwardemail changes behaviour._
 
@@ -313,4 +313,4 @@ X-Request-Id              # include in tracing spans for log correlation
 
 All resources created during the smoke test were deleted in the same script
 runs. Verified via `GET /v1/{calendars,contacts,messages,sieve-scripts}`
-returning `[]` after cleanup. No lingering state on `dotfiles_mcp_test@purpose.dev`.
+returning `[]` after cleanup. No lingering state on `a dedicated test alias (name contains `_test` per the safety guardrail)`.
