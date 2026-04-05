@@ -117,14 +117,19 @@ are written back to forwardemail.
 Once pimsteward is wired up to your AI assistant, "PIM assistant" stops being
 a demo and starts being a daily driver. Some of the things it's built for:
 
-#### 📬 Mail — triage, search, summarise
+#### 📬 Mail — triage, search, summarise, send
 - **"What landed in my inbox this week that I haven't replied to?"** — the AI
   runs a proper full-text + header search via forwardemail's API, summarises,
   and proposes next actions.
 - **"Move anything from my accountant into the `taxes/` folder."** — batch
   label/move operations across folders, logged and reversible.
 - **"Draft a reply to the Monday thread, polite decline."** — the AI writes
-  into your Drafts folder; you hit send.
+  into your Drafts folder; you hit send. This is the safe default.
+- **"Send the polite decline I drafted yesterday."** — once you've granted
+  the separate `email_send` permission (see below), the AI can actually
+  put mail on the wire via forwardemail's SMTP bridge. Every send is a git
+  commit with `tool: send_email` in the audit trailer carrying recipients,
+  subject, and body sha256 — irreversible, but fully recorded.
 - **"Find every email that mentions project Gemini between Feb and April."**
   — advanced search passed through to forwardemail, with results streamed
   back over MCP so the assistant can reason across the full corpus.
@@ -423,11 +428,16 @@ answer, not a hallucinated summary.
 Trust in an AI assistant is not binary, and neither is pimsteward. You set one
 policy per resource type, and you turn the dials up as the assistant earns it.
 
-| Level            | What the AI can do                                           | Where it makes sense               |
-| ---------------- | ------------------------------------------------------------ | ---------------------------------- |
-| **`none`**       | Resource is invisible — the MCP tools aren't even registered | Data you simply don't want AI near |
-| **`read`**       | Search, read, summarise, quote — zero writes                 | The safe default for everything    |
-| **`read_write`** | Full CRUD: create, update, delete, move, send                | Once the AI has earned it          |
+| Level            | What the AI can do                                                        | Where it makes sense               |
+| ---------------- | ------------------------------------------------------------------------- | ---------------------------------- |
+| **`none`**       | Resource is invisible — the MCP tools aren't even registered              | Data you simply don't want AI near |
+| **`read`**       | Search, read, summarise, quote — zero writes                              | The safe default for everything    |
+| **`read_write`** | Full mailbox CRUD: create drafts, update flags, move, delete. **Not send.** | Once the AI has earned it          |
+
+**Sending mail over SMTP is its own separate permission** (`email_send`,
+covered below). `read_write` on email does not grant send and never will —
+the blast radius of `POST /v1/emails` is strictly larger than any mailbox
+mutation, and that asymmetry is worth an extra opt-in.
 
 For the "let the AI draft replies but never touch the rest of my mail"
 middle ground, use a **scoped** permission (documented below) rather than a
@@ -477,17 +487,22 @@ existing message. You review and hit send yourself.
 
 ```toml
 [permissions]
-email    = "read_write"   # full CRUD, including send
-calendar = "read_write"
-contacts = "read_write"
-sieve    = "read_write"
+email      = "read_write"   # triage, file, move, delete — everything except send
+email_send = "allowed"      # SEPARATE opt-in; read_write does not imply this
+calendar   = "read_write"
+contacts   = "read_write"
+sieve      = "read_write"
 ```
 
-At this point the assistant can autonomously triage, reply, file, and archive.
-The safety net is not the permission bit — it's the fact that **every mutation
-is still committed to git with AI attribution**, and the restore MCP tools can
-rewind any path to any point in time. You are trading convenience for the
-need to occasionally audit a `git log`, not for blind faith.
+At this point the assistant can autonomously triage, reply, file, archive,
+*and send mail on your behalf*. The safety net is not the permission bit —
+it's the fact that **every mutation is still committed to git with AI
+attribution**, and the restore MCP tools can rewind any path to any point in
+time. Sends are the one exception that can't be rewound, but they can still
+be audited: every `send_email` call lands a commit with the full recipient
+list, subject, and a sha256 of the body that was transmitted. You are
+trading convenience for the need to occasionally audit a `git log`, not for
+blind faith.
 
 ### The rest of the config
 
@@ -560,6 +575,65 @@ default = "none"
 Contacts and sieve stay globally scoped on purpose — forwardemail gives you
 one default address book per alias and a flat sieve namespace, so per-item
 rules would add friction without meaningful security value.
+
+### Sending mail — `email_send` is its own permission
+
+Everything on the `email` axis above governs **mailbox mutations** —
+creating drafts, flipping flags, moving messages, deleting threads. Sending
+an outgoing message over SMTP is a different capability, and pimsteward
+treats it that way:
+
+```toml
+[permissions]
+email      = "read_write"   # mailbox CRUD
+email_send = "allowed"      # default is "denied" — you must opt in explicitly
+```
+
+Why the split? The blast radius of a send is strictly larger than any
+mailbox mutation. Mailbox writes stay inside your alias and are reversible
+via `restore_mail_*`. `POST /v1/emails` puts bytes in front of third
+parties over the public internet, and there is no "undo" once the remote
+SMTP server accepts them. `read_write` on `email` therefore **does not
+imply** send — you have to write the extra line.
+
+Mechanically, forwardemail uses one alias credential for both IMAP/REST
+mailbox access and SMTP sending, so the split isn't enforced at the
+transport layer. pimsteward enforces it at the policy layer: the
+`send_email` MCP tool calls a dedicated `check_email_send` gate, and the
+default `email_send = "denied"` means the tool refuses every call until
+you opt in.
+
+Every successful send produces a git commit with a structured audit
+trailer:
+
+```
+mail: SEND → ["alice@example.com"]: meeting confirmation
+
+---
+tool: send_email
+resource: mail
+resource_id: <forwardemail-returned-id>
+caller: ai
+reason: "user asked me to confirm the 3pm slot"
+args: {"to":["alice@example.com"],"cc":[],"bcc":[],
+       "subject":"meeting confirmation",
+       "body_sha256":"9f86d081884c7d659a2feaa0c55ad015...",
+       "has_text":true,"has_html":false,
+       "returned_id":"..."}
+---
+```
+
+The full body bytes land in git a few seconds later via the automatic pull
+that captures the Sent folder. The `body_sha256` in the audit trailer binds
+the commit to the exact bytes that were transmitted — so even if the Sent
+copy is later deleted, the hash in the audit log still proves what went
+out. Enumerate every send with `git log --grep='tool: send_email'`.
+
+If you want the AI to compose outgoing mail without being trusted to put
+it on the wire, set `email_send = "denied"` (the default) and use
+`create_draft` instead. The assistant writes into your Drafts folder; you
+review and hit send yourself. This is the right setting for most people
+most of the time.
 
 ---
 
@@ -686,15 +760,17 @@ Early development, but the core is working end-to-end:
   Weekly `git gc --auto` runs alongside the pull tasks.
 - **MCP server** — read tools (`search_email`, `get_email`, `list_folders`,
   `list_calendars`, `list_events`, `list_contacts`, `list_sieve`, `history`)
-  and write tools for all four resources (`create_draft`, `move_email`,
-  `delete_email`, `update_email_flags`, `create_event`, `update_event`,
-  `delete_event`, `create_contact`, `update_contact`, `delete_contact`,
-  `install_sieve_script`, `update_sieve_script`, `delete_sieve_script`).
+  and write tools for all four resources (`create_draft`, **`send_email`**,
+  `move_email`, `delete_email`, `update_email_flags`, `create_event`,
+  `update_event`, `delete_event`, `create_contact`, `update_contact`,
+  `delete_contact`, `install_sieve_script`, `update_sieve_script`,
+  `delete_sieve_script`).
 - **Restore** — dry-run + apply tool pairs for contacts, sieve, calendar
   events, mail, and arbitrary paths, all gated by a content-derived
   `plan_token`.
 - **Permission model** — flat and scoped (per-folder / per-calendar-id)
-  forms, with a path-safe deny guard for the test suite.
+  forms, a separate opt-in `email_send` permission for SMTP delivery, and a
+  path-safe deny guard for the test suite.
 
 See [PLAN.md](PLAN.md) for the full design and phased implementation, and
 [DESIGN.md](DESIGN.md) for deeper rationale on the trickier decisions.
