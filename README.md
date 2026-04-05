@@ -71,8 +71,10 @@ three.
   backend was already programmatic.
 
 If forwardemail didn't exist, pimsteward would need to be five times the code
-and half as reliable. Give them [a look](https://forwardemail.net) — and, if
-you end up running pimsteward, a paid plan.
+and half as reliable. Give them [a look](https://forwardemail.net) if you're
+shopping for an email host.
+
+*I'm not affiliated with forwardemail — just a happy paying user.*
 
 ---
 
