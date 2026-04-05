@@ -120,16 +120,16 @@ git repository sideways, and the forwardemail REST API downward.
 ```mermaid
 flowchart TB
     subgraph client["AI side"]
-        AI["AI assistant<br/>(Claude Desktop, Claude Code,<br/>any MCP client)"]
+        AI["AI assistant<br/>Claude Desktop / Claude Code<br/>any MCP client"]
     end
 
     subgraph daemon["pimsteward daemon"]
         direction TB
-        MCP["MCP server<br/><sub>typed, high-level tools</sub>"]
-        PERM["Permission gate<br/><sub>none / read / readwrite<br/>per resource</sub>"]
-        PULL["Pull loop<br/><sub>forwardemail → diff → git</sub>"]
-        WRITE["Write path<br/><sub>git WAL → API → git commit</sub>"]
-        REST["Restore engine<br/><sub>git @ T → diff → API</sub>"]
+        MCP["MCP server<br/>typed, high-level tools"]
+        PERM["Permission gate<br/>none / read / readwrite<br/>per resource"]
+        PULL["Pull loop<br/>forwardemail → diff → git"]
+        WRITE["Write path<br/>git WAL → API → commit"]
+        REST["Restore engine<br/>git @ T → diff → API"]
         MCP --> PERM
         PERM --> WRITE
         PERM --> REST
@@ -140,13 +140,13 @@ flowchart TB
         AUDIT[("audit log<br/>mutations.jsonl")]
     end
 
-    FE["forwardemail.net<br/><sub>authoritative store</sub>"]
+    FE["forwardemail.net<br/>authoritative store"]
 
-    AI -- "MCP (stdio or unix socket)" --> MCP
-    PULL -- "REST (alias auth)" --> FE
-    WRITE -- "REST (alias auth)" --> FE
-    REST -- "REST (alias auth)" --> FE
-    FE -. "polled every 5 min" .-> PULL
+    AI -- "MCP" --> MCP
+    PULL -- "REST" --> FE
+    WRITE -- "REST" --> FE
+    REST -- "REST" --> FE
+    FE -. "poll 5 min" .-> PULL
     PULL --> GIT
     WRITE --> GIT
     WRITE --> AUDIT
@@ -182,8 +182,8 @@ silently diverges from the remote.
 sequenceDiagram
     autonumber
     participant AI as AI assistant
-    participant MCP as pimsteward<br/>MCP server
-    participant P as Permission<br/>gate
+    participant MCP as pimsteward
+    participant P as Permission gate
     participant G as git repo
     participant FE as forwardemail.net
 
@@ -191,13 +191,13 @@ sequenceDiagram
     MCP->>P: check(calendar, write)
     alt denied
         P-->>MCP: denied
-        MCP-->>AI: error: permission
+        MCP-->>AI: error — permission
     else allowed
         P-->>MCP: allowed
-        MCP->>G: stage intent → WAL commit
-        MCP->>FE: POST /calendars/.../events
-        FE-->>MCP: 201 Created (uid)
-        MCP->>G: commit "ai: create_event <uid>"<br/>+ audit log entry
+        MCP->>G: stage intent (WAL commit)
+        MCP->>FE: POST /calendars/events
+        FE-->>MCP: 201 Created, uid
+        MCP->>G: commit "ai create_event" + audit entry
         MCP-->>AI: ok (uid)
     end
 ```
@@ -213,21 +213,21 @@ default** and requires an explicit confirmation token to apply.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant U as You (or AI)
+    participant U as You or AI
     participant MCP as pimsteward
     participant G as git repo
     participant FE as forwardemail.net
 
-    U->>MCP: restore(path="calendars/work/", at="2026-03-01T09:00Z")
-    MCP->>G: read tree @ T
+    U->>MCP: restore(path, at=T)
+    MCP->>G: read tree at T
     MCP->>FE: GET current state
-    MCP->>MCP: compute diff (adds / deletes / updates)
+    MCP->>MCP: compute diff (add / del / update)
     MCP-->>U: dry-run plan + confirm_token
-    Note over U,MCP: Human (or AI with explicit approval)<br/>inspects the plan.
+    Note over U,MCP: Human inspects the plan and approves.
     U->>MCP: restore_apply(confirm_token)
     MCP->>FE: apply diff (idempotent, ordered)
-    MCP->>G: commit "restore: @2026-03-01 → now"
-    MCP-->>U: restored (N files, M events)
+    MCP->>G: commit "restore at T"
+    MCP-->>U: restored N files, M events
 ```
 
 ---
