@@ -55,6 +55,12 @@ pub struct CalendarEvent {
     /// verbatim.
     #[serde(default)]
     pub ical: Option<String>,
+    /// CalDAV `getetag` value. Present when events are pulled via the
+    /// CalDAV source; absent for REST pulls (forwardemail's REST API
+    /// does not return ETags for calendar events). Used for optimistic
+    /// concurrency control on writes (If-Match header) when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -164,6 +170,7 @@ impl Client {
         id: &str,
         ical: Option<&str>,
         calendar_id: Option<&str>,
+        if_match: Option<&str>,
     ) -> Result<CalendarEvent, Error> {
         let mut body = serde_json::Map::new();
         if let Some(i) = ical {
@@ -175,7 +182,7 @@ impl Client {
         self.put_json(
             &format!("/v1/calendar-events/{id}"),
             &serde_json::Value::Object(body),
-            None,
+            if_match,
         )
         .await
     }

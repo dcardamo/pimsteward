@@ -92,6 +92,7 @@ async fn calendar_event_create_update_delete_lifecycle() {
         &event_id,
         Some(&ical_v2),
         None,
+        None,
     )
     .await
     .expect("update event");
@@ -152,6 +153,7 @@ async fn calendar_event_restore_from_history() {
         &attr,
         &event_id,
         Some(&bad_ical),
+        None,
         None,
     )
     .await

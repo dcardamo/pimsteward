@@ -149,6 +149,7 @@ impl CalendarSource for DavCalendarSource {
                     uid,
                     calendar_id: Some(cal_id.clone()),
                     ical: Some(ical),
+                    etag: r.etag,
                     summary: None,
                     description: None,
                     location: None,

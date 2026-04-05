@@ -144,6 +144,7 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
         &event.id,
         Some(&bad_ical),
         None,
+        None,
     )
     .await
     .expect("bad event update");

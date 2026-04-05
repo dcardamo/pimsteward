@@ -22,10 +22,15 @@ struct EventMeta {
     id: String,
     uid: Option<String>,
     calendar_id: Option<String>,
-    /// sha256 of the raw iCalendar text. Calendar events have no etag in
-    /// the forwardemail REST response, so content hash is the stable diff
-    /// key.
+    /// sha256 of the raw iCalendar text. Used as the diff key when etag
+    /// is absent (REST pulls). When etag is present (CalDAV), it takes
+    /// priority as the diff key.
     content_sha256: Option<String>,
+    /// CalDAV getetag. Present only when pulled via CalDAV; REST events
+    /// don't carry an etag. Used as primary diff key when available, and
+    /// threaded through to writes for If-Match concurrency control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
     updated_at: Option<String>,
 }
 
@@ -77,11 +82,14 @@ pub async fn pull_calendar(
             let content_hash = sha256(ical.as_bytes());
             let prev = local_meta.get(&key);
 
-            // No CardDAV-style etag on calendar events per the forwardemail
-            // API shape — diff on content hash only.
+            // Prefer etag as the diff key when available (CalDAV source);
+            // fall back to content hash (REST source or missing etag).
             let changed = match prev {
                 None => true,
-                Some(p) => p.content_sha256.as_deref() != Some(content_hash.as_str()),
+                Some(p) => match (&e.etag, &p.etag) {
+                    (Some(remote_etag), Some(local_etag)) => remote_etag != local_etag,
+                    _ => p.content_sha256.as_deref() != Some(content_hash.as_str()),
+                },
             };
 
             if !changed {
@@ -96,6 +104,7 @@ pub async fn pull_calendar(
                 uid: e.uid.clone(),
                 calendar_id: e.calendar_id.clone(),
                 content_sha256: Some(content_hash),
+                etag: e.etag.clone(),
                 updated_at: e.updated_at.clone(),
             };
             let meta_path = format!("{cal_dir}/events/{key}.meta.json");

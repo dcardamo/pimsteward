@@ -46,6 +46,7 @@ pub async fn create_event(
     Ok(created)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_event(
     client: &Client,
     repo: &Repo,
@@ -54,9 +55,10 @@ pub async fn update_event(
     id: &str,
     ical: Option<&str>,
     target_calendar_id: Option<&str>,
+    if_match: Option<&str>,
 ) -> Result<CalendarEvent, Error> {
     let updated = client
-        .update_calendar_event(id, ical, target_calendar_id)
+        .update_calendar_event(id, ical, target_calendar_id, if_match)
         .await?;
     let audit = WriteAudit {
         attribution,

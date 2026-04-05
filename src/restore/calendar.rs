@@ -127,7 +127,9 @@ pub async fn apply_calendar(
                 .as_ref()
                 .ok_or_else(|| Error::config("UpdateIcal op requires live_event_id in plan"))?;
             client
-                .update_calendar_event(id, Some(target_ical), None)
+                // Restore doesn't carry an etag — the user explicitly
+                // asked to overwrite, so we skip If-Match.
+                .update_calendar_event(id, Some(target_ical), None, None)
                 .await?;
         }
         CalendarOperation::Recreate { ical } => {

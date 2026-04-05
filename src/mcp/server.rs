@@ -311,6 +311,12 @@ pub struct UpdateEventParams {
     /// Optionally move the event to a different calendar.
     #[serde(default)]
     pub target_calendar_id: Option<String>,
+    /// Optimistic concurrency: pass the event's last-known etag (from a
+    /// CalDAV-sourced pull) to get a 412 Precondition Failed if the
+    /// server version has changed. Harmlessly ignored on REST backends
+    /// that don't support If-Match for calendar events.
+    #[serde(default)]
+    pub if_match: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -888,6 +894,7 @@ impl PimstewardServer {
             &p.id,
             p.ical.as_deref(),
             p.target_calendar_id.as_deref(),
+            p.if_match.as_deref(),
         )
         .await
         .map_err(|e| self.api_error(e))?;
