@@ -378,6 +378,10 @@ since been built. Listed here so the delta is traceable.
 | IMAP `CHANGEDSINCE` filtering         | **V2.5** — `MailSource::list_messages` returns `ListResult` with `all_ids` + `changed`. IMAP source issues `FETCH 1:* (...) (CHANGEDSINCE <m>)` when UIDVALIDITY matches stored value; `_folder.json` persists `modify_index`/`uid_validity` between pulls |
 | IMAP `IDLE` for push notifications    | **V2.5** — `idle_loop()` runs a dedicated IMAP IDLE connection on INBOX, signals the mail puller via `tokio::sync::Notify`. Opt-in via `forwardemail.imap_idle = true`. Periodic ticker remains as safety net |
 | Scoped email write permissions + `create_draft` tool | **V2.5** — removed resource-level baseline gate so per-folder overrides are authoritative; `create_draft` tool saves structured messages to Drafts folder |
+| Richer contact restore (full vCard)   | **V2.5** — `Recreate` and `Update` now POST/PUT the raw historical vCard content; forwardemail parses it server-side preserving all fields |
+| Calendar event If-Match via CalDAV etags | **V2.5** — `CalendarEvent.etag` populated from CalDAV getetag; `EventMeta` persists it; `update_calendar_event` accepts `if_match` parameter; MCP `update_event` tool exposes it |
+| IMAP write path                        | **V2.5** — `MailWriter` trait with REST + IMAP impls; IMAP uses UID STORE/COPY+EXPUNGE for flags/moves/deletes; MCP server holds `Arc<dyn MailWriter>` |
+| Canonical cross-source message id      | **V2.5** — `sha256(Message-ID header)[..16]` as filename stem; source-specific id preserved in `meta.json`; safe to switch `mail_source` between REST and IMAP without wiping |
 
 ## Deferred (and why)
 
@@ -388,18 +392,9 @@ future improvement when the need is concrete.
 
 | # | Deferred                              | Reason |
 | - | ------------------------------------- | ------ |
-| 7 | **Richer contact restore recreate**   | Current `Recreate` uses a placeholder email and only preserves `full_name`. Full vCard re-hydration needs a proper parser. Common case (undo a rename) is fully covered. |
-| 8 | **Calendar event optimistic concurrency (If-Match)** | Forwardemail's calendar events don't return an ETag header — API limitation, not a pimsteward gap. Contacts *do* support If-Match and pimsteward uses it. |
 | 9 | **Webhook-driven push ingest**        | Would require a public HTTPS endpoint (attack surface) and a partial delivery model. Forwardemail's storage is zero-knowledge so server-side push isn't architecturally possible. |
 | 10 | **Multi-alias support in one instance** | One alias per daemon. Run two if you need two. |
 | 12 | **Dedicated `get_*` MCP tools**       | `list_*` tools return full content for contacts/events/sieve; individual `get_*` would be redundant. `search_email` covers the mail case. |
-
-### Discovered during V2.x work
-
-| # | Deferred                              | Reason |
-| - | ------------------------------------- | ------ |
-| 16 | **IMAP write path**                   | Writes always go through REST (flag updates, folder moves, deletes, creates). Mixing IMAP writes with REST writes complicates audit attribution. Only needed if a future backend lacks a REST write API. |
-| 17 | **Canonical cross-source message id** | REST uses forwardemail's ObjectId (`69d1…`); IMAP uses `imap-<uid>`. You can't switch `mail_source` against the same backup tree without wiping `mail/`. A canonical id (e.g. `Message-ID` header hash) would allow hot-swapping backends. Documented as a warning on the config field. |
 
 ### Known limitations
 
