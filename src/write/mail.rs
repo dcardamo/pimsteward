@@ -12,6 +12,34 @@ use crate::pull::mail::pull_mail;
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
 
+pub async fn create_draft(
+    client: &Client,
+    repo: &Repo,
+    alias: &str,
+    attribution: &Attribution,
+    msg: &crate::forwardemail::writes::NewMessage,
+) -> Result<serde_json::Value, Error> {
+    let result = client.create_message(msg).await?;
+    let msg_id = result
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let audit = WriteAudit {
+        attribution,
+        tool: "create_draft",
+        resource: "mail",
+        resource_id: msg_id.to_string(),
+        args: serde_json::json!({
+            "folder": &msg.folder,
+            "to": &msg.to,
+            "subject": &msg.subject,
+        }),
+        summary: format!("mail: create draft in {} → {}", msg.folder, msg.subject),
+    };
+    refresh(client, repo, alias, attribution, &audit).await?;
+    Ok(result)
+}
+
 pub async fn update_flags(
     client: &Client,
     repo: &Repo,

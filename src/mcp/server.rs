@@ -230,6 +230,32 @@ pub struct DeleteSieveParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateDraftParams {
+    /// Recipient email addresses (To:).
+    pub to: Vec<String>,
+    /// CC recipients. Optional.
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// BCC recipients. Optional.
+    #[serde(default)]
+    pub bcc: Vec<String>,
+    /// Email subject line.
+    pub subject: String,
+    /// Plain-text body. At least one of `text` or `html` should be
+    /// provided.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// HTML body. Optional — if only `text` is provided, forwardemail
+    /// uses it as the sole body part.
+    #[serde(default)]
+    pub html: Option<String>,
+    /// Free-text reason why you're creating this draft. Ends up in the
+    /// git commit message for audit purposes.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateFlagsParams {
     /// Forwardemail message id.
     pub id: String,
@@ -669,6 +695,47 @@ impl PimstewardServer {
         .await
         .map_err(|e| self.api_error(e))?;
         Ok(format!("deleted sieve script {}", p.id))
+    }
+
+    #[tool(
+        name = "create_draft",
+        description = "Create a new draft email in the Drafts folder. Provide recipients, subject, and body (text and/or html). The draft appears in the user's Drafts folder ready for review and manual sending. Does NOT send the email — only saves a draft."
+    )]
+    async fn create_draft(
+        &self,
+        Parameters(p): Parameters<CreateDraftParams>,
+    ) -> Result<String, McpError> {
+        // Drafts go into the special-use Drafts folder. Gate on write
+        // access to that folder — the motivating use case is
+        // default=read + Drafts=read_write.
+        let folder = "Drafts";
+        self.check_write_scoped(Scope::Email {
+            folder: Some(folder),
+        })?;
+        let attr = self.attribution(None, p.reason);
+        let msg = crate::forwardemail::writes::NewMessage {
+            folder: folder.to_string(),
+            to: p.to,
+            cc: p.cc,
+            bcc: p.bcc,
+            subject: p.subject,
+            text: p.text,
+            html: p.html,
+        };
+        let result = crate::write::mail::create_draft(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &msg,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let id = result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        Ok(format!("draft created: {id} in {folder}"))
     }
 
     #[tool(

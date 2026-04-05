@@ -14,6 +14,18 @@ use crate::forwardemail::sieve::SieveScript;
 use crate::forwardemail::Client;
 use serde_json::json;
 
+/// Structured input for `Client::create_message`. Bundles all the fields
+/// the forwardemail POST /v1/messages endpoint accepts.
+pub struct NewMessage {
+    pub folder: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub text: Option<String>,
+    pub html: Option<String>,
+}
+
 impl Client {
     // ── Contacts ──────────────────────────────────────────────────────
 
@@ -99,6 +111,36 @@ impl Client {
             ))
         })?;
         let body = json!({"folder": folder, "raw": raw_str});
+        self.post_json("/v1/messages", &body).await
+    }
+
+    /// POST /v1/messages with structured fields — creates a new message in
+    /// the specified folder. Forwardemail constructs the RFC822 envelope and
+    /// body server-side from the structured fields (to, cc, bcc, subject,
+    /// text, html). The `\Draft` flag is set automatically by forwardemail
+    /// for messages placed into the Drafts folder.
+    pub async fn create_message(
+        &self,
+        msg: &NewMessage,
+    ) -> Result<serde_json::Value, Error> {
+        let mut body = json!({
+            "folder": msg.folder,
+            "to": msg.to,
+            "subject": msg.subject,
+        });
+        let obj = body.as_object_mut().expect("just created");
+        if !msg.cc.is_empty() {
+            obj.insert("cc".into(), json!(msg.cc));
+        }
+        if !msg.bcc.is_empty() {
+            obj.insert("bcc".into(), json!(msg.bcc));
+        }
+        if let Some(ref t) = msg.text {
+            obj.insert("text".into(), json!(t));
+        }
+        if let Some(ref h) = msg.html {
+            obj.insert("html".into(), json!(h));
+        }
         self.post_json("/v1/messages", &body).await
     }
 
