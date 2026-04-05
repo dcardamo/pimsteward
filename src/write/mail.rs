@@ -1,19 +1,23 @@
-//! Mail write operations. v1 only handles safe mutations:
-//! - flag updates (read/unread/flagged/etc.)
-//! - move between folders
-//! - delete
-//!
-//! Body rewrites are not supported because forwardemail silently ignores
-//! them (`.eml` is effectively immutable — see docs/api-findings.md §Q4).
+//! Mail write operations: flag updates, folder moves, deletes, draft
+//! creation. Mutations route through a [`MailWriter`] trait so the same
+//! MCP tools and write functions work for both REST and IMAP backends.
+//! Post-write refresh uses the caller-supplied [`MailSource`] to re-sync
+//! the backup tree.
 
 use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::pull::mail::pull_mail;
+use crate::source::{MailSource, MailWriter};
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
 
+/// Create a draft email via REST. Draft creation is REST-only because it
+/// requires constructing a message from structured fields — IMAP would
+/// need raw RFC822 bytes and an APPEND command, which is a different
+/// (and larger) feature.
 pub async fn create_draft(
     client: &Client,
+    source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
@@ -36,19 +40,22 @@ pub async fn create_draft(
         }),
         summary: format!("mail: create draft in {} → {}", msg.folder, msg.subject),
     };
-    refresh(client, repo, alias, attribution, &audit).await?;
+    refresh(source, repo, alias, attribution, &audit).await?;
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update_flags(
-    client: &Client,
+    writer: &dyn MailWriter,
+    source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
+    folder: &str,
     id: &str,
     flags: &[String],
 ) -> Result<(), Error> {
-    let _ = client.update_message_flags(id, flags).await?;
+    writer.update_flags(folder, id, flags).await?;
     let audit = WriteAudit {
         attribution,
         tool: "update_flags",
@@ -57,37 +64,44 @@ pub async fn update_flags(
         args: serde_json::json!({"flags": flags}),
         summary: format!("mail: update flags on {id} → {flags:?}"),
     };
-    refresh(client, repo, alias, attribution, &audit).await
+    refresh(source, repo, alias, attribution, &audit).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn move_message(
-    client: &Client,
+    writer: &dyn MailWriter,
+    source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
+    source_folder: &str,
     id: &str,
-    folder: &str,
+    target_folder: &str,
 ) -> Result<(), Error> {
-    let _ = client.move_message(id, folder).await?;
+    writer
+        .move_message(source_folder, id, target_folder)
+        .await?;
     let audit = WriteAudit {
         attribution,
         tool: "move_message",
         resource: "mail",
         resource_id: id.to_string(),
-        args: serde_json::json!({"folder": folder}),
-        summary: format!("mail: move {id} → {folder}"),
+        args: serde_json::json!({"folder": target_folder}),
+        summary: format!("mail: move {id} → {target_folder}"),
     };
-    refresh(client, repo, alias, attribution, &audit).await
+    refresh(source, repo, alias, attribution, &audit).await
 }
 
 pub async fn delete_message(
-    client: &Client,
+    writer: &dyn MailWriter,
+    source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
+    folder: &str,
     id: &str,
 ) -> Result<(), Error> {
-    client.delete_message(id).await?;
+    writer.delete_message(folder, id).await?;
     let audit = WriteAudit {
         attribution,
         tool: "delete_message",
@@ -96,23 +110,20 @@ pub async fn delete_message(
         args: serde_json::json!({}),
         summary: format!("mail: delete {id}"),
     };
-    refresh(client, repo, alias, attribution, &audit).await
+    refresh(source, repo, alias, attribution, &audit).await
 }
 
 async fn refresh(
-    client: &Client,
+    source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
     audit: &WriteAudit<'_>,
 ) -> Result<(), Error> {
-    // Write-path refreshes always go through the REST source, regardless
-    // of which MailSource the daemon picks for reads. This keeps the
-    // post-write refresh fast (one HTTP round-trip) and avoids IMAP
-    // session state surprises during a mutation.
-    let rest_source = crate::source::RestMailSource::new(client.clone());
+    // Refresh the backup tree using the same source the daemon reads
+    // from, so IDs, folder layout, and metadata stay consistent.
     let _ = pull_mail(
-        &rest_source,
+        source,
         repo,
         alias,
         &attribution.caller,

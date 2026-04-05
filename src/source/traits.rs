@@ -69,6 +69,34 @@ pub trait MailSource: Send + Sync {
     async fn fetch_message(&self, folder: &str, id: &str) -> Result<FetchedMessage, Error>;
 }
 
+/// Write-side trait for mail mutations: flag updates, folder moves,
+/// deletes, and draft creation. Complements [`MailSource`] (read-side).
+/// REST implements it via the forwardemail REST API; IMAP implements it
+/// via STORE/MOVE/EXPUNGE commands.
+#[async_trait]
+pub trait MailWriter: Send + Sync {
+    fn tag(&self) -> &'static str;
+    /// Replace a message's entire flag set. `folder` is the message's
+    /// current folder — IMAP needs it to SELECT before STORE; REST
+    /// ignores it (the id is globally unique).
+    async fn update_flags(
+        &self,
+        folder: &str,
+        id: &str,
+        flags: &[String],
+    ) -> Result<(), Error>;
+    /// Move a message to a different folder. `source_folder` is the
+    /// current location — IMAP needs it for SELECT; REST ignores it.
+    async fn move_message(
+        &self,
+        source_folder: &str,
+        id: &str,
+        target_folder: &str,
+    ) -> Result<(), Error>;
+    /// Delete a message. `folder` is the current folder.
+    async fn delete_message(&self, folder: &str, id: &str) -> Result<(), Error>;
+}
+
 // ── Calendar ───────────────────────────────────────────────────────
 
 /// Read-only abstraction for pulling calendar state. Implementations return

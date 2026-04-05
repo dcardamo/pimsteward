@@ -110,6 +110,31 @@ impl MailSource for RestMailSource {
     }
 }
 
+// ── Mail writes via REST ───────────────────────────────────────────
+
+#[async_trait]
+impl crate::source::traits::MailWriter for RestMailSource {
+    fn tag(&self) -> &'static str {
+        "rest"
+    }
+    async fn update_flags(&self, _folder: &str, id: &str, flags: &[String]) -> Result<(), Error> {
+        let _ = self.client.update_message_flags(id, flags).await?;
+        Ok(())
+    }
+    async fn move_message(
+        &self,
+        _source_folder: &str,
+        id: &str,
+        target_folder: &str,
+    ) -> Result<(), Error> {
+        let _ = self.client.move_message(id, target_folder).await?;
+        Ok(())
+    }
+    async fn delete_message(&self, _folder: &str, id: &str) -> Result<(), Error> {
+        self.client.delete_message(id).await
+    }
+}
+
 // ── Calendar via REST ───────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

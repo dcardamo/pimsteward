@@ -76,13 +76,16 @@ async fn mail_flag_update_and_restore() {
 
     let good_sha = current_head(&ctx.repo);
 
-    // Set flags via write path
+    // Set flags via write path (REST writer + REST source for e2e)
+    let rest_source = RestMailSource::new(ctx.client.clone());
     let flags = vec!["\\Seen".to_string(), "\\Flagged".to_string()];
     write::mail::update_flags(
-        &ctx.client,
+        &rest_source,
+        &rest_source,
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        "INBOX",
         &msg_id,
         &flags,
     )
@@ -151,9 +154,17 @@ async fn mail_flag_update_and_restore() {
     );
 
     // Cleanup
-    write::mail::delete_message(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &msg_id)
-        .await
-        .expect("cleanup");
+    write::mail::delete_message(
+        &rest_source,
+        &rest_source,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        "INBOX",
+        &msg_id,
+    )
+    .await
+    .expect("cleanup");
 }
 
 #[tokio::test]
@@ -176,11 +187,14 @@ async fn mail_move_back_to_original_folder() {
     let good_sha = current_head(&ctx.repo);
 
     // Move to Archive
+    let rest_source = RestMailSource::new(ctx.client.clone());
     write::mail::move_message(
-        &ctx.client,
+        &rest_source,
+        &rest_source,
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        "INBOX",
         &msg_id,
         "Archive",
     )
@@ -221,9 +235,17 @@ async fn mail_move_back_to_original_folder() {
         "message should be back in INBOX after restore"
     );
 
-    write::mail::delete_message(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &msg_id)
-        .await
-        .expect("cleanup");
+    write::mail::delete_message(
+        &rest_source,
+        &rest_source,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        "INBOX",
+        &msg_id,
+    )
+    .await
+    .expect("cleanup");
 }
 
 fn current_head(repo: &pimsteward::store::Repo) -> String {

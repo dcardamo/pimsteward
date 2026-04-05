@@ -19,7 +19,8 @@ use pimsteward::{
     pull,
     source::{
         imap::ImapConfig, CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource,
-        ImapMailSource, MailSource, RestCalendarSource, RestContactsSource, RestMailSource,
+        ImapMailSource, MailSource, MailWriter, RestCalendarSource, RestContactsSource,
+        RestMailSource,
     },
     store::Repo,
     Config,
@@ -36,9 +37,12 @@ fn build_mail_source(
     client: Client,
     user: &str,
     password: &str,
-) -> Arc<dyn MailSource> {
+) -> (Arc<dyn MailSource>, Arc<dyn MailWriter>) {
     match cfg.forwardemail.mail_source {
-        MailSourceKind::Rest => Arc::new(RestMailSource::new(client)),
+        MailSourceKind::Rest => {
+            let rest = Arc::new(RestMailSource::new(client));
+            (rest.clone(), rest)
+        }
         MailSourceKind::Imap => {
             let imap_cfg = ImapConfig {
                 host: cfg.forwardemail.imap_host.clone(),
@@ -46,7 +50,8 @@ fn build_mail_source(
                 user: user.to_string(),
                 password: password.to_string(),
             };
-            Arc::new(ImapMailSource::new(imap_cfg))
+            let imap = Arc::new(ImapMailSource::new(imap_cfg));
+            (imap.clone(), imap)
         }
     }
 }
@@ -219,7 +224,7 @@ async fn main() -> Result<()> {
                 pass.clone(),
             )?;
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
-            let source = build_mail_source(&cfg, client, &user, &pass);
+            let (source, _writer) = build_mail_source(&cfg, client, &user, &pass);
             let summary = pull::mail::pull_mail(
                 source.as_ref(),
                 &repo,
@@ -313,7 +318,7 @@ async fn main() -> Result<()> {
                 .check_read(pimsteward::Resource::Email)
                 .is_ok()
             {
-                let mail_source = build_mail_source(&cfg, client.clone(), &user, &pass);
+                let (mail_source, _writer) = build_mail_source(&cfg, client.clone(), &user, &pass);
                 let s =
                     pull::mail::pull_mail(mail_source.as_ref(), &repo, &alias, author.0, author.1)
                         .await?;
@@ -324,10 +329,21 @@ async fn main() -> Result<()> {
         Command::Mcp => {
             let (user, pass) = cfg.load_credentials()?;
             let alias = alias_from_user(&user);
-            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let client = Client::new(
+                cfg.forwardemail.api_base.clone(),
+                user.clone(),
+                pass.clone(),
+            )?;
+            let (mail_source, mail_writer) = build_mail_source(&cfg, client.clone(), &user, &pass);
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
-            let server =
-                PimstewardServer::new(client, repo, cfg.permissions.clone(), alias.clone());
+            let server = PimstewardServer::new(
+                client,
+                repo,
+                cfg.permissions.clone(),
+                alias.clone(),
+                mail_source,
+                mail_writer,
+            );
             tracing::info!(alias = %alias, "mcp server starting over stdio");
             let running = server.serve(stdio()).await?;
             running.waiting().await?;

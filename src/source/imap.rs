@@ -384,6 +384,128 @@ impl MailSource for ImapMailSource {
     }
 }
 
+#[async_trait]
+impl crate::source::traits::MailWriter for ImapMailSource {
+    fn tag(&self) -> &'static str {
+        "imap"
+    }
+
+    async fn update_flags(&self, folder: &str, id: &str, flags: &[String]) -> Result<(), Error> {
+        let uid = parse_imap_uid(id)?;
+        let mut guard = self.session_guard().await?;
+        let session = guard.as_mut().expect("session present");
+        let result: Result<(), Error> = async {
+            // SELECT (not EXAMINE) so we can write.
+            session
+                .select(&folder)
+                .await
+                .map_err(|e| Error::store(format!("IMAP SELECT {folder}: {e}")))?;
+            // STORE replaces the flag set entirely.
+            let flag_str = flags.join(" ");
+            let _: Vec<_> = session
+                .uid_store(uid.to_string(), format!("FLAGS ({flag_str})"))
+                .await
+                .map_err(|e| Error::store(format!("IMAP STORE flags: {e}")))?
+                .try_collect()
+                .await
+                .map_err(|e| Error::store(format!("IMAP STORE collect: {e}")))?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            *guard = None;
+        }
+        result
+    }
+
+    async fn move_message(
+        &self,
+        folder: &str,
+        id: &str,
+        target_folder: &str,
+    ) -> Result<(), Error> {
+        let uid = parse_imap_uid(id)?;
+        let mut guard = self.session_guard().await?;
+        let session = guard.as_mut().expect("session present");
+        let result: Result<(), Error> = async {
+            session
+                .select(&folder)
+                .await
+                .map_err(|e| Error::store(format!("IMAP SELECT {folder}: {e}")))?;
+            // UID COPY + UID STORE \Deleted + EXPUNGE.
+            // RFC 6851 MOVE exists but async-imap doesn't expose it;
+            // COPY+EXPUNGE is the universally supported fallback.
+            session
+                .uid_copy(uid.to_string(), target_folder)
+                .await
+                .map_err(|e| Error::store(format!("IMAP COPY: {e}")))?;
+            let _: Vec<_> = session
+                .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
+                .await
+                .map_err(|e| Error::store(format!("IMAP STORE \\Deleted: {e}")))?
+                .try_collect()
+                .await
+                .map_err(|e| Error::store(format!("IMAP STORE collect: {e}")))?;
+            session
+                .expunge()
+                .await
+                .map_err(|e| Error::store(format!("IMAP EXPUNGE: {e}")))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| Error::store(format!("IMAP EXPUNGE collect: {e}")))?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            *guard = None;
+        }
+        result
+    }
+
+    async fn delete_message(&self, folder: &str, id: &str) -> Result<(), Error> {
+        let uid = parse_imap_uid(id)?;
+        let mut guard = self.session_guard().await?;
+        let session = guard.as_mut().expect("session present");
+        let result: Result<(), Error> = async {
+            session
+                .select(&folder)
+                .await
+                .map_err(|e| Error::store(format!("IMAP SELECT {folder}: {e}")))?;
+            let _: Vec<_> = session
+                .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
+                .await
+                .map_err(|e| Error::store(format!("IMAP STORE \\Deleted: {e}")))?
+                .try_collect()
+                .await
+                .map_err(|e| Error::store(format!("IMAP STORE collect: {e}")))?;
+            session
+                .expunge()
+                .await
+                .map_err(|e| Error::store(format!("IMAP EXPUNGE: {e}")))?
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| Error::store(format!("IMAP EXPUNGE collect: {e}")))?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            *guard = None;
+        }
+        result
+    }
+}
+
+/// Extract the IMAP UID from an `imap-<uid>` style message id. The
+/// folder is passed separately by the caller (it's already known from
+/// the backup tree or the permission-check lookup).
+fn parse_imap_uid(id: &str) -> Result<u32, Error> {
+    let rest = id.strip_prefix("imap-").ok_or_else(|| {
+        Error::store(format!("IMAP writer: id {id} not in 'imap-<uid>' form"))
+    })?;
+    rest.parse::<u32>()
+        .map_err(|e| Error::store(format!("IMAP writer: cannot parse uid from {id}: {e}")))
+}
+
 /// Run a standalone IMAP IDLE listener forever. Each iteration:
 ///
 ///   1. Open a fresh connection + log in (not shared with the puller's

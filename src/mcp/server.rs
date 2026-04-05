@@ -3,6 +3,7 @@
 //! check on the front and a JSON-ready return value on the back.
 
 use crate::forwardemail::Client;
+use crate::source::{MailSource, MailWriter};
 use crate::permission::{Permissions, Resource, Scope};
 use crate::store::Repo;
 use crate::write::audit::Attribution;
@@ -26,6 +27,11 @@ struct Inner {
     repo: Repo,
     permissions: Permissions,
     alias: String,
+    /// Mail read source for post-write refresh. Matches the daemon's read
+    /// source so IDs stay consistent.
+    mail_source: Arc<dyn MailSource>,
+    /// Mail write backend: REST or IMAP, matching the read source.
+    mail_writer: Arc<dyn MailWriter>,
 }
 
 impl std::fmt::Debug for PimstewardServer {
@@ -37,13 +43,22 @@ impl std::fmt::Debug for PimstewardServer {
 }
 
 impl PimstewardServer {
-    pub fn new(client: Client, repo: Repo, permissions: Permissions, alias: String) -> Self {
+    pub fn new(
+        client: Client,
+        repo: Repo,
+        permissions: Permissions,
+        alias: String,
+        mail_source: Arc<dyn MailSource>,
+        mail_writer: Arc<dyn MailWriter>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 client,
                 repo,
                 permissions,
                 alias,
+                mail_source,
+                mail_writer,
             }),
             tool_router: Self::tool_router(),
         }
@@ -730,6 +745,7 @@ impl PimstewardServer {
         };
         let result = crate::write::mail::create_draft(
             &self.inner.client,
+            self.inner.mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -762,10 +778,12 @@ impl PimstewardServer {
         })?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::update_flags(
-            &self.inner.client,
+            self.inner.mail_writer.as_ref(),
+            self.inner.mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
+            &folder,
             &p.id,
             &p.flags,
         )
@@ -795,10 +813,12 @@ impl PimstewardServer {
         })?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::move_message(
-            &self.inner.client,
+            self.inner.mail_writer.as_ref(),
+            self.inner.mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
+            &source_folder,
             &p.id,
             &p.folder,
         )
@@ -821,10 +841,12 @@ impl PimstewardServer {
         })?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::delete_message(
-            &self.inner.client,
+            self.inner.mail_writer.as_ref(),
+            self.inner.mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
+            &folder,
             &p.id,
         )
         .await
