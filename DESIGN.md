@@ -392,17 +392,17 @@ future improvement when the need is concrete.
 
 | # | Deferred                              | Reason |
 | - | ------------------------------------- | ------ |
-| 9 | **Webhook-driven push ingest**        | Would require a public HTTPS endpoint (attack surface) and a partial delivery model. Forwardemail's storage is zero-knowledge so server-side push isn't architecturally possible. |
 | 10 | **Multi-alias support in one instance** | One alias per daemon. Run two if you need two. |
 | 12 | **Dedicated `get_*` MCP tools**       | `list_*` tools return full content for contacts/events/sieve; individual `get_*` would be redundant. `search_email` covers the mail case. |
 
-### Known limitations
+### Design decisions (not planned)
 
-Not planned. These are architectural choices, not gaps.
+Deliberate architectural choices, not gaps.
 
-| # | Limitation                            | Rationale |
+| # | Decision                              | Rationale |
 | - | ------------------------------------- | --------- |
 | 5 | **No retention / pruning of git history** | Disk is cheap, history is the product. The backup repo is append-only by design; `git gc --auto` handles object compaction. If a repo grows unwieldy, `git filter-repo` is the manual escape hatch. |
+| 9 | **No webhook-driven push ingest**     | IMAP IDLE (`imap_idle = true`) provides sub-minute push notifications without exposing a public HTTPS endpoint. Webhooks would add attack surface, require partial-delivery handling, and duplicate what IDLE already does better. |
 
 ## Open-source friendly
 
