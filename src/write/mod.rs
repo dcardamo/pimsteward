@@ -15,6 +15,7 @@
 //! next startup). A durable WAL is a phase-later hardening.
 
 pub mod audit;
+pub mod calendar;
 pub mod contacts;
 pub mod mail;
 pub mod sieve;

@@ -359,8 +359,7 @@ async fn calendar_pull_handles_events_with_raw_ical() {
     let events_v1 = serde_json::json!([
         {
             "id": "e1", "uid": "uid-1", "calendar_id": "cal-1",
-            "content": "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:uid-1\nSUMMARY:v1\nEND:VEVENT\nEND:VCALENDAR",
-            "etag": "\"e1v1\"",
+            "ical": "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:uid-1\nSUMMARY:v1\nEND:VEVENT\nEND:VCALENDAR",
             "summary": "v1"
         }
     ]);
@@ -385,8 +384,7 @@ async fn calendar_pull_handles_events_with_raw_ical() {
     let events_v2 = serde_json::json!([
         {
             "id": "e1", "uid": "uid-1", "calendar_id": "cal-1",
-            "content": "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:uid-1\nSUMMARY:v2\nEND:VEVENT\nEND:VCALENDAR",
-            "etag": "\"e1v2\"",
+            "ical": "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:uid-1\nSUMMARY:v2\nEND:VEVENT\nEND:VCALENDAR",
             "summary": "v2"
         }
     ]);

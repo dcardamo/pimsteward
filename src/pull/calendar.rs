@@ -22,9 +22,9 @@ struct EventMeta {
     id: String,
     uid: Option<String>,
     calendar_id: Option<String>,
-    etag: Option<String>,
-    /// sha256 of `content` when etag is absent. Gives us a stable diff key
-    /// even when the server doesn't return an etag.
+    /// sha256 of the raw iCalendar text. Calendar events have no etag in
+    /// the forwardemail REST response, so content hash is the stable diff
+    /// key.
     content_sha256: Option<String>,
     updated_at: Option<String>,
 }
@@ -72,19 +72,15 @@ pub async fn pull_calendar(
 
         for e in &events_here {
             let key = event_key(e);
-            let content = e.content.clone().unwrap_or_default();
-            let content_hash = sha256(content.as_bytes());
+            let ical = e.ical.clone().unwrap_or_default();
+            let content_hash = sha256(ical.as_bytes());
             let prev = local_meta.get(&key);
 
+            // No CardDAV-style etag on calendar events per the forwardemail
+            // API shape — diff on content hash only.
             let changed = match prev {
                 None => true,
-                Some(p) => {
-                    // Prefer etag comparison; fall back to content hash.
-                    match (&p.etag, &e.etag) {
-                        (Some(a), Some(b)) => a != b,
-                        _ => p.content_sha256.as_deref() != Some(content_hash.as_str()),
-                    }
-                }
+                Some(p) => p.content_sha256.as_deref() != Some(content_hash.as_str()),
             };
 
             if !changed {
@@ -92,13 +88,12 @@ pub async fn pull_calendar(
             }
 
             let ics_path = format!("{cal_dir}/events/{key}.ics");
-            repo.write_file(&ics_path, content.as_bytes())?;
+            repo.write_file(&ics_path, ical.as_bytes())?;
 
             let meta = EventMeta {
                 id: e.id.clone(),
                 uid: e.uid.clone(),
                 calendar_id: e.calendar_id.clone(),
-                etag: e.etag.clone(),
                 content_sha256: Some(content_hash),
                 updated_at: e.updated_at.clone(),
             };

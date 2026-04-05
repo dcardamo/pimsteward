@@ -213,6 +213,46 @@ pub struct DeleteMessageParams {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateEventParams {
+    /// Calendar id (from list_calendars).
+    pub calendar_id: String,
+    /// Full iCalendar text, e.g.
+    /// "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//foo//bar\nBEGIN:VEVENT\n
+    ///  UID:abc@example\nDTSTAMP:20260101T000000Z\nSUMMARY:Lunch
+    ///  DTSTART:20260115T120000Z\nDTEND:20260115T130000Z\n
+    ///  END:VEVENT\nEND:VCALENDAR".
+    /// Forwardemail parses and normalizes the ics server-side.
+    pub ical: String,
+    /// Optional client-provided event id. Forwardemail generates one if not
+    /// provided. Useful for ensuring idempotence across retries.
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateEventParams {
+    /// Forwardemail event id from list_events or create_event.
+    pub id: String,
+    /// New iCalendar text. Replaces the previous ics entirely.
+    #[serde(default)]
+    pub ical: Option<String>,
+    /// Optionally move the event to a different calendar.
+    #[serde(default)]
+    pub target_calendar_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DeleteEventParams {
+    pub id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 // ── Restore tool params ─────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -576,6 +616,81 @@ impl PimstewardServer {
         .await
         .map_err(|e| self.api_error(e))?;
         Ok(format!("deleted {}", p.id))
+    }
+
+    #[tool(
+        name = "create_event",
+        description = "Create a calendar event. Requires `ical` — the full iCalendar text including BEGIN:VCALENDAR and a VEVENT. Forwardemail normalizes the ics server-side. Requires readwrite on calendar."
+    )]
+    async fn create_event(
+        &self,
+        Parameters(p): Parameters<CreateEventParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Calendar)?;
+        let attr = self.attribution(None, p.reason);
+        let created = crate::write::calendar::create_event(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.calendar_id,
+            &p.ical,
+            p.event_id.as_deref(),
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&created)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "update_event",
+        description = "Update a calendar event's iCal payload and/or move it to a different calendar. Either `ical` or `target_calendar_id` (or both) must be provided."
+    )]
+    async fn update_event(
+        &self,
+        Parameters(p): Parameters<UpdateEventParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Calendar)?;
+        if p.ical.is_none() && p.target_calendar_id.is_none() {
+            return Err(McpError::invalid_params(
+                "update_event requires at least one of `ical` or `target_calendar_id`",
+                None,
+            ));
+        }
+        let attr = self.attribution(None, p.reason);
+        let updated = crate::write::calendar::update_event(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+            p.ical.as_deref(),
+            p.target_calendar_id.as_deref(),
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&updated)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(name = "delete_event", description = "Delete a calendar event by id.")]
+    async fn delete_event(
+        &self,
+        Parameters(p): Parameters<DeleteEventParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Calendar)?;
+        let attr = self.attribution(None, p.reason);
+        crate::write::calendar::delete_event(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!("deleted event {}", p.id))
     }
 
     // ── Restore tools (always available, gated by the two-call dance) ──
