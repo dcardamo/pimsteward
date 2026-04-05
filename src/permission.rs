@@ -456,6 +456,45 @@ mod tests {
     }
 
     #[test]
+    fn email_drafts_only_write_with_default_read() {
+        // The motivating scoped use case: agent can read everything, write
+        // only to Drafts. No resource-level baseline gate should block
+        // this — per-folder override must be authoritative.
+        let mut folders = HashMap::new();
+        folders.insert("Drafts".to_string(), Access::ReadWrite);
+        let p = Permissions {
+            email: EmailPermission::Scoped(ScopedEmail {
+                default: Access::Read,
+                folders,
+            }),
+            ..Permissions::default()
+        };
+        // Read works everywhere
+        assert!(p
+            .check_read_scoped(&Scope::Email {
+                folder: Some("INBOX")
+            })
+            .is_ok());
+        // Write blocked on non-Drafts folders
+        assert!(p
+            .check_write_scoped(&Scope::Email {
+                folder: Some("INBOX")
+            })
+            .is_err());
+        assert!(p
+            .check_write_scoped(&Scope::Email {
+                folder: Some("Trash")
+            })
+            .is_err());
+        // Write allowed on Drafts
+        assert!(p
+            .check_write_scoped(&Scope::Email {
+                folder: Some("Drafts")
+            })
+            .is_ok());
+    }
+
+    #[test]
     fn flat_email_permission_ignores_folder_scope() {
         let p = Permissions {
             email: EmailPermission::Flat(Access::ReadWrite),
