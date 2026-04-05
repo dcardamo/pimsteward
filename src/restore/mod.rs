@@ -22,9 +22,33 @@
 //! the live state has changed since the dry-run, the apply path can
 //! detect a race by comparing etags before each mutation.
 
+pub mod bulk;
+pub mod calendar;
 pub mod contacts;
+pub mod mail;
+pub mod sieve;
 
 pub use contacts::{apply_contact, plan_contact, RestorePlan};
+
+use crate::store::Repo;
+use std::process::Command;
+
+/// Read a blob from a specific commit via `git show <sha>:<path>`. Shared
+/// helper used by every restore module.
+pub(crate) fn read_git_blob(repo: &Repo, sha: &str, path: &str) -> Result<Vec<u8>, crate::Error> {
+    let out = Command::new("git")
+        .args(["show", &format!("{sha}:{path}")])
+        .current_dir(repo.root())
+        .output()
+        .map_err(|e| crate::Error::store(format!("git show: {e}")))?;
+    if !out.status.success() {
+        return Err(crate::Error::store(format!(
+            "git show {sha}:{path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(out.stdout)
+}
 
 use crate::error::Error;
 use sha2::{Digest, Sha256};

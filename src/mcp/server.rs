@@ -279,6 +279,77 @@ pub struct RestoreContactApplyParams {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreSieveDryRunParams {
+    /// Sieve script name (the filename stem in the backup tree).
+    pub script_name: String,
+    /// Git commit SHA to restore from.
+    pub at_sha: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreSieveApplyParams {
+    pub plan: serde_json::Value,
+    pub plan_token: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreCalendarDryRunParams {
+    /// Calendar id (the directory name under the backup tree).
+    pub calendar_id: String,
+    /// Event UID from the VEVENT component (the .ics filename stem).
+    pub event_uid: String,
+    /// Git commit SHA to restore from.
+    pub at_sha: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreCalendarApplyParams {
+    pub plan: serde_json::Value,
+    pub plan_token: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreMailDryRunParams {
+    /// Folder path, e.g. "INBOX" or "Sent Mail".
+    pub folder: String,
+    /// Forwardemail message id.
+    pub message_id: String,
+    /// Git commit SHA to restore from.
+    pub at_sha: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestoreMailApplyParams {
+    pub plan: serde_json::Value,
+    pub plan_token: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestorePathDryRunParams {
+    /// Backup-tree path prefix to restore, e.g.
+    /// `sources/forwardemail/<alias>/contacts/` to restore all contacts,
+    /// or `sources/forwardemail/<alias>/calendars/<id>/events/` for one
+    /// calendar.
+    pub path_prefix: String,
+    /// Git commit SHA to restore from.
+    pub at_sha: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RestorePathApplyParams {
+    pub plan: serde_json::Value,
+    pub plan_token: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[tool_router]
 impl PimstewardServer {
     #[tool(
@@ -750,6 +821,244 @@ impl PimstewardServer {
             plan.contact_uid,
             &plan.at_sha[..8.min(plan.at_sha.len())]
         ))
+    }
+
+    // ── Sieve restore ──
+
+    #[tool(
+        name = "restore_sieve_dry_run",
+        description = "Compute what it would take to restore a sieve script back to its historical state. Returns a plan + plan_token for the apply step."
+    )]
+    async fn restore_sieve_dry_run(
+        &self,
+        Parameters(p): Parameters<RestoreSieveDryRunParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Sieve)?;
+        let (plan, token) = crate::restore::sieve::plan_sieve(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &p.script_name,
+            &p.at_sha,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let out = serde_json::json!({"plan": plan, "plan_token": token});
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "restore_sieve_apply",
+        description = "Execute a sieve restore plan. Re-computes plan_token and refuses on mismatch."
+    )]
+    async fn restore_sieve_apply(
+        &self,
+        Parameters(p): Parameters<RestoreSieveApplyParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Sieve)?;
+        let plan: crate::restore::sieve::SieveRestorePlan = serde_json::from_value(p.plan)
+            .map_err(|e| {
+                McpError::invalid_params(format!("plan is not a SieveRestorePlan: {e}"), None)
+            })?;
+        let attr = self.attribution(None, p.reason);
+        crate::restore::sieve::apply_sieve(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &plan,
+            &p.plan_token,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!("restore applied: sieve/{}", plan.script_name))
+    }
+
+    // ── Calendar restore ──
+
+    #[tool(
+        name = "restore_calendar_event_dry_run",
+        description = "Compute what it would take to restore a calendar event back to its historical state. Returns a plan + plan_token."
+    )]
+    async fn restore_calendar_event_dry_run(
+        &self,
+        Parameters(p): Parameters<RestoreCalendarDryRunParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Calendar)?;
+        let (plan, token) = crate::restore::calendar::plan_calendar(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &p.calendar_id,
+            &p.event_uid,
+            &p.at_sha,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let out = serde_json::json!({"plan": plan, "plan_token": token});
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "restore_calendar_event_apply",
+        description = "Execute a calendar event restore plan."
+    )]
+    async fn restore_calendar_event_apply(
+        &self,
+        Parameters(p): Parameters<RestoreCalendarApplyParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Calendar)?;
+        let plan: crate::restore::calendar::CalendarRestorePlan = serde_json::from_value(p.plan)
+            .map_err(|e| {
+                McpError::invalid_params(format!("plan is not a CalendarRestorePlan: {e}"), None)
+            })?;
+        let attr = self.attribution(None, p.reason);
+        crate::restore::calendar::apply_calendar(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &plan,
+            &p.plan_token,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!(
+            "restore applied: calendar/{}/{}",
+            plan.calendar_id, plan.event_uid
+        ))
+    }
+
+    // ── Mail restore (flags + folder only — body is immutable) ──
+
+    #[tool(
+        name = "restore_mail_dry_run",
+        description = "Compute what it would take to restore a message's flags + folder to their historical state. Mail body cannot be restored automatically (forwardemail API silently ignores body rewrites). If the message has been deleted from forwardemail, the plan will mark it as Unrestorable."
+    )]
+    async fn restore_mail_dry_run(
+        &self,
+        Parameters(p): Parameters<RestoreMailDryRunParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Email)?;
+        let (plan, token) = crate::restore::mail::plan_mail(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &p.folder,
+            &p.message_id,
+            &p.at_sha,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let out = serde_json::json!({"plan": plan, "plan_token": token});
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "restore_mail_apply",
+        description = "Execute a mail restore plan (flags or folder only)."
+    )]
+    async fn restore_mail_apply(
+        &self,
+        Parameters(p): Parameters<RestoreMailApplyParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Email)?;
+        let plan: crate::restore::mail::MailRestorePlan =
+            serde_json::from_value(p.plan).map_err(|e| {
+                McpError::invalid_params(format!("plan is not a MailRestorePlan: {e}"), None)
+            })?;
+        let attr = self.attribution(None, p.reason);
+        crate::restore::mail::apply_mail(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &plan,
+            &p.plan_token,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!(
+            "restore applied: mail/{}/{}",
+            plan.folder, plan.message_id
+        ))
+    }
+
+    // ── Bulk restore ──
+
+    #[tool(
+        name = "restore_path_dry_run",
+        description = "Compute a bulk restore plan covering every contact, sieve script, and calendar event under a path prefix in the backup tree. Mail is excluded from bulk restore (body is immutable, partial failures confusing) — use restore_mail_* for individual messages. Returns a BulkRestorePlan with per-resource sub-plans and a deterministic plan_token."
+    )]
+    async fn restore_path_dry_run(
+        &self,
+        Parameters(p): Parameters<RestorePathDryRunParams>,
+    ) -> Result<String, McpError> {
+        // Permission: require readwrite on all three covered resources so
+        // the plan computation can't be used to enumerate forbidden data.
+        self.check_write(Resource::Contacts)?;
+        self.check_write(Resource::Sieve)?;
+        self.check_write(Resource::Calendar)?;
+
+        let (plan, token) = crate::restore::bulk::plan_bulk(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &p.path_prefix,
+            &p.at_sha,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let out = serde_json::json!({
+            "plan": plan,
+            "plan_token": token,
+            "total_operations": plan.total_ops(),
+        });
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "restore_path_apply",
+        description = "Execute a bulk restore plan. Re-verifies the bulk plan_token AND each sub-plan's individual token before executing. Continues past individual sub-plan failures and returns a summary of what succeeded and what failed."
+    )]
+    async fn restore_path_apply(
+        &self,
+        Parameters(p): Parameters<RestorePathApplyParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Contacts)?;
+        self.check_write(Resource::Sieve)?;
+        self.check_write(Resource::Calendar)?;
+
+        let plan: crate::restore::bulk::BulkRestorePlan =
+            serde_json::from_value(p.plan).map_err(|e| {
+                McpError::invalid_params(format!("plan is not a BulkRestorePlan: {e}"), None)
+            })?;
+        let attr = self.attribution(None, p.reason);
+        let result = crate::restore::bulk::apply_bulk(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &plan,
+            &p.plan_token,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let out = serde_json::json!({
+            "path_prefix": plan.path_prefix,
+            "at_sha": plan.at_sha,
+            "contacts_ok": result.contacts_ok,
+            "sieve_ok": result.sieve_ok,
+            "calendar_ok": result.calendar_ok,
+            "total_ok": result.total_ok(),
+            "errors": result.errors,
+        });
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     // ── History / audit ──────────────────────────────────────────────

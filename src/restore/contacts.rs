@@ -3,10 +3,10 @@
 use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::pull::contacts::pull_contacts;
+use crate::restore::read_git_blob;
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
 use serde::{Deserialize, Serialize};
-use std::process::Command;
 
 /// A plan describes exactly what a restore will do. Serialized into the
 /// plan_token hash so any change invalidates the previously-returned token.
@@ -188,21 +188,7 @@ pub async fn apply_contact(
     Ok(())
 }
 
-/// Read a blob from a specific commit via `git show <sha>:<path>`.
-fn read_git_blob(repo: &Repo, sha: &str, path: &str) -> Result<Vec<u8>, Error> {
-    let out = Command::new("git")
-        .args(["show", &format!("{sha}:{path}")])
-        .current_dir(repo.root())
-        .output()
-        .map_err(|e| Error::store(format!("git show: {e}")))?;
-    if !out.status.success() {
-        return Err(Error::store(format!(
-            "git show {sha}:{path} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    Ok(out.stdout)
-}
+// read_git_blob moved to restore/mod.rs as a shared helper across resources.
 
 /// Extract the FN: line from a vCard. Minimal parser — good enough for
 /// the smoke-tested forwardemail output format.
