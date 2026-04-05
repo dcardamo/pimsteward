@@ -32,7 +32,9 @@ use crate::forwardemail::mail::{Folder, MessageSummary};
 use crate::pull::{filename_safe, PullResult, PullSummary};
 use crate::source::MailSource;
 use crate::store::Repo;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -63,6 +65,29 @@ struct MessageMeta {
     flags: Vec<String>,
     #[serde(default)]
     labels: Vec<String>,
+}
+
+/// One entry in `<id>.attachments.json`. The raw bytes live at
+/// `_attachments/<sha256>` so multiple messages referencing the same blob
+/// (common for forwarded chains) share a single copy on disk. The .eml is
+/// left untouched — clients that want the original attachment bytes can
+/// still re-parse the MIME from the .eml, but tooling can also load
+/// `_attachments/<sha256>` directly without MIME walking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttachmentRef {
+    sha256: String,
+    size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_disposition: Option<String>,
+    /// True if the attachment is `inline` (e.g. embedded HTML image).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    inline: bool,
 }
 
 impl MessageMeta {
@@ -185,6 +210,24 @@ pub async fn pull_mail(
             let meta_path = format!("{folder_dir}/{id}.meta.json");
             repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
 
+            // Attachment index: parse nodemailer.attachments[], write each
+            // blob to _attachments/<sha256>, and write the reference list as
+            // a sidecar. REST-only — IMAP's `extra` is None.
+            let attachments_sidecar = format!("{folder_dir}/{id}.attachments.json");
+            let attachments_sidecar_fs = repo.root().join(&attachments_sidecar);
+            match extract_attachments(&fetched, alias, repo)? {
+                Some(refs) if !refs.is_empty() => {
+                    repo.write_file(
+                        &attachments_sidecar,
+                        serde_json::to_vec_pretty(&refs)?.as_slice(),
+                    )?;
+                }
+                _ => {
+                    // No attachments on this revision — remove any stale sidecar.
+                    let _ = std::fs::remove_file(attachments_sidecar_fs);
+                }
+            }
+
             if prev.is_some() {
                 summary.updated += 1;
             } else {
@@ -206,6 +249,10 @@ pub async fn pull_mail(
                 let _ = std::fs::remove_file(
                     repo.root()
                         .join(format!("{folder_dir}/{local_id}.meta.json")),
+                );
+                let _ = std::fs::remove_file(
+                    repo.root()
+                        .join(format!("{folder_dir}/{local_id}.attachments.json")),
                 );
                 summary.deleted += 1;
             }
@@ -264,12 +311,95 @@ fn cleanup_removed_folders(repo: &Repo, alias: &str, folders: &[Folder]) -> Resu
     {
         let entry = entry.map_err(|e| Error::store(format!("dir entry: {}", e)))?;
         let name = entry.file_name().into_string().unwrap_or_default();
+        // `_attachments` is the content-addressed blob store, not a folder;
+        // never treat it as a stale folder even though it isn't in the
+        // remote folder list.
+        if name == "_attachments" {
+            continue;
+        }
         if !current.contains(&name) {
             // Remove the whole folder subtree
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
     Ok(())
+}
+
+/// Pull `nodemailer.attachments[]` out of a fetched REST message, write each
+/// distinct blob to `_attachments/<sha256>` under the alias's mail root, and
+/// return the list of references to embed in the sidecar. Returns `Ok(None)`
+/// if the source didn't provide a parsed `nodemailer` field (e.g. IMAP). The
+/// blob directory is per-alias so blobs are scoped the same way as the rest
+/// of the pulled state.
+fn extract_attachments(
+    fetched: &crate::source::FetchedMessage,
+    alias: &str,
+    repo: &Repo,
+) -> Result<Option<Vec<AttachmentRef>>, Error> {
+    let Some(extra) = fetched.extra.as_ref() else {
+        return Ok(None);
+    };
+    let Some(atts) = extra
+        .get("nodemailer")
+        .and_then(|n| n.get("attachments"))
+        .and_then(|a| a.as_array())
+    else {
+        return Ok(Some(Vec::new()));
+    };
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut refs = Vec::with_capacity(atts.len());
+
+    for att in atts {
+        // Nodemailer encodes `content` as a base64 string. Skip entries that
+        // don't have one — forwardemail occasionally returns structural-only
+        // parts (e.g. message/rfc822 wrappers) with no raw body.
+        let Some(content_b64) = att.get("content").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let bytes = b64
+            .decode(content_b64.as_bytes())
+            .map_err(|e| Error::store(format!("attachment base64 decode: {e}")))?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let sha = format!("{:x}", hasher.finalize());
+
+        let blob_path = format!("sources/forwardemail/{alias}/mail/_attachments/{sha}");
+        // Write-once: if a blob with the same content hash already exists on
+        // disk the write is a no-op, which keeps the repo churn-free.
+        if !repo.root().join(&blob_path).exists() {
+            repo.write_file(&blob_path, &bytes)?;
+        }
+
+        refs.push(AttachmentRef {
+            sha256: sha,
+            size: bytes.len() as u64,
+            filename: att
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            content_type: att
+                .get("contentType")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            content_id: att
+                .get("contentId")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            content_disposition: att
+                .get("contentDisposition")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            inline: att
+                .get("contentDisposition")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("inline"))
+                .unwrap_or(false),
+        });
+    }
+
+    Ok(Some(refs))
 }
 
 /// Convert a forwardemail folder path into a filesystem-safe directory name.
@@ -282,6 +412,102 @@ fn folder_safe(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::forwardemail::mail::MessageSummary;
+    use crate::source::FetchedMessage;
+    use crate::store::Repo;
+
+    fn blank_summary() -> MessageSummary {
+        MessageSummary {
+            id: "m1".into(),
+            folder_id: "f1".into(),
+            folder_path: "INBOX".into(),
+            subject: String::new(),
+            size: 0,
+            uid: None,
+            modseq: None,
+            updated_at: None,
+            flags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn extract_attachments_writes_blob_and_dedups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+
+        // base64("hello world") = "aGVsbG8gd29ybGQ="
+        let extra = serde_json::json!({
+            "nodemailer": {
+                "attachments": [
+                    {
+                        "filename": "a.txt",
+                        "contentType": "text/plain",
+                        "contentDisposition": "attachment",
+                        "content": "aGVsbG8gd29ybGQ="
+                    },
+                    {
+                        "filename": "b.txt",
+                        "contentType": "text/plain",
+                        "contentDisposition": "inline",
+                        "contentId": "<cid@x>",
+                        "content": "aGVsbG8gd29ybGQ="
+                    }
+                ]
+            }
+        });
+        let fetched = FetchedMessage {
+            summary: blank_summary(),
+            raw: b"".to_vec(),
+            extra: Some(extra),
+        };
+
+        let refs = extract_attachments(&fetched, "alias", &repo)
+            .unwrap()
+            .unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].sha256, refs[1].sha256, "same bytes → same sha");
+        assert_eq!(refs[0].size, 11);
+        assert_eq!(refs[0].filename.as_deref(), Some("a.txt"));
+        assert!(!refs[0].inline);
+        assert!(refs[1].inline);
+        assert_eq!(refs[1].content_id.as_deref(), Some("<cid@x>"));
+
+        let blob = repo
+            .root()
+            .join(format!("sources/forwardemail/alias/mail/_attachments/{}", refs[0].sha256));
+        assert!(blob.exists());
+        assert_eq!(std::fs::read(&blob).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn extract_attachments_no_extra_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        let fetched = FetchedMessage {
+            summary: blank_summary(),
+            raw: b"".to_vec(),
+            extra: None,
+        };
+        assert!(extract_attachments(&fetched, "alias", &repo)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn extract_attachments_missing_nodemailer_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        let fetched = FetchedMessage {
+            summary: blank_summary(),
+            raw: b"".to_vec(),
+            extra: Some(serde_json::json!({})),
+        };
+        let refs = extract_attachments(&fetched, "alias", &repo)
+            .unwrap()
+            .unwrap();
+        assert!(refs.is_empty());
+    }
 
     #[test]
     fn folder_safe_escapes_slashes() {
