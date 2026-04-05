@@ -8,11 +8,12 @@
 //! means the daemon can run as a low-privilege user doing nothing but
 //! pulling, and each MCP client gets its own isolated process on demand.
 
-use crate::config::Config;
+use crate::config::{Config, MailSourceKind};
 use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::permission::Resource;
 use crate::pull;
+use crate::source::{imap::ImapConfig, ImapMailSource, MailSource, RestMailSource};
 use crate::store::Repo;
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,19 +100,25 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     }
 
     if cfg.permissions.check_read(Resource::Email).is_ok() {
-        let h = spawn_puller(
-            "mail",
+        // Mail has a dedicated puller because it dispatches on a
+        // MailSource trait object, not a concrete Client.
+        let mail_source: Arc<dyn MailSource> = match cfg.forwardemail.mail_source {
+            MailSourceKind::Rest => Arc::new(RestMailSource::new(client.clone())),
+            MailSourceKind::Imap => {
+                let (u, p) = cfg.load_credentials()?;
+                Arc::new(ImapMailSource::new(ImapConfig {
+                    host: cfg.forwardemail.imap_host.clone(),
+                    port: cfg.forwardemail.imap_port,
+                    user: u,
+                    password: p,
+                }))
+            }
+        };
+        let h = spawn_mail_puller(
             Duration::from_secs(cfg.pull.mail_interval_seconds),
-            client.clone(),
+            mail_source,
             repo.clone(),
             alias.clone(),
-            |c, r, a| {
-                Box::pin(async move {
-                    pull::mail::pull_mail(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
-                        .await
-                        .map(|s| s.to_string())
-                })
-            },
         );
         handles.push(h);
     }
@@ -128,6 +135,41 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
     wait_for_shutdown().await;
     tracing::info!("shutdown signal received, daemon exiting");
     Ok(())
+}
+
+fn spawn_mail_puller(
+    period: Duration,
+    source: Arc<dyn MailSource>,
+    repo: Arc<Repo>,
+    alias: String,
+) -> tokio::task::JoinHandle<()> {
+    let span = tracing::info_span!("puller", resource = "mail");
+    tokio::spawn(
+        async move {
+            let mut ticker = interval(period);
+            tracing::info!(
+                period_secs = period.as_secs(),
+                source = source.tag(),
+                "mail puller started"
+            );
+            loop {
+                ticker.tick().await;
+                let result = pull::mail::pull_mail(
+                    source.as_ref(),
+                    &repo,
+                    &alias,
+                    "pimsteward-pull",
+                    "pull@pimsteward.local",
+                )
+                .await;
+                match result {
+                    Ok(s) => tracing::info!(summary = %s, "pull ok"),
+                    Err(e) => tracing::error!(error = %e, "pull failed"),
+                }
+            }
+        }
+        .instrument(span),
+    )
 }
 
 type PullFn = Box<

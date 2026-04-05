@@ -6,6 +6,7 @@ mod common;
 use common::E2eContext;
 use pimsteward::pull::mail::pull_mail;
 use pimsteward::restore;
+use pimsteward::source::RestMailSource;
 use pimsteward::write;
 use serde_json::json;
 
@@ -64,7 +65,7 @@ async fn mail_flag_update_and_restore() {
 
     // Initial pull captures the fresh message (flags = [])
     let _ = pull_mail(
-        &ctx.client,
+        &RestMailSource::new(ctx.client.clone()),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",
@@ -164,7 +165,7 @@ async fn mail_move_back_to_original_folder() {
     let msg_id = create_test_message(&ctx, &subject).await;
 
     let _ = pull_mail(
-        &ctx.client,
+        &RestMailSource::new(ctx.client.clone()),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",

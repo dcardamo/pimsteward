@@ -166,8 +166,10 @@ pub async fn apply_mail(
         }
     }
 
+    // Refresh via REST regardless of read source (same rationale as write/mail.rs).
+    let rest_source = crate::source::RestMailSource::new(client.clone());
     let _ = pull_mail(
-        client,
+        &rest_source,
         repo,
         alias,
         &attribution.caller,

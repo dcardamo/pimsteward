@@ -29,8 +29,8 @@
 
 use crate::error::Error;
 use crate::forwardemail::mail::{Folder, MessageSummary};
-use crate::forwardemail::Client;
 use crate::pull::{filename_safe, PullResult, PullSummary};
+use crate::source::MailSource;
 use crate::store::Repo;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -66,10 +66,14 @@ struct MessageMeta {
 }
 
 impl MessageMeta {
-    /// Build a MessageMeta from the list summary + full response JSON. Fields
-    /// present in the summary are preferred because they're canonical; extra
-    /// fields come from the full response.
-    fn from_response(summary: &MessageSummary, full: &serde_json::Value) -> Self {
+    /// Build a MessageMeta from the fetched message. The summary carries
+    /// canonical diff keys (id, modseq, flags, uid). The optional `extra`
+    /// JSON (populated only by REST source) fills in fields that forwardemail
+    /// exposes but IMAP doesn't (thread_id, labels, folder_path, internal_date).
+    fn from_fetched(fetched: &crate::source::FetchedMessage) -> Self {
+        let s = &fetched.summary;
+        let extra = fetched.extra.as_ref();
+
         fn string_at(v: &serde_json::Value, key: &str) -> Option<String> {
             v.get(key).and_then(|x| x.as_str()).map(String::from)
         }
@@ -88,29 +92,35 @@ impl MessageMeta {
         }
 
         Self {
-            id: summary.id.clone(),
-            folder_id: Some(summary.folder_id.clone()).filter(|s| !s.is_empty()),
-            folder_path: string_at(full, "folder_path"),
-            thread_id: string_at(full, "thread_id"),
-            uid: summary.uid,
-            modseq: summary.modseq,
-            size: Some(summary.size)
-                .filter(|s| *s > 0)
-                .or_else(|| u64_at(full, "size")),
-            updated_at: summary.updated_at.clone(),
-            internal_date: string_at(full, "internal_date"),
-            flags: if summary.flags.is_empty() {
-                string_array_at(full, "flags")
+            id: s.id.clone(),
+            folder_id: Some(s.folder_id.clone()).filter(|v| !v.is_empty()),
+            folder_path: extra
+                .and_then(|e| string_at(e, "folder_path"))
+                .or_else(|| Some(s.folder_path.clone()).filter(|v| !v.is_empty())),
+            thread_id: extra.and_then(|e| string_at(e, "thread_id")),
+            uid: s.uid,
+            modseq: s.modseq,
+            size: Some(s.size)
+                .filter(|v| *v > 0)
+                .or_else(|| extra.and_then(|e| u64_at(e, "size"))),
+            updated_at: s.updated_at.clone(),
+            internal_date: extra.and_then(|e| string_at(e, "internal_date")),
+            flags: if s.flags.is_empty() {
+                extra
+                    .map(|e| string_array_at(e, "flags"))
+                    .unwrap_or_default()
             } else {
-                summary.flags.clone()
+                s.flags.clone()
             },
-            labels: string_array_at(full, "labels"),
+            labels: extra
+                .map(|e| string_array_at(e, "labels"))
+                .unwrap_or_default(),
         }
     }
 }
 
 pub async fn pull_mail(
-    client: &Client,
+    source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     author_name: &str,
@@ -121,10 +131,8 @@ pub async fn pull_mail(
         ..Default::default()
     };
 
-    // 1. List folders and write a folder manifest per folder. Folders are
-    // cheap and their metadata (uid_validity, uid_next, special_use) is
-    // worth tracking in git history.
-    let folders = client.list_folders().await?;
+    // 1. List folders and write a folder manifest per folder.
+    let folders = source.list_folders().await?;
     for f in &folders {
         let dir = format!(
             "sources/forwardemail/{}/mail/{}",
@@ -144,7 +152,7 @@ pub async fn pull_mail(
             folder_safe(&f.path)
         );
         let local_meta = read_local_message_meta(repo, &folder_dir)?;
-        let remote_summaries = client.list_messages_in_folder(&f.path).await?;
+        let remote_summaries = source.list_messages(&f.path).await?;
         let remote_by_id: HashMap<String, &MessageSummary> =
             remote_summaries.iter().map(|m| (m.id.clone(), m)).collect();
 
@@ -161,29 +169,19 @@ pub async fn pull_mail(
                 continue;
             }
 
-            // Fetch the full response, extract the raw RFC822 bytes.
-            // Forwardemail returns `raw` as a string in the JSON by default;
-            // see docs/api-findings.md.
-            let full = client.get_message(&msg.id).await?;
-            let raw_bytes = full
-                .get("raw")
-                .and_then(|v| v.as_str())
-                .map(|s| s.as_bytes().to_vec())
-                .ok_or_else(|| {
-                    Error::store(format!(
-                        "forwardemail response for message {} missing `raw` field",
-                        msg.id
-                    ))
-                })?;
+            // Source-agnostic fetch: REST extracts `raw` from the JSON
+            // response; IMAP uses `UID FETCH BODY[]`. Both return raw
+            // RFC822 bytes in FetchedMessage.raw.
+            let fetched = source.fetch_message(&f.path, &msg.id).await?;
 
             let eml_path = format!("{folder_dir}/{id}.eml");
-            repo.write_file(&eml_path, &raw_bytes)?;
+            repo.write_file(&eml_path, &fetched.raw)?;
 
             // Remove any legacy .json sidecar left over from earlier versions.
             let legacy_json = repo.root().join(format!("{folder_dir}/{id}.json"));
             let _ = std::fs::remove_file(legacy_json);
 
-            let meta = MessageMeta::from_response(msg, &full);
+            let meta = MessageMeta::from_fetched(&fetched);
             let meta_path = format!("{folder_dir}/{id}.meta.json");
             repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
 

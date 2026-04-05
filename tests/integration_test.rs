@@ -6,6 +6,7 @@ use pimsteward::pull::calendar::pull_calendar;
 use pimsteward::pull::contacts::pull_contacts;
 use pimsteward::pull::mail::pull_mail;
 use pimsteward::pull::sieve::pull_sieve;
+use pimsteward::source::RestMailSource;
 use pimsteward::store::Repo;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -272,9 +273,15 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         .await;
 
     let client = make_client(&server.uri());
-    let s1 = pull_mail(&client, &repo, "test-alias", "test", "test@x")
-        .await
-        .unwrap();
+    let s1 = pull_mail(
+        &RestMailSource::new(client.clone()),
+        &repo,
+        "test-alias",
+        "test",
+        "test@x",
+    )
+    .await
+    .unwrap();
     assert_eq!(s1.added, 1, "first pull adds one message");
     assert!(s1.commit_sha.is_some());
     // raw RFC822 is written as <id>.eml
@@ -315,9 +322,15 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         .mount(&server)
         .await;
 
-    let s2 = pull_mail(&client, &repo, "test-alias", "test", "test@x")
-        .await
-        .unwrap();
+    let s2 = pull_mail(
+        &RestMailSource::new(client.clone()),
+        &repo,
+        "test-alias",
+        "test",
+        "test@x",
+    )
+    .await
+    .unwrap();
     assert_eq!(s2.updated, 1, "modseq change detected as update");
     assert_eq!(s2.added, 0);
     assert_eq!(s2.deleted, 0);
@@ -331,9 +344,15 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
         .mount(&server)
         .await;
 
-    let s3 = pull_mail(&client, &repo, "test-alias", "test", "test@x")
-        .await
-        .unwrap();
+    let s3 = pull_mail(
+        &RestMailSource::new(client.clone()),
+        &repo,
+        "test-alias",
+        "test",
+        "test@x",
+    )
+    .await
+    .unwrap();
     assert_eq!(s3.deleted, 1, "missing-from-remote detected as deletion");
     assert!(repo
         .read_file("sources/forwardemail/test-alias/mail/INBOX/m1.eml")

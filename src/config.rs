@@ -94,6 +94,43 @@ pub struct ForwardemailConfig {
 
     /// File containing the generated alias password (Basic auth password).
     pub alias_password_file: Option<PathBuf>,
+
+    /// Which backend to use for reading mail. `rest` (default) uses the
+    /// forwardemail REST API with per-message JSON fetch. `imap` uses
+    /// native IMAP with `FETCH BODY[]` and CONDSTORE modseq delta hints.
+    ///
+    /// Writes always go through REST regardless of this setting — mixing
+    /// write backends complicates audit attribution.
+    ///
+    /// **Warning:** do not switch mail_source values against the same
+    /// backup tree without first wiping the mail/ subtree. The two
+    /// sources use different id schemes for filenames.
+    #[serde(default)]
+    pub mail_source: MailSourceKind,
+
+    /// IMAP host — used only when `mail_source = "imap"`.
+    #[serde(default = "default_imap_host")]
+    pub imap_host: String,
+
+    /// IMAP port — used only when `mail_source = "imap"`.
+    #[serde(default = "default_imap_port")]
+    pub imap_port: u16,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailSourceKind {
+    #[default]
+    Rest,
+    Imap,
+}
+
+fn default_imap_host() -> String {
+    "imap.forwardemail.net".into()
+}
+
+fn default_imap_port() -> u16 {
+    993
 }
 
 impl Default for ForwardemailConfig {
@@ -102,6 +139,9 @@ impl Default for ForwardemailConfig {
             api_base: default_api_base(),
             alias_user_file: None,
             alias_password_file: None,
+            mail_source: MailSourceKind::default(),
+            imap_host: default_imap_host(),
+            imap_port: default_imap_port(),
         }
     }
 }
@@ -246,6 +286,7 @@ sieve = "read_write"
                 api_base: "https://x".into(),
                 alias_user_file: Some(u),
                 alias_password_file: Some(p),
+                ..ForwardemailConfig::default()
             },
             ..Config::default()
         };
@@ -266,6 +307,7 @@ sieve = "read_write"
                 api_base: "https://x".into(),
                 alias_user_file: Some(u),
                 alias_password_file: Some(p),
+                ..ForwardemailConfig::default()
             },
             ..Config::default()
         };

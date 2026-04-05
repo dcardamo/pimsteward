@@ -10,6 +10,7 @@ pub mod permission;
 pub mod pull;
 pub mod restore;
 pub mod safety;
+pub mod source;
 pub mod store;
 pub mod write;
 

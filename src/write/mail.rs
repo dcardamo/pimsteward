@@ -78,8 +78,13 @@ async fn refresh(
     attribution: &Attribution,
     audit: &WriteAudit<'_>,
 ) -> Result<(), Error> {
+    // Write-path refreshes always go through the REST source, regardless
+    // of which MailSource the daemon picks for reads. This keeps the
+    // post-write refresh fast (one HTTP round-trip) and avoids IMAP
+    // session state surprises during a mutation.
+    let rest_source = crate::source::RestMailSource::new(client.clone());
     let _ = pull_mail(
-        client,
+        &rest_source,
         repo,
         alias,
         &attribution.caller,

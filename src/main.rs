@@ -12,10 +12,42 @@
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::Result;
-use pimsteward::{forwardemail::Client, mcp::PimstewardServer, pull, store::Repo, Config};
+use pimsteward::{
+    config::MailSourceKind,
+    forwardemail::Client,
+    mcp::PimstewardServer,
+    pull,
+    source::{imap::ImapConfig, ImapMailSource, MailSource, RestMailSource},
+    store::Repo,
+    Config,
+};
 use rmcp::{transport::stdio, ServiceExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// Build the configured MailSource for this run. REST is the default;
+/// IMAP is selected when `forwardemail.mail_source = "imap"` in the
+/// config, in which case the IMAP host/port come from config too.
+fn build_mail_source(
+    cfg: &Config,
+    client: Client,
+    user: &str,
+    password: &str,
+) -> Arc<dyn MailSource> {
+    match cfg.forwardemail.mail_source {
+        MailSourceKind::Rest => Arc::new(RestMailSource::new(client)),
+        MailSourceKind::Imap => {
+            let imap_cfg = ImapConfig {
+                host: cfg.forwardemail.imap_host.clone(),
+                port: cfg.forwardemail.imap_port,
+                user: user.to_string(),
+                password: password.to_string(),
+            };
+            Arc::new(ImapMailSource::new(imap_cfg))
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,6 +100,12 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+    // Install rustls's `ring` crypto provider once, process-wide. reqwest's
+    // rustls-tls feature manages its own crypto internally; our direct
+    // rustls usage (for the IMAP source's TLS connection) needs an
+    // explicit default provider. Ignoring the Err because it only fires
+    // if a provider was already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // Always write logs to stderr so stdout is clean for JSON-RPC (MCP) or
     // JSON output from pull-* subcommands. A real MCP client parses stdout
     // strictly and would choke on log lines mixed in.
@@ -136,17 +174,22 @@ async fn main() -> Result<()> {
             cfg.permissions.check_read(pimsteward::Resource::Email)?;
             let (user, pass) = cfg.load_credentials()?;
             let alias = alias_from_user(&user);
-            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let client = Client::new(
+                cfg.forwardemail.api_base.clone(),
+                user.clone(),
+                pass.clone(),
+            )?;
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let source = build_mail_source(&cfg, client, &user, &pass);
             let summary = pull::mail::pull_mail(
-                &client,
+                source.as_ref(),
                 &repo,
                 &alias,
                 "pimsteward-pull",
                 "pull@pimsteward.local",
             )
             .await?;
-            tracing::info!(summary = %summary, "pull-mail done");
+            tracing::info!(summary = %summary, source = source.tag(), "pull-mail done");
             println!("{summary}");
         }
         Command::PullCalendar => {
@@ -169,7 +212,11 @@ async fn main() -> Result<()> {
         Command::PullAll => {
             let (user, pass) = cfg.load_credentials()?;
             let alias = alias_from_user(&user);
-            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let client = Client::new(
+                cfg.forwardemail.api_base.clone(),
+                user.clone(),
+                pass.clone(),
+            )?;
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
             let author = ("pimsteward-pull", "pull@pimsteward.local");
 
@@ -208,8 +255,11 @@ async fn main() -> Result<()> {
                 .check_read(pimsteward::Resource::Email)
                 .is_ok()
             {
-                let s = pull::mail::pull_mail(&client, &repo, &alias, author.0, author.1).await?;
-                tracing::info!(summary = %s, "pull-mail done");
+                let mail_source = build_mail_source(&cfg, client.clone(), &user, &pass);
+                let s =
+                    pull::mail::pull_mail(mail_source.as_ref(), &repo, &alias, author.0, author.1)
+                        .await?;
+                tracing::info!(summary = %s, source = mail_source.tag(), "pull-mail done");
                 println!("{s}");
             }
         }
