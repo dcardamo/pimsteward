@@ -23,6 +23,9 @@ pub struct Config {
     #[serde(default)]
     pub permissions: Permissions,
 
+    #[serde(default)]
+    pub pull: PullConfig,
+
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -33,9 +36,48 @@ impl Default for Config {
             forwardemail: ForwardemailConfig::default(),
             storage: StorageConfig::default(),
             permissions: Permissions::default(),
+            pull: PullConfig::default(),
             log_level: default_log_level(),
         }
     }
+}
+
+/// Per-resource pull intervals used by the daemon. Non-daemon subcommands
+/// (probe, pull-contacts, etc.) ignore these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullConfig {
+    #[serde(default = "default_contacts_interval")]
+    pub contacts_interval_seconds: u64,
+    #[serde(default = "default_sieve_interval")]
+    pub sieve_interval_seconds: u64,
+    #[serde(default = "default_calendar_interval")]
+    pub calendar_interval_seconds: u64,
+    #[serde(default = "default_mail_interval")]
+    pub mail_interval_seconds: u64,
+}
+
+impl Default for PullConfig {
+    fn default() -> Self {
+        Self {
+            contacts_interval_seconds: default_contacts_interval(),
+            sieve_interval_seconds: default_sieve_interval(),
+            calendar_interval_seconds: default_calendar_interval(),
+            mail_interval_seconds: default_mail_interval(),
+        }
+    }
+}
+
+fn default_contacts_interval() -> u64 {
+    900 // 15 min
+}
+fn default_sieve_interval() -> u64 {
+    3600 // 1 hour
+}
+fn default_calendar_interval() -> u64 {
+    300 // 5 min
+}
+fn default_mail_interval() -> u64 {
+    300 // 5 min
 }
 
 fn default_log_level() -> String {
