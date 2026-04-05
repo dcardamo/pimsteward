@@ -83,6 +83,65 @@ impl Client {
         Ok(resp)
     }
 
+    /// POST JSON body, decode a typed response.
+    pub(crate) async fn post_json<Req, Resp>(&self, path: &str, body: &Req) -> Result<Resp, Error>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: DeserializeOwned,
+    {
+        let resp = self.send_json(Method::POST, path, body, None).await?;
+        let bytes = resp.bytes().await?;
+        serde_json::from_slice(&bytes).map_err(Error::from)
+    }
+
+    /// PUT JSON body with optional `If-Match` header, decode a typed response.
+    pub(crate) async fn put_json<Req, Resp>(
+        &self,
+        path: &str,
+        body: &Req,
+        if_match: Option<&str>,
+    ) -> Result<Resp, Error>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: DeserializeOwned,
+    {
+        let resp = self.send_json(Method::PUT, path, body, if_match).await?;
+        let bytes = resp.bytes().await?;
+        serde_json::from_slice(&bytes).map_err(Error::from)
+    }
+
+    /// DELETE a path. Ignores the response body.
+    pub(crate) async fn delete_path(&self, path: &str) -> Result<(), Error> {
+        let _ = self.send(Method::DELETE, path).await?;
+        Ok(())
+    }
+
+    async fn send_json<Req>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &Req,
+        if_match: Option<&str>,
+    ) -> Result<Response, Error>
+    where
+        Req: serde::Serialize + ?Sized,
+    {
+        let url = format!("{}{}", self.api_base, path);
+        let mut req = self
+            .http
+            .request(method, &url)
+            .basic_auth(&self.alias_user, Some(&self.alias_password))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(body);
+        if let Some(etag) = if_match {
+            req = req.header("If-Match", etag);
+        }
+        let resp = req.send().await?;
+        self.capture_rate_limit(&resp);
+        self.check_status(&resp)?;
+        Ok(resp)
+    }
+
     fn capture_rate_limit(&self, resp: &Response) {
         if let Some(v) = resp
             .headers()

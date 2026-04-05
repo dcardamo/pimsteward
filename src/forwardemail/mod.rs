@@ -17,6 +17,7 @@ pub mod client;
 pub mod contacts;
 pub mod mail;
 pub mod sieve;
+pub mod writes;
 
 // Shared error helpers / response wrapping lives on Client itself.
 pub use client::Client;

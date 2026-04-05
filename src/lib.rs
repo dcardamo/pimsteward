@@ -8,6 +8,7 @@ pub mod mcp;
 pub mod permission;
 pub mod pull;
 pub mod store;
+pub mod write;
 
 pub use config::Config;
 pub use error::Error;

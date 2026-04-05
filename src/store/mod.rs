@@ -136,6 +136,36 @@ impl Repo {
             String::from_utf8_lossy(&sha.stdout).trim().to_string(),
         ))
     }
+
+    /// Make an empty commit. Used by the write path to record an attributed
+    /// audit entry even when the resource state on disk is identical to
+    /// what's already committed (e.g. because an earlier pull cycle already
+    /// captured the new state).
+    pub fn empty_commit(
+        &self,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> Result<String, Error> {
+        let status = Command::new("git")
+            .args(["commit", "-q", "--allow-empty", "-m", message])
+            .env("GIT_AUTHOR_NAME", author_name)
+            .env("GIT_AUTHOR_EMAIL", author_email)
+            .env("GIT_COMMITTER_NAME", author_name)
+            .env("GIT_COMMITTER_EMAIL", author_email)
+            .current_dir(&self.root)
+            .status()
+            .map_err(|e| Error::store(format!("git commit --allow-empty: {}", e)))?;
+        if !status.success() {
+            return Err(Error::store("git empty commit failed"));
+        }
+        let sha = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|e| Error::store(format!("git rev-parse: {}", e)))?;
+        Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
+    }
 }
 
 #[cfg(test)]

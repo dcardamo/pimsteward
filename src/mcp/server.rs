@@ -5,6 +5,7 @@
 use crate::forwardemail::Client;
 use crate::permission::{Permissions, Resource};
 use crate::store::Repo;
+use crate::write::audit::Attribution;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
@@ -55,8 +56,19 @@ impl PimstewardServer {
             .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
     }
 
+    fn check_write(&self, resource: Resource) -> Result<(), McpError> {
+        self.inner
+            .permissions
+            .check_write(resource)
+            .map_err(|e| McpError::invalid_params(format!("permission denied: {e}"), None))
+    }
+
     fn api_error(&self, e: crate::Error) -> McpError {
         McpError::internal_error(format!("forwardemail: {e}"), None)
+    }
+
+    fn attribution(&self, caller: Option<String>, reason: Option<String>) -> Attribution {
+        Attribution::new(caller.unwrap_or_else(|| "ai".into()), reason)
     }
 }
 
@@ -103,6 +115,102 @@ pub struct HistoryParams {
     /// Max number of commits to return (default 20, max 200).
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+// ── Write tool params ───────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateContactParams {
+    /// Full name as it should appear in the contact.
+    pub full_name: String,
+    /// Email addresses, each with a type ("home", "work", etc.) and the address.
+    pub emails: Vec<ContactEmail>,
+    /// Free-text reason why you're making this change. Ends up in the git
+    /// commit message for audit purposes. Be specific: "user asked me to
+    /// add Alice to contacts" is better than "new contact".
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ContactEmail {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateContactParams {
+    /// Forwardemail contact id.
+    pub id: String,
+    /// New full name.
+    pub full_name: String,
+    /// Optional etag from a previous get_contact call. If provided and
+    /// stale, the update will fail with 412 Precondition Failed — use this
+    /// to prevent clobbering concurrent edits.
+    #[serde(default)]
+    pub if_match: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DeleteContactParams {
+    pub id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct InstallSieveParams {
+    pub name: String,
+    /// Sieve script source. Must be valid RFC 5228 sieve; forwardemail
+    /// will parse and reject invalid scripts server-side.
+    pub content: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateSieveParams {
+    pub id: String,
+    pub content: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DeleteSieveParams {
+    pub id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UpdateFlagsParams {
+    /// Forwardemail message id.
+    pub id: String,
+    /// New flag set — replaces existing flags entirely. Use IMAP flag names
+    /// with backslashes: "\\Seen", "\\Flagged", "\\Answered", "\\Draft".
+    pub flags: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct MoveMessageParams {
+    pub id: String,
+    /// Target folder path, e.g. "Archive" or "INBOX".
+    pub folder: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DeleteMessageParams {
+    pub id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[tool_router]
@@ -230,6 +338,212 @@ impl PimstewardServer {
         serde_json::to_string_pretty(&scripts)
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
+
+    // ── Write tools (require readwrite permission) ───────────────────
+
+    #[tool(
+        name = "create_contact",
+        description = "Create a new contact. Requires readwrite permission on contacts. Every write produces a git commit attributed to the caller with the `reason` in the commit message."
+    )]
+    async fn create_contact(
+        &self,
+        Parameters(p): Parameters<CreateContactParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Contacts)?;
+        let attr = self.attribution(None, p.reason);
+        let emails: Vec<(&str, &str)> =
+            p.emails.iter().map(|e| (e.kind.as_str(), e.value.as_str())).collect();
+        let created = crate::write::contacts::create_contact(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.full_name,
+            &emails,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&created)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "update_contact",
+        description = "Update a contact's full_name. If `if_match` is provided, forwardemail uses it for optimistic concurrency — stale etags return 412. Requires readwrite permission."
+    )]
+    async fn update_contact(
+        &self,
+        Parameters(p): Parameters<UpdateContactParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Contacts)?;
+        let attr = self.attribution(None, p.reason);
+        let updated = crate::write::contacts::update_contact_name(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+            &p.full_name,
+            p.if_match.as_deref(),
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&updated)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "delete_contact",
+        description = "Delete a contact by id. Destructive — the deletion is captured in git so a restore tool can bring it back."
+    )]
+    async fn delete_contact(
+        &self,
+        Parameters(p): Parameters<DeleteContactParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Contacts)?;
+        let attr = self.attribution(None, p.reason);
+        crate::write::contacts::delete_contact(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!("deleted contact {}", p.id))
+    }
+
+    #[tool(
+        name = "install_sieve_script",
+        description = "Install a new sieve filter script. Forwardemail parses the script server-side and rejects invalid syntax, giving dry-run validation for free."
+    )]
+    async fn install_sieve_script(
+        &self,
+        Parameters(p): Parameters<InstallSieveParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Sieve)?;
+        let attr = self.attribution(None, p.reason);
+        let created = crate::write::sieve::install_sieve_script(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.name,
+            &p.content,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&created)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        name = "update_sieve_script",
+        description = "Update an existing sieve script's content."
+    )]
+    async fn update_sieve_script(
+        &self,
+        Parameters(p): Parameters<UpdateSieveParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Sieve)?;
+        let attr = self.attribution(None, p.reason);
+        let updated = crate::write::sieve::update_sieve_script(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+            &p.content,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&updated)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(name = "delete_sieve_script", description = "Delete a sieve script by id.")]
+    async fn delete_sieve_script(
+        &self,
+        Parameters(p): Parameters<DeleteSieveParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Sieve)?;
+        let attr = self.attribution(None, p.reason);
+        crate::write::sieve::delete_sieve_script(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!("deleted sieve script {}", p.id))
+    }
+
+    #[tool(
+        name = "update_email_flags",
+        description = "Replace a message's flag set. Use IMAP flag names with backslash-escaping: \\Seen, \\Flagged, \\Answered, \\Draft. Passing an empty list clears flags."
+    )]
+    async fn update_email_flags(
+        &self,
+        Parameters(p): Parameters<UpdateFlagsParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Email)?;
+        let attr = self.attribution(None, p.reason);
+        crate::write::mail::update_flags(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+            &p.flags,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!("updated flags on {}", p.id))
+    }
+
+    #[tool(name = "move_email", description = "Move a message to a different folder by path.")]
+    async fn move_email(
+        &self,
+        Parameters(p): Parameters<MoveMessageParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Email)?;
+        let attr = self.attribution(None, p.reason);
+        crate::write::mail::move_message(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+            &p.folder,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!("moved {} to {}", p.id, p.folder))
+    }
+
+    #[tool(name = "delete_email", description = "Delete a message by id.")]
+    async fn delete_email(
+        &self,
+        Parameters(p): Parameters<DeleteMessageParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Email)?;
+        let attr = self.attribution(None, p.reason);
+        crate::write::mail::delete_message(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &p.id,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        Ok(format!("deleted {}", p.id))
+    }
+
+    // ── History / audit ──────────────────────────────────────────────
 
     #[tool(
         name = "history",
