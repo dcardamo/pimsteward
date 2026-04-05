@@ -1,15 +1,16 @@
-//! Mail restore — v1 supports flag + folder restoration only.
+//! Mail restore.
 //!
-//! **Body restoration is not possible.** Per `docs/api-findings.md`,
-//! forwardemail silently ignores `PUT {raw: ...}` on messages, so once a
-//! message's body is deleted from the server there's no API path to put it
-//! back. The `.eml.json` in the backup tree preserves the content for
-//! manual recovery, but automated restore can only touch mutable metadata:
-//! flags and folder.
+//! Mutable metadata (flags, folder) is restored by PUTing against the
+//! existing message. If the message has been hard-deleted from
+//! forwardemail, the restore reads the original RFC822 bytes from the
+//! git `.eml` at the target SHA and **re-appends** them via
+//! `POST /v1/messages` (IMAP APPEND equivalent). The restored message
+//! gets a new backend id but is byte-identical to the historical version,
+//! so mail clients re-syncing the folder will see it again.
 //!
-//! If a message has been hard-deleted from forwardemail, the restore can
-//! re-append it via `POST /v1/messages` (IMAP APPEND equivalent). This
-//! path is not yet implemented in v1.
+//! Caveat: a re-appended message has a new `uid` and forwardemail id.
+//! The audit commit records the new id so the history tracks the
+//! restoration explicitly rather than silently reusing the old id.
 
 use crate::error::Error;
 use crate::forwardemail::Client;
@@ -38,11 +39,14 @@ pub enum MailOperation {
     MoveBack { target_folder: String },
     /// Live flags+folder match historical already.
     NoOp,
-    /// Message has been deleted from forwardemail — v1 can't automatically
-    /// re-APPEND, so this plan variant is informational only and apply
-    /// refuses to proceed. Captured as a dedicated variant so the AI sees
-    /// the limitation explicitly.
-    Unrestorable { reason: String },
+    /// Message has been deleted from forwardemail. Restore will re-append
+    /// the raw RFC822 bytes read from `<folder>/<id>.eml` at `at_sha`.
+    /// `raw_bytes` carries the historical payload in the plan itself so
+    /// the token binds to the exact content being restored.
+    Append {
+        target_folder: String,
+        raw_bytes: Vec<u8>,
+    },
 }
 
 pub async fn plan_mail(
@@ -71,15 +75,26 @@ pub async fn plan_mail(
     // Fetch live state
     let live = client.get_message(message_id).await;
     let (operation, human_summary) = match live {
-        Err(Error::Api { status: 404, .. }) | Err(Error::Api { status: 410, .. }) => (
-            MailOperation::Unrestorable {
-                reason: "Message has been deleted from forwardemail. Automatic \
-                         re-APPEND via POST /v1/messages is not yet implemented \
-                         in pimsteward v1."
-                    .into(),
-            },
-            format!("Message {message_id} is gone from forwardemail — cannot auto-restore."),
-        ),
+        Err(Error::Api { status: 404, .. }) | Err(Error::Api { status: 410, .. }) => {
+            // Message is gone from forwardemail. Read the historical
+            // .eml from git at at_sha and plan an Append.
+            let eml_path =
+                format!("sources/forwardemail/{alias}/mail/{folder_safe}/{message_id}.eml");
+            let raw_bytes = read_git_blob(repo, at_sha, &eml_path)?;
+            let size = raw_bytes.len();
+            (
+                MailOperation::Append {
+                    target_folder: folder.to_string(),
+                    raw_bytes,
+                },
+                format!(
+                    "Message {message_id} has been deleted from forwardemail. \
+                     Restore will re-append the historical RFC822 ({size} bytes) \
+                     to folder '{folder}'. The restored message will have a new \
+                     backend id."
+                ),
+            )
+        }
         Err(e) => return Err(e),
         Ok(live_msg) => {
             let live_flags: Vec<String> = live_msg
@@ -153,9 +168,6 @@ pub async fn apply_mail(
 
     match &plan.operation {
         MailOperation::NoOp => return Ok(()),
-        MailOperation::Unrestorable { reason } => {
-            return Err(Error::config(format!("mail restore refused: {reason}")));
-        }
         MailOperation::RestoreFlags { target_flags } => {
             client
                 .update_message_flags(&plan.message_id, target_flags)
@@ -163,6 +175,15 @@ pub async fn apply_mail(
         }
         MailOperation::MoveBack { target_folder } => {
             client.move_message(&plan.message_id, target_folder).await?;
+        }
+        MailOperation::Append {
+            target_folder,
+            raw_bytes,
+        } => {
+            // Re-append the historical message. Forwardemail generates a
+            // new backend id; the pull loop on refresh below will capture
+            // it as a brand-new .eml in the tree (the old id stays gone).
+            client.append_raw_message(target_folder, raw_bytes).await?;
         }
     }
 

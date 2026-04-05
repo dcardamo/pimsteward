@@ -6,6 +6,7 @@ mod common;
 use common::E2eContext;
 use pimsteward::pull::calendar::pull_calendar;
 use pimsteward::restore;
+use pimsteward::source::RestCalendarSource;
 use pimsteward::write;
 
 fn sample_ical(uid: &str, summary: &str) -> String {
@@ -43,7 +44,7 @@ async fn calendar_event_create_update_delete_lifecycle() {
 
     // Baseline pull
     let _ = pull_calendar(
-        &ctx.client,
+        &RestCalendarSource::new(ctx.client.clone()),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",

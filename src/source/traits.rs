@@ -1,18 +1,24 @@
-//! The MailSource trait and shared types that implementations return.
+//! Source traits. One trait per resource type. Implementations may cover
+//! one or more resources — e.g. the REST client implements all of them,
+//! the IMAP source implements only `MailSource`, the DAV sources
+//! implement calendar + contacts.
 
 use crate::error::Error;
+use crate::forwardemail::calendar::{Calendar, CalendarEvent};
+use crate::forwardemail::contacts::Contact;
 use crate::forwardemail::mail::{Folder, MessageSummary};
 use async_trait::async_trait;
 
+// ── Mail ────────────────────────────────────────────────────────────
+
 /// A fetched message: the raw RFC822 bytes plus the forwardemail-shape
-/// summary fields that the pull loop uses as diff keys. When the source is
-/// IMAP, these fields are synthesized from FETCH responses so the pull
-/// loop's logic is identical regardless of backend.
+/// summary fields that the pull loop uses as diff keys. IMAP-sourced
+/// messages synthesize these from FETCH responses so the pull loop logic
+/// is identical regardless of backend.
 ///
-/// `extra` carries source-specific metadata that doesn't fit in the
-/// generic summary (e.g. REST's `thread_id`, `folder_path`, `labels`).
-/// IMAP-sourced messages leave it `None`; the pull loop tolerates missing
-/// fields in the sidecar meta.json.
+/// `extra` carries source-specific metadata (REST's `thread_id`,
+/// `folder_path`, `labels`, etc.). IMAP leaves it `None`; the pull loop
+/// tolerates missing fields in the sidecar meta.json.
 #[derive(Debug, Clone)]
 pub struct FetchedMessage {
     pub summary: MessageSummary,
@@ -20,25 +26,36 @@ pub struct FetchedMessage {
     pub extra: Option<serde_json::Value>,
 }
 
-/// Read-only abstraction for pulling mail state.
-///
-/// Implementations must be cheap to clone (use Arc internally for
-/// connection state).
 #[async_trait]
 pub trait MailSource: Send + Sync {
-    /// Human-readable tag identifying this source (e.g. "rest" or "imap").
-    /// Used in commit messages and logs so history makes clear where the
-    /// data came from.
     fn tag(&self) -> &'static str;
-
-    /// List all folders on the alias.
     async fn list_folders(&self) -> Result<Vec<Folder>, Error>;
-
-    /// List message summaries in a folder (paginated transparently to
-    /// the caller). Summaries must include the fields the pull loop diffs
-    /// on: `id`, `modseq`, `flags`, `updated_at`.
     async fn list_messages(&self, folder: &str) -> Result<Vec<MessageSummary>, Error>;
-
-    /// Fetch a single full message including its raw RFC822 bytes.
     async fn fetch_message(&self, folder: &str, id: &str) -> Result<FetchedMessage, Error>;
+}
+
+// ── Calendar ───────────────────────────────────────────────────────
+
+/// Read-only abstraction for pulling calendar state. Implementations return
+/// forwardemail-shape types so the pull loop and storage layout are
+/// identical across backends.
+#[async_trait]
+pub trait CalendarSource: Send + Sync {
+    fn tag(&self) -> &'static str;
+    /// List all calendars accessible to the authenticated alias.
+    async fn list_calendars(&self) -> Result<Vec<Calendar>, Error>;
+    /// List all events from all calendars (or a specific calendar if
+    /// `calendar_id` is provided). Each event includes its raw iCalendar
+    /// text in the `ical` field.
+    async fn list_events(&self, calendar_id: Option<&str>) -> Result<Vec<CalendarEvent>, Error>;
+}
+
+// ── Contacts ────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait ContactsSource: Send + Sync {
+    fn tag(&self) -> &'static str;
+    /// List all contacts for the authenticated alias. Each contact
+    /// includes the raw vCard in `content` and the CardDAV etag in `etag`.
+    async fn list_contacts(&self) -> Result<Vec<Contact>, Error>;
 }

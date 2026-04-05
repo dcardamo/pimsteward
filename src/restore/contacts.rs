@@ -160,8 +160,9 @@ pub async fn apply_contact(
     }
 
     // Refresh + attributed commit
+    let rest_source = crate::source::RestContactsSource::new(client.clone());
     let _ = pull_contacts(
-        client,
+        &rest_source,
         repo,
         alias,
         &attribution.caller,

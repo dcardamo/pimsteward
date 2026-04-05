@@ -92,3 +92,58 @@ impl MailSource for RestMailSource {
         })
     }
 }
+
+// ── Calendar via REST ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RestCalendarSource {
+    client: Client,
+}
+
+impl RestCalendarSource {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl crate::source::traits::CalendarSource for RestCalendarSource {
+    fn tag(&self) -> &'static str {
+        "rest"
+    }
+
+    async fn list_calendars(&self) -> Result<Vec<crate::forwardemail::calendar::Calendar>, Error> {
+        self.client.list_calendars().await
+    }
+
+    async fn list_events(
+        &self,
+        calendar_id: Option<&str>,
+    ) -> Result<Vec<crate::forwardemail::calendar::CalendarEvent>, Error> {
+        self.client.list_calendar_events(calendar_id).await
+    }
+}
+
+// ── Contacts via REST ───────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct RestContactsSource {
+    client: Client,
+}
+
+impl RestContactsSource {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl crate::source::traits::ContactsSource for RestContactsSource {
+    fn tag(&self) -> &'static str {
+        "rest"
+    }
+
+    async fn list_contacts(&self) -> Result<Vec<crate::forwardemail::contacts::Contact>, Error> {
+        self.client.list_contacts().await
+    }
+}

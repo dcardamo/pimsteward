@@ -15,6 +15,7 @@ mod common;
 use common::E2eContext;
 use pimsteward::pull::contacts::pull_contacts;
 use pimsteward::restore;
+use pimsteward::source::RestContactsSource;
 use pimsteward::write;
 
 /// Full lifecycle: create → pull → update → pull → delete → pull → verify
@@ -29,7 +30,7 @@ async fn contact_create_update_delete_lifecycle() {
     // contacts on the test alias). Use unique test names to avoid
     // collisions with leftover state.
     let _ = pull_contacts(
-        &ctx.client,
+        &RestContactsSource::new(ctx.client.clone()),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",

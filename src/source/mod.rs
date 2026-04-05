@@ -18,10 +18,15 @@
 //! because only one backend exists for each (REST). Add per-resource
 //! traits when a second backend arrives.
 
+pub mod caldav;
+pub mod carddav;
+pub mod dav;
 pub mod imap;
 pub mod rest;
 pub mod traits;
 
+pub use caldav::DavCalendarSource;
+pub use carddav::DavContactsSource;
 pub use imap::ImapMailSource;
-pub use rest::RestMailSource;
-pub use traits::{FetchedMessage, MailSource};
+pub use rest::{RestCalendarSource, RestContactsSource, RestMailSource};
+pub use traits::{CalendarSource, ContactsSource, FetchedMessage, MailSource};

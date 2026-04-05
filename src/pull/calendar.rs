@@ -9,8 +9,8 @@
 
 use crate::error::Error;
 use crate::forwardemail::calendar::{Calendar, CalendarEvent};
-use crate::forwardemail::Client;
 use crate::pull::{filename_safe, PullResult, PullSummary};
+use crate::source::CalendarSource;
 use crate::store::Repo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,7 +30,7 @@ struct EventMeta {
 }
 
 pub async fn pull_calendar(
-    client: &Client,
+    source: &dyn CalendarSource,
     repo: &Repo,
     alias: &str,
     author_name: &str,
@@ -42,7 +42,7 @@ pub async fn pull_calendar(
     };
 
     // 1. List calendars; write manifest per calendar.
-    let calendars = client.list_calendars().await?;
+    let calendars = source.list_calendars().await?;
     let mut current_calendar_dirs = HashSet::new();
     for c in &calendars {
         let cal_dir = calendar_dir(alias, c);
@@ -51,9 +51,10 @@ pub async fn pull_calendar(
         repo.write_file(&manifest_path, serde_json::to_vec_pretty(c)?.as_slice())?;
     }
 
-    // 2. Fetch all events (one pass — forwardemail's list endpoint supports
-    // calendar_id filtering but global is simpler and fewer round-trips).
-    let remote_events = client.list_calendar_events(None).await?;
+    // 2. Fetch all events (one pass — the REST backend supports
+    // calendar_id filtering but global is simpler and fewer round-trips;
+    // the DAV backend enumerates per-calendar internally anyway).
+    let remote_events = source.list_events(None).await?;
 
     // Build: per-calendar local meta + per-calendar remote events
     let mut remote_by_cal: HashMap<String, Vec<&CalendarEvent>> = HashMap::new();

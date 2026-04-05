@@ -7,6 +7,7 @@ mod common;
 use common::E2eContext;
 use pimsteward::pull::{calendar::pull_calendar, contacts::pull_contacts, sieve::pull_sieve};
 use pimsteward::restore;
+use pimsteward::source::{RestCalendarSource, RestContactsSource};
 use pimsteward::write;
 
 fn sample_ical(uid: &str, summary: &str) -> String {
@@ -81,7 +82,7 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
 
     // 2. Baseline pull to ensure everything is captured, then snapshot sha
     let _ = pull_contacts(
-        &ctx.client,
+        &RestContactsSource::new(ctx.client.clone()),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",
@@ -99,7 +100,7 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     .await
     .ok();
     let _ = pull_calendar(
-        &ctx.client,
+        &RestCalendarSource::new(ctx.client.clone()),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",

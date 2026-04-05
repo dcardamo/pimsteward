@@ -13,11 +13,14 @@
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::Result;
 use pimsteward::{
-    config::MailSourceKind,
+    config::{CalendarSourceKind, ContactsSourceKind, MailSourceKind},
     forwardemail::Client,
     mcp::PimstewardServer,
     pull,
-    source::{imap::ImapConfig, ImapMailSource, MailSource, RestMailSource},
+    source::{
+        imap::ImapConfig, CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource,
+        ImapMailSource, MailSource, RestCalendarSource, RestContactsSource, RestMailSource,
+    },
     store::Repo,
     Config,
 };
@@ -27,8 +30,7 @@ use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Build the configured MailSource for this run. REST is the default;
-/// IMAP is selected when `forwardemail.mail_source = "imap"` in the
-/// config, in which case the IMAP host/port come from config too.
+/// IMAP is selected when `forwardemail.mail_source = "imap"` in the config.
 fn build_mail_source(
     cfg: &Config,
     client: Client,
@@ -47,6 +49,38 @@ fn build_mail_source(
             Arc::new(ImapMailSource::new(imap_cfg))
         }
     }
+}
+
+fn build_calendar_source(
+    cfg: &Config,
+    client: Client,
+    user: &str,
+    password: &str,
+) -> Result<Arc<dyn CalendarSource>, pimsteward::Error> {
+    Ok(match cfg.forwardemail.calendar_source {
+        CalendarSourceKind::Rest => Arc::new(RestCalendarSource::new(client)),
+        CalendarSourceKind::Caldav => Arc::new(DavCalendarSource::new(
+            cfg.forwardemail.caldav_base_url.clone(),
+            user,
+            password,
+        )?),
+    })
+}
+
+fn build_contacts_source(
+    cfg: &Config,
+    client: Client,
+    user: &str,
+    password: &str,
+) -> Result<Arc<dyn ContactsSource>, pimsteward::Error> {
+    Ok(match cfg.forwardemail.contacts_source {
+        ContactsSourceKind::Rest => Arc::new(RestContactsSource::new(client)),
+        ContactsSourceKind::Carddav => Arc::new(DavContactsSource::new(
+            cfg.forwardemail.carddav_base_url.clone(),
+            user,
+            password,
+        )?),
+    })
 }
 
 #[derive(Debug, Parser)]
@@ -140,17 +174,22 @@ async fn main() -> Result<()> {
             cfg.permissions.check_read(pimsteward::Resource::Contacts)?;
             let (user, pass) = cfg.load_credentials()?;
             let alias = alias_from_user(&user);
-            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let client = Client::new(
+                cfg.forwardemail.api_base.clone(),
+                user.clone(),
+                pass.clone(),
+            )?;
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let source = build_contacts_source(&cfg, client, &user, &pass)?;
             let summary = pull::contacts::pull_contacts(
-                &client,
+                source.as_ref(),
                 &repo,
                 &alias,
                 "pimsteward-pull",
                 "pull@pimsteward.local",
             )
             .await?;
-            tracing::info!(summary = %summary, "pull-contacts done");
+            tracing::info!(summary = %summary, source = source.tag(), "pull-contacts done");
             println!("{summary}");
         }
         Command::PullSieve => {
@@ -196,17 +235,22 @@ async fn main() -> Result<()> {
             cfg.permissions.check_read(pimsteward::Resource::Calendar)?;
             let (user, pass) = cfg.load_credentials()?;
             let alias = alias_from_user(&user);
-            let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+            let client = Client::new(
+                cfg.forwardemail.api_base.clone(),
+                user.clone(),
+                pass.clone(),
+            )?;
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let source = build_calendar_source(&cfg, client, &user, &pass)?;
             let summary = pull::calendar::pull_calendar(
-                &client,
+                source.as_ref(),
                 &repo,
                 &alias,
                 "pimsteward-pull",
                 "pull@pimsteward.local",
             )
             .await?;
-            tracing::info!(summary = %summary, "pull-calendar done");
+            tracing::info!(summary = %summary, source = source.tag(), "pull-calendar done");
             println!("{summary}");
         }
         Command::PullAll => {
@@ -226,9 +270,16 @@ async fn main() -> Result<()> {
                 .check_read(pimsteward::Resource::Contacts)
                 .is_ok()
             {
-                let s = pull::contacts::pull_contacts(&client, &repo, &alias, author.0, author.1)
-                    .await?;
-                tracing::info!(summary = %s, "pull-contacts done");
+                let source = build_contacts_source(&cfg, client.clone(), &user, &pass)?;
+                let s = pull::contacts::pull_contacts(
+                    source.as_ref(),
+                    &repo,
+                    &alias,
+                    author.0,
+                    author.1,
+                )
+                .await?;
+                tracing::info!(summary = %s, source = source.tag(), "pull-contacts done");
                 println!("{s}");
             }
             if cfg
@@ -245,9 +296,16 @@ async fn main() -> Result<()> {
                 .check_read(pimsteward::Resource::Calendar)
                 .is_ok()
             {
-                let s = pull::calendar::pull_calendar(&client, &repo, &alias, author.0, author.1)
-                    .await?;
-                tracing::info!(summary = %s, "pull-calendar done");
+                let source = build_calendar_source(&cfg, client.clone(), &user, &pass)?;
+                let s = pull::calendar::pull_calendar(
+                    source.as_ref(),
+                    &repo,
+                    &alias,
+                    author.0,
+                    author.1,
+                )
+                .await?;
+                tracing::info!(summary = %s, source = source.tag(), "pull-calendar done");
                 println!("{s}");
             }
             if cfg

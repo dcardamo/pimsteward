@@ -102,11 +102,25 @@ pub struct ForwardemailConfig {
     /// Writes always go through REST regardless of this setting — mixing
     /// write backends complicates audit attribution.
     ///
-    /// **Warning:** do not switch mail_source values against the same
-    /// backup tree without first wiping the mail/ subtree. The two
-    /// sources use different id schemes for filenames.
+    /// **Warning:** do not switch source values against the same backup
+    /// tree without first wiping the corresponding subtree. Different
+    /// sources may use different id schemes for filenames.
     #[serde(default)]
     pub mail_source: MailSourceKind,
+
+    /// Backend for reading calendar state. `rest` (default) uses the
+    /// REST API. `caldav` uses native CalDAV against
+    /// `caldav.forwardemail.net` — more efficient at high event counts
+    /// because a single REPORT returns all events with iCal bodies and
+    /// etags in one round trip.
+    #[serde(default)]
+    pub calendar_source: CalendarSourceKind,
+
+    /// Backend for reading contacts. `rest` (default) or `carddav`.
+    /// CardDAV is more efficient with large address books for the same
+    /// reason CalDAV is for calendars.
+    #[serde(default)]
+    pub contacts_source: ContactsSourceKind,
 
     /// IMAP host — used only when `mail_source = "imap"`.
     #[serde(default = "default_imap_host")]
@@ -115,6 +129,16 @@ pub struct ForwardemailConfig {
     /// IMAP port — used only when `mail_source = "imap"`.
     #[serde(default = "default_imap_port")]
     pub imap_port: u16,
+
+    /// CalDAV base URL (no trailing slash) — used only when
+    /// `calendar_source = "caldav"`.
+    #[serde(default = "default_caldav_base_url")]
+    pub caldav_base_url: String,
+
+    /// CardDAV base URL (no trailing slash) — used only when
+    /// `contacts_source = "carddav"`.
+    #[serde(default = "default_carddav_base_url")]
+    pub carddav_base_url: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,12 +149,36 @@ pub enum MailSourceKind {
     Imap,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarSourceKind {
+    #[default]
+    Rest,
+    Caldav,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactsSourceKind {
+    #[default]
+    Rest,
+    Carddav,
+}
+
 fn default_imap_host() -> String {
     "imap.forwardemail.net".into()
 }
 
 fn default_imap_port() -> u16 {
     993
+}
+
+fn default_caldav_base_url() -> String {
+    "https://caldav.forwardemail.net".into()
+}
+
+fn default_carddav_base_url() -> String {
+    "https://carddav.forwardemail.net".into()
 }
 
 impl Default for ForwardemailConfig {
@@ -140,8 +188,12 @@ impl Default for ForwardemailConfig {
             alias_user_file: None,
             alias_password_file: None,
             mail_source: MailSourceKind::default(),
+            calendar_source: CalendarSourceKind::default(),
+            contacts_source: ContactsSourceKind::default(),
             imap_host: default_imap_host(),
             imap_port: default_imap_port(),
+            caldav_base_url: default_caldav_base_url(),
+            carddav_base_url: default_carddav_base_url(),
         }
     }
 }

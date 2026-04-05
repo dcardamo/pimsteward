@@ -79,6 +79,29 @@ impl Client {
 
     // ── Mail flags/folder ────────────────────────────────────────────
 
+    /// POST /v1/messages — append raw RFC822 bytes to a folder (IMAP
+    /// APPEND equivalent). Used by the mail restore flow to re-append a
+    /// message that was hard-deleted from the server. Forwardemail
+    /// generates a new message id; the restored message is byte-identical
+    /// to the historical version but has a different backend id.
+    pub async fn append_raw_message(
+        &self,
+        folder: &str,
+        raw_rfc822: &[u8],
+    ) -> Result<serde_json::Value, Error> {
+        // The API accepts `{folder, raw}` with raw as a string. We parse
+        // the bytes as UTF-8 — forwardemail will round-trip 8-bit MIME
+        // without us needing to encode, because the `raw` field is what
+        // it stores verbatim.
+        let raw_str = std::str::from_utf8(raw_rfc822).map_err(|e| {
+            Error::config(format!(
+                "append_raw_message: stored raw bytes are not valid UTF-8: {e}"
+            ))
+        })?;
+        let body = json!({"folder": folder, "raw": raw_str});
+        self.post_json("/v1/messages", &body).await
+    }
+
     /// PUT /v1/messages/:id with `{flags: [...]}` — replace the flag set.
     pub async fn update_message_flags(
         &self,

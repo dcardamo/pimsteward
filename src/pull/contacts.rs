@@ -14,8 +14,8 @@
 
 use crate::error::Error;
 use crate::forwardemail::contacts::Contact;
-use crate::forwardemail::Client;
 use crate::pull::{filename_safe, PullResult, PullSummary};
+use crate::source::ContactsSource;
 use crate::store::Repo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,13 +35,13 @@ struct ContactMeta {
 /// `sources/forwardemail/`). Typically the alias email with `@` replaced by
 /// `-`, e.g. `dan-hld.ca`.
 pub async fn pull_contacts(
-    client: &Client,
+    source: &dyn ContactsSource,
     repo: &Repo,
     alias: &str,
     author_name: &str,
     author_email: &str,
 ) -> PullResult<PullSummary> {
-    let remote = client.list_contacts().await?;
+    let remote = source.list_contacts().await?;
     let local = read_local_contacts(repo, alias)?;
 
     let remote_by_uid: HashMap<String, &Contact> =

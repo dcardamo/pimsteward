@@ -89,8 +89,12 @@ async fn refresh_and_commit(
     // The pull loop does the file diff and commits its own summary. We
     // override by calling the commit helper directly after the file write,
     // passing our attributed message.
+    // Writes always use the REST source for the refresh — the REST API
+    // is the single source of truth for writes regardless of the
+    // daemon's read-side source choice.
+    let rest_source = crate::source::RestContactsSource::new(client.clone());
     let _ = pull_contacts(
-        client,
+        &rest_source,
         repo,
         alias,
         &audit.attribution.caller,

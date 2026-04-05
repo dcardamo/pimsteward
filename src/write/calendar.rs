@@ -99,8 +99,9 @@ async fn refresh(
     attribution: &Attribution,
     audit: &WriteAudit<'_>,
 ) -> Result<(), Error> {
+    let rest_source = crate::source::RestCalendarSource::new(client.clone());
     let _ = pull_calendar(
-        client,
+        &rest_source,
         repo,
         alias,
         &attribution.caller,
