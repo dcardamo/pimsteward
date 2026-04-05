@@ -420,6 +420,59 @@ writes, single writer, no merge conflicts.
 
 ---
 
+## Testing
+
+Unit tests run against fakes and never touch the network:
+
+```sh
+cargo test
+```
+
+The interesting tests are the **end-to-end** suite, which drives the real
+forwardemail REST API and IMAP/CalDAV/CardDAV endpoints. Because those tests
+create, modify, and delete live resources, they are gated behind an explicit
+opt-in **and** a safety guard that refuses to run against anything that isn't
+a test alias.
+
+```sh
+export PIMSTEWARD_RUN_E2E=1
+export PIMSTEWARD_TEST_ALIAS_USER_FILE=/path/to/test-alias-email
+export PIMSTEWARD_TEST_ALIAS_PASSWORD_FILE=/path/to/test-alias-password
+
+cargo nextest run --run-ignored all
+```
+
+### The `_test` alias safety guard
+
+**Every e2e test must use a forwardemail alias whose localpart contains the
+substring `_test`.** The guard lives in
+[`src/safety.rs`](src/safety.rs) and runs *before* any client is constructed
+or any API call is made. If the alias doesn't match, the test **panics
+immediately** — it does not return a `Result` you can `?` past or `let _ =`
+away. This is intentional: a safety guard that can be silently swallowed
+isn't a safety guard.
+
+Concretely, the rule is:
+
+1. The alias must contain `_test` in its localpart — e.g.
+   `pimsteward_test@example.dev` ✅, `dan@example.dev` ❌.
+2. The alias must not appear on the **explicit deny list** of known
+   production addresses (belt-and-braces; the deny list catches hypothetical
+   collisions like someone registering `dan_test` on a production domain).
+3. Defense in depth: the repo path used by the test must not live under
+   `/data/Backups/` or `/var/lib/pimsteward/` — those are reserved for the
+   production daemon. Tests use a `tempfile::tempdir()` repo.
+
+The recommended setup is a dedicated forwardemail alias you create just for
+this — something like `pimsteward_test@<your-domain>` — with its own
+alias-scoped credentials. Never point the test suite at an alias that holds
+real mail, even briefly. The guard will stop you, but not pointing the gun
+in the first place is better.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full e2e walkthrough.
+
+---
+
 ## Status
 
 Early development. Pull-loop and MCP server are functional; the write path
