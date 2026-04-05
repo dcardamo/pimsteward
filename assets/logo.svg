@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="pimsteward logo">
+  <title>pimsteward</title>
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e3a8a"/>
+      <stop offset="100%" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="env" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#cbd5e1"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- shield -->
+  <path d="M256 28 L452 94 V260 C452 372 366 458 256 484 C146 458 60 372 60 260 V94 Z"
+        fill="url(#shield)" stroke="#38bdf8" stroke-width="10" stroke-linejoin="round"/>
+
+  <!-- subtle inner ring -->
+  <path d="M256 60 L424 116 V258 C424 352 352 428 256 452 C160 428 88 352 88 258 V116 Z"
+        fill="none" stroke="#334155" stroke-width="3"/>
+
+  <!-- envelope -->
+  <g transform="translate(0,-10)">
+    <rect x="132" y="186" width="248" height="164" rx="14" fill="url(#env)" stroke="#38bdf8" stroke-width="6"/>
+    <path d="M132 198 L256 292 L380 198" fill="none" stroke="#1e3a8a" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M132 350 L220 270 M380 350 L292 270" fill="none" stroke="#94a3b8" stroke-width="4" stroke-linecap="round"/>
+  </g>
+
+  <!-- git history line beneath envelope -->
+  <g filter="url(#glow)">
+    <line x1="160" y1="402" x2="352" y2="402" stroke="#fbbf24" stroke-width="6" stroke-linecap="round"/>
+    <circle cx="160" cy="402" r="14" fill="#fbbf24"/>
+    <circle cx="256" cy="402" r="14" fill="#fbbf24"/>
+    <circle cx="352" cy="402" r="18" fill="#fbbf24" stroke="#fff7ed" stroke-width="3"/>
+  </g>
+</svg>
