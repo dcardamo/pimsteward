@@ -38,9 +38,10 @@ to see what it changed today, you ask `git log`.
 
 ## Why [forwardemail.net](https://forwardemail.net)
 
-pimsteward is a forwardemail-only tool on purpose. The provider makes this kind
-of mediator **possible**, where most mailbox hosts make it painful or outright
-hostile.
+pimsteward is a forwardemail-only tool on purpose. A mediator like this needs
+a backend with a real programmatic surface, stable resource ids, and
+credentials that can be scoped to a single mailbox — forwardemail has all
+three.
 
 - **A real, first-class REST API.** forwardemail ships a
   [well-documented REST API](https://forwardemail.net/en/email-api) covering
