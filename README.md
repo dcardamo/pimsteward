@@ -286,6 +286,189 @@ sequenceDiagram
     MCP-->>U: restored N files, M events
 ```
 
+### Restore in practice — three scenarios
+
+The easiest way to understand restore is to watch it fix mistakes. These
+are shown using the `pimsteward` CLI; the same operations are available
+to the AI via MCP tools (`restore_plan` + `restore_apply`), which is how
+you'd drive them from inside a conversation.
+
+#### Scenario 1 — "the AI archived a newsletter I wanted to keep in my inbox"
+
+You asked the assistant to clean up your inbox this morning. It filed
+fifteen newsletters to `archive/newsletters/`, but one of them — the
+Friday edition of a newsletter you actually read — should have stayed
+put.
+
+```sh
+# 1. See what changed in the last hour, scoped to mail.
+pimsteward log --since "1 hour ago" --path sources/forwardemail/*/mail/
+
+# 2. Find the specific move. Commit looks like:
+#    ai: move 15 messages → archive/newsletters/
+#    Source: ai
+#    Tool: bulk_move
+#    Session: 01HXYZ...
+
+# 3. Dry-run a restore of just that message back to where it was.
+pimsteward restore plan \
+    --path 'sources/forwardemail/*/mail/inbox/2026-04-05-signal-weekly/' \
+    --at 'HEAD~1'            # the commit before the bulk move
+
+# Prints: 1 message will be moved: archive/newsletters/ → inbox/
+
+# 4. Apply it.
+pimsteward restore apply --token <token-from-dry-run>
+```
+
+The other fourteen archived messages stay archived. Restore is a
+**selective** git checkout, not a global rewind.
+
+#### Scenario 2 — "the AI rewrote my sieve filter and now mail is going to the wrong folder"
+
+You gave the assistant `sieve = "readwrite"` last week. Overnight it
+"optimised" your filter script, and now messages from your accountant
+are landing in `spam/` instead of `taxes/`.
+
+```sh
+# 1. What did the sieve file look like yesterday morning?
+pimsteward show --path 'sources/forwardemail/*/sieve/inbox.sieve' \
+                --at '2026-04-04T09:00Z'
+
+# 2. Diff yesterday against now to see exactly what the AI changed.
+pimsteward diff --path 'sources/forwardemail/*/sieve/inbox.sieve' \
+                --from '2026-04-04T09:00Z' --to HEAD
+
+# 3. Roll the file back.
+pimsteward restore plan \
+    --path 'sources/forwardemail/*/sieve/inbox.sieve' \
+    --at '2026-04-04T09:00Z'
+
+pimsteward restore apply --token <token>
+```
+
+The restore is committed as a new commit with `Source: restore` and a
+reference back to the commit being reverted, so the audit trail shows
+both the AI's change and your undo.
+
+#### Scenario 3 — "the AI merged two contacts and kept the wrong one"
+
+The assistant helpfully deduped your address book, but it chose the
+older "Alex Kim" vcard and dropped the newer phone number you'd added
+last week.
+
+```sh
+# 1. Find the merge commit.
+pimsteward log --path 'sources/forwardemail/*/contacts/' --grep 'merge'
+
+# 2. Show the deleted vcard as it was just before the merge.
+pimsteward show --path 'sources/forwardemail/*/contacts/main/alex-kim-b.vcf' \
+                --at 'HEAD~1'
+
+# 3. Restore that single vcard. The AI-preferred one stays — you end
+#    up with both, and can tidy them yourself.
+pimsteward restore plan \
+    --path 'sources/forwardemail/*/contacts/main/alex-kim-b.vcf' \
+    --at 'HEAD~1'
+
+pimsteward restore apply --token <token>
+```
+
+In every case the pattern is the same: **narrow the path, pick the
+time, dry-run, confirm, apply.**
+
+---
+
+## Auditing what the AI did
+
+pimsteward is a backup *and* an audit tool. Every AI-initiated change
+leaves two traces:
+
+1. **A git commit** with a structured footer identifying source, tool,
+   and session — so `git log` is your primary audit log.
+2. **A line in `audit/mutations.jsonl`** — an append-only, human-
+   readable JSON-lines log you can grep, pipe into `jq`, or load into
+   any log tooling.
+
+### Commit shape
+
+Every mutation commit carries trailers that make filtering easy:
+
+```
+ai: create_event work-cal/2026-04-10-design-review
+
+Source: ai
+Tool: create_event
+Session: 01HXYZ7P2Q3R4S5T6V
+Resource: calendar
+Alias: pimsteward_test@example.dev
+```
+
+`Source:` is one of `ai`, `pull`, or `restore`. `Tool:` names the MCP
+tool that was invoked. `Session:` ties together every mutation from a
+single AI conversation, so you can see a burst of related changes as
+one coherent action.
+
+### Asking "what did the AI change today?"
+
+```sh
+# Every AI-authored change today, newest first, scoped to one alias.
+git -C /data/Backups/$(hostname)/pimsteward/<alias_slug> \
+    log --since=midnight --grep='^Source: ai$'
+
+# Same question, but just the files touched.
+git -C .../<alias_slug> \
+    log --since=midnight --grep='^Source: ai$' --name-status
+
+# All changes from a single AI session — useful when the assistant did
+# a burst of edits and you want to review them as a unit.
+git -C .../<alias_slug> \
+    log --grep='Session: 01HXYZ7P2Q3R4S5T6V'
+
+# "Who last touched this specific calendar event?"
+git -C .../<alias_slug> \
+    blame sources/forwardemail/*/calendars/work/events/01HXYZ....ics
+```
+
+Because the repo is just git, **everything you already know about git
+works here**. `git log -p`, `git log --stat`, `gitk`, `tig`,
+`lazygit`, VS Code's git lens — all of them become audit tools for
+your AI.
+
+### The mutations log
+
+For the cases where you want something less git-shaped — dashboards,
+alerts, "email me if the AI ever deletes more than ten messages in a
+day" — there's `audit/mutations.jsonl`:
+
+```jsonl
+{"ts":"2026-04-05T08:14:22Z","source":"ai","tool":"create_event","resource":"calendar","path":"calendars/work/events/01HXYZ....ics","session":"01HXYZ7P2Q3R4S5T6V","result":"ok"}
+{"ts":"2026-04-05T08:14:23Z","source":"ai","tool":"bulk_move","resource":"mail","count":15,"from":"inbox/","to":"archive/newsletters/","session":"01HXYZ7P2Q3R4S5T6V","result":"ok"}
+{"ts":"2026-04-05T08:14:24Z","source":"ai","tool":"delete_message","resource":"mail","result":"denied","reason":"permission: email=drafts"}
+```
+
+Note the last line: **denied attempts are logged too.** If your AI
+repeatedly tries to do things its permission level forbids, that's a
+signal worth surfacing — pimsteward captures it whether or not the
+operation succeeded.
+
+```sh
+# Show every AI mutation today, pretty-printed.
+jq -c 'select(.source=="ai" and (.ts | startswith("2026-04-05")))' \
+    /data/Backups/.../<alias_slug>/audit/mutations.jsonl
+
+# Count by tool — where is the AI spending its write budget?
+jq -r 'select(.source=="ai") | .tool' mutations.jsonl | sort | uniq -c | sort -rn
+
+# Every denied attempt this week.
+jq -c 'select(.result=="denied")' mutations.jsonl
+```
+
+The combination — structured commits for narrative review, JSON-lines
+for tooling — is the whole point of pimsteward. You don't audit the
+AI by asking it what it did. You audit the AI by looking at the trail
+it couldn't avoid leaving.
+
 ---
 
 ## Permission model — a trust gradient you control
