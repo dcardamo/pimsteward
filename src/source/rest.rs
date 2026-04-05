@@ -7,7 +7,7 @@
 use crate::error::Error;
 use crate::forwardemail::mail::{Folder, MessageSummary};
 use crate::forwardemail::Client;
-use crate::source::traits::{FetchedMessage, MailSource};
+use crate::source::traits::{FetchedMessage, ListResult, MailSource};
 use async_trait::async_trait;
 
 #[derive(Debug, Clone)]
@@ -31,8 +31,25 @@ impl MailSource for RestMailSource {
         self.client.list_folders().await
     }
 
-    async fn list_messages(&self, folder: &str) -> Result<Vec<MessageSummary>, Error> {
-        self.client.list_messages_in_folder(folder).await
+    async fn list_messages(
+        &self,
+        folder: &str,
+        _since_modseq: Option<i64>,
+        _uid_validity: Option<i64>,
+    ) -> Result<ListResult, Error> {
+        // REST returns every message on every call and has no mailbox-level
+        // HIGHESTMODSEQ or UIDVALIDITY to persist — the per-message modseq
+        // on each summary is what drives the pull loop's skip logic. So we
+        // return the full list as both `all_ids` and `changed`, and leave
+        // the CONDSTORE-adjacent fields None.
+        let msgs = self.client.list_messages_in_folder(folder).await?;
+        let all_ids = msgs.iter().map(|m| m.id.clone()).collect();
+        Ok(ListResult {
+            all_ids,
+            changed: msgs,
+            highest_modseq: None,
+            uid_validity: None,
+        })
     }
 
     async fn fetch_message(&self, _folder: &str, id: &str) -> Result<FetchedMessage, Error> {

@@ -28,7 +28,7 @@
 //! > N filtering via native IMAP is a v2.2 concern.
 
 use crate::error::Error;
-use crate::forwardemail::mail::{Folder, MessageSummary};
+use crate::forwardemail::mail::Folder;
 use crate::pull::{filename_safe, PullResult, PullSummary};
 use crate::source::MailSource;
 use crate::store::Repo;
@@ -156,18 +156,10 @@ pub async fn pull_mail(
         ..Default::default()
     };
 
-    // 1. List folders and write a folder manifest per folder.
+    // 1. List folders. We defer writing `_folder.json` until after
+    //    list_messages runs so we can fold in the CONDSTORE values
+    //    (uid_validity, highest_modseq) the source returns.
     let folders = source.list_folders().await?;
-    for f in &folders {
-        let dir = format!(
-            "sources/forwardemail/{}/mail/{}",
-            alias,
-            folder_safe(&f.path)
-        );
-        let meta_path = format!("{dir}/_folder.json");
-        let body = serde_json::to_vec_pretty(f)?;
-        repo.write_file(&meta_path, &body)?;
-    }
 
     // 2. Per-folder message sync
     for f in &folders {
@@ -177,12 +169,18 @@ pub async fn pull_mail(
             folder_safe(&f.path)
         );
         let local_meta = read_local_message_meta(repo, &folder_dir)?;
-        let remote_summaries = source.list_messages(&f.path).await?;
-        let remote_by_id: HashMap<String, &MessageSummary> =
-            remote_summaries.iter().map(|m| (m.id.clone(), m)).collect();
+
+        // Read the previous _folder.json (if any) to recover the last
+        // observed uid_validity + modify_index. These drive CONDSTORE
+        // delta sync on sources that support it. If uid_validity has
+        // changed under us, the source will ignore the modseq hint.
+        let (prev_uid_validity, prev_modseq) = read_prev_folder_state(repo, &folder_dir);
+        let list_result = source
+            .list_messages(&f.path, prev_modseq, prev_uid_validity)
+            .await?;
 
         // 3. Detect changes and re-fetch full bodies where needed.
-        for msg in &remote_summaries {
+        for msg in &list_result.changed {
             let id = filename_safe(&msg.id);
             let prev = local_meta.get(&id);
             let needs_refetch = match prev {
@@ -235,10 +233,12 @@ pub async fn pull_mail(
             }
         }
 
-        // 4. Detect deletions.
-        let remote_ids: HashSet<String> = remote_summaries
+        // 4. Detect deletions. `all_ids` is authoritative even when
+        //    `changed` was CHANGEDSINCE-filtered.
+        let remote_ids: HashSet<String> = list_result
+            .all_ids
             .iter()
-            .map(|m| filename_safe(&m.id))
+            .map(|id| filename_safe(id))
             .collect();
         for local_id in local_meta.keys() {
             if !remote_ids.contains(local_id) {
@@ -257,9 +257,24 @@ pub async fn pull_mail(
                 summary.deleted += 1;
             }
         }
-        // Keep `remote_by_id` in scope until after the delete pass so the
-        // compiler knows it's still alive (unused after here).
-        drop(remote_by_id);
+        // 5. Write/update _folder.json with the latest CONDSTORE state so
+        //    the next pull can pass a stable since_modseq hint. We fold
+        //    the source-returned ListResult values into the Folder from
+        //    list_folders() — REST populates modify_index/uid_validity up
+        //    front; IMAP leaves them None and we fill them here from
+        //    ListResult.
+        let mut folder_meta = f.clone();
+        if list_result.highest_modseq.is_some() {
+            folder_meta.modify_index = list_result.highest_modseq;
+        }
+        if list_result.uid_validity.is_some() {
+            folder_meta.uid_validity = list_result.uid_validity;
+        }
+        let folder_manifest_path = format!("{folder_dir}/_folder.json");
+        repo.write_file(
+            &folder_manifest_path,
+            serde_json::to_vec_pretty(&folder_meta)?.as_slice(),
+        )?;
     }
 
     // Also detect folder removals: local folder dir exists but not in remote list
@@ -271,6 +286,23 @@ pub async fn pull_mail(
     );
     summary.commit_sha = repo.commit_all(author_name, author_email, &msg)?;
     Ok(summary)
+}
+
+/// Load the previously written `_folder.json` (if any) and extract the
+/// `(uid_validity, modify_index)` pair. Used to feed CONDSTORE hints back
+/// into the source on the next pull. Returns `(None, None)` if the file
+/// doesn't exist or is malformed — the source will just do a full fetch.
+fn read_prev_folder_state(repo: &Repo, folder_dir: &str) -> (Option<i64>, Option<i64>) {
+    let path = repo.root().join(format!("{folder_dir}/_folder.json"));
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (None, None);
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return (None, None);
+    };
+    let uid_validity = val.get("uid_validity").and_then(|v| v.as_i64());
+    let modify_index = val.get("modify_index").and_then(|v| v.as_i64());
+    (uid_validity, modify_index)
 }
 
 fn read_local_message_meta(
@@ -507,6 +539,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn read_prev_folder_state_reads_uid_validity_and_modify_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        let folder_dir = "sources/forwardemail/alias/mail/INBOX";
+        let body = serde_json::json!({
+            "id": "INBOX",
+            "path": "INBOX",
+            "name": "INBOX",
+            "uid_validity": 42,
+            "modify_index": 9001,
+            "subscribed": true
+        });
+        repo.write_file(
+            format!("{folder_dir}/_folder.json"),
+            serde_json::to_vec(&body).unwrap().as_slice(),
+        )
+        .unwrap();
+
+        let (uv, mi) = read_prev_folder_state(&repo, folder_dir);
+        assert_eq!(uv, Some(42));
+        assert_eq!(mi, Some(9001));
+    }
+
+    #[test]
+    fn read_prev_folder_state_missing_file_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        let (uv, mi) = read_prev_folder_state(&repo, "sources/forwardemail/alias/mail/INBOX");
+        assert_eq!((uv, mi), (None, None));
     }
 
     #[test]

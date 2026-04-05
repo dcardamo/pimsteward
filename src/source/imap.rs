@@ -26,7 +26,7 @@
 
 use crate::error::Error;
 use crate::forwardemail::mail::{Folder, MessageSummary};
-use crate::source::traits::{FetchedMessage, MailSource};
+use crate::source::traits::{FetchedMessage, ListResult, MailSource};
 use async_imap::Session;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -202,22 +202,67 @@ impl MailSource for ImapMailSource {
         result
     }
 
-    async fn list_messages(&self, folder: &str) -> Result<Vec<MessageSummary>, Error> {
+    async fn list_messages(
+        &self,
+        folder: &str,
+        since_modseq: Option<i64>,
+        uid_validity_hint: Option<i64>,
+    ) -> Result<ListResult, Error> {
         let mut guard = self.session_guard().await?;
         let session = guard.as_mut().expect("session present");
-        let result: Result<Vec<MessageSummary>, Error> = async {
+        let result: Result<ListResult, Error> = async {
             let mailbox = session
                 .examine(folder)
                 .await
                 .map_err(|e| Error::store(format!("IMAP EXAMINE {folder}: {e}")))?;
 
+            let server_uid_validity = mailbox.uid_validity.map(|v| v as i64);
+            let server_highest = mailbox.highest_modseq.map(|v| v as i64);
+
             if mailbox.exists == 0 {
-                return Ok(Vec::new());
+                return Ok(ListResult {
+                    all_ids: Vec::new(),
+                    changed: Vec::new(),
+                    highest_modseq: server_highest,
+                    uid_validity: server_uid_validity,
+                });
             }
 
-            // FETCH 1:* UID FLAGS MODSEQ — summary fields only, no bodies.
+            // CONDSTORE delta sync is only valid when the mailbox's
+            // UIDVALIDITY matches what the caller stored. If it's
+            // mismatched (or the caller has no stored value), fall back to
+            // a full fetch and let the caller persist the new UIDVALIDITY.
+            let use_changedsince = matches!(
+                (since_modseq, uid_validity_hint, server_uid_validity),
+                (Some(_), Some(h), Some(s)) if h == s
+            );
+
+            // Always enumerate the full UID set so the caller can detect
+            // deletions. UID SEARCH ALL is cheap — server returns just a
+            // list of numbers.
+            let all_uids: Vec<u32> = {
+                let search = session
+                    .uid_search("ALL")
+                    .await
+                    .map_err(|e| Error::store(format!("IMAP UID SEARCH ALL: {e}")))?;
+                let mut v: Vec<u32> = search.into_iter().collect();
+                v.sort_unstable();
+                v
+            };
+            let all_ids: Vec<String> = all_uids.iter().map(|u| format!("imap-{u}")).collect();
+
+            // Build the FETCH range. With CHANGEDSINCE, FETCH 1:* returns
+            // only messages whose modseq > <hint>. Without, we fetch
+            // everything.
+            let fetch_cmd = if use_changedsince {
+                let m = since_modseq.expect("checked above");
+                format!("(UID FLAGS MODSEQ INTERNALDATE RFC822.SIZE) (CHANGEDSINCE {m})")
+            } else {
+                "(UID FLAGS MODSEQ INTERNALDATE RFC822.SIZE)".to_string()
+            };
+
             let messages = session
-                .fetch("1:*", "(UID FLAGS MODSEQ INTERNALDATE RFC822.SIZE)")
+                .fetch("1:*", &fetch_cmd)
                 .await
                 .map_err(|e| Error::store(format!("IMAP FETCH summaries: {e}")))?;
             let collected: Vec<async_imap::types::Fetch> = messages
@@ -225,7 +270,7 @@ impl MailSource for ImapMailSource {
                 .await
                 .map_err(|e| Error::store(format!("IMAP FETCH collect: {e}")))?;
 
-            let summaries = collected
+            let changed: Vec<MessageSummary> = collected
                 .iter()
                 .filter_map(|m| {
                     let uid = m.uid?;
@@ -233,7 +278,7 @@ impl MailSource for ImapMailSource {
                     Some(MessageSummary {
                         // Synthetic id: `imap-<uid>`. Deployments must not
                         // mix REST and IMAP read sources against the same
-                        // backup tree — filenames are in a single namespace.
+                        // backup tree — filenames share a namespace.
                         id: format!("imap-{uid}"),
                         folder_id: folder.to_string(),
                         folder_path: folder.to_string(),
@@ -246,7 +291,22 @@ impl MailSource for ImapMailSource {
                     })
                 })
                 .collect();
-            Ok(summaries)
+
+            tracing::debug!(
+                folder,
+                used_changedsince = use_changedsince,
+                since = since_modseq,
+                all = all_ids.len(),
+                changed = changed.len(),
+                "IMAP list_messages"
+            );
+
+            Ok(ListResult {
+                all_ids,
+                changed,
+                highest_modseq: server_highest,
+                uid_validity: server_uid_validity,
+            })
         }
         .await;
         if result.is_err() {

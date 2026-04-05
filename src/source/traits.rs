@@ -26,11 +26,46 @@ pub struct FetchedMessage {
     pub extra: Option<serde_json::Value>,
 }
 
+/// Result of enumerating a folder. The split between `all_ids` and
+/// `changed` is what lets CONDSTORE-capable sources (IMAP) return only
+/// messages that have changed since the caller's last sync, while still
+/// giving the caller enough information to detect deletions.
+#[derive(Debug, Clone, Default)]
+pub struct ListResult {
+    /// Authoritative set of message ids currently in the folder. The
+    /// caller diffs this against local state to detect deletions.
+    pub all_ids: Vec<String>,
+    /// Message summaries the caller should consider for refetch. If the
+    /// source doesn't support CONDSTORE (or the caller passed
+    /// `since_modseq = None`), this contains every message. With a
+    /// CHANGEDSINCE hint, it's the server-filtered delta.
+    pub changed: Vec<MessageSummary>,
+    /// New HIGHESTMODSEQ observed. Callers persist this and pass it back
+    /// as `since_modseq` next time. `None` means the source doesn't
+    /// surface a mailbox-level modseq (REST).
+    pub highest_modseq: Option<i64>,
+    /// UIDVALIDITY at fetch time. If this differs from the caller's
+    /// stored value, the stored `since_modseq` is invalid and the caller
+    /// must do a full resync.
+    pub uid_validity: Option<i64>,
+}
+
 #[async_trait]
 pub trait MailSource: Send + Sync {
     fn tag(&self) -> &'static str;
     async fn list_folders(&self) -> Result<Vec<Folder>, Error>;
-    async fn list_messages(&self, folder: &str) -> Result<Vec<MessageSummary>, Error>;
+    /// Enumerate a folder. `since_modseq` and `uid_validity` are hints
+    /// from the caller's previous sync — sources that support CONDSTORE
+    /// use them to reduce the FETCH to only changed messages. Sources
+    /// that don't may ignore them. If `uid_validity` doesn't match the
+    /// server's current value, the source MUST ignore `since_modseq` and
+    /// return a full list.
+    async fn list_messages(
+        &self,
+        folder: &str,
+        since_modseq: Option<i64>,
+        uid_validity: Option<i64>,
+    ) -> Result<ListResult, Error>;
     async fn fetch_message(&self, folder: &str, id: &str) -> Result<FetchedMessage, Error>;
 }
 
