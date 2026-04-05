@@ -1,0 +1,27 @@
+# Example pimsteward config targeting the dotfiles_mcp_test@purpose.dev alias
+# on saturn. Credentials are delivered by dotvault to the pimsteward-scoped
+# fake-home at /var/lib/pimsteward-secrets/, which is isolated from rockycc
+# and from the regular dan-user import.
+#
+# Run with:
+#     pimsteward --config examples/saturn-test.toml probe
+#     pimsteward --config examples/saturn-test.toml pull-contacts
+#     pimsteward --config examples/saturn-test.toml pull-sieve
+
+log_level = "info"
+
+[forwardemail]
+api_base = "https://api.forwardemail.net"
+alias_user_file = "/var/lib/pimsteward-secrets/.config/secrets/pimsteward-test-alias-user"
+alias_password_file = "/var/lib/pimsteward-secrets/.config/secrets/pimsteward-test-alias-password"
+
+[storage]
+# Uses /tmp for the test account. Production will use
+# /data/Backups/saturn/pimsteward/dan_hld_ca/ under dan@hld.ca credentials.
+repo_path = "/tmp/pimsteward-test-repo"
+
+[permissions]
+email    = "read"
+calendar = "read"
+contacts = "read_write"
+sieve    = "read_write"
