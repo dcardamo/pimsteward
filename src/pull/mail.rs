@@ -170,7 +170,10 @@ pub async fn pull_mail(
     //    (uid_validity, highest_modseq) the source returns.
     let folders = source.list_folders().await?;
 
-    // 2. Per-folder message sync
+    // 2. Per-folder message sync. Each folder commits independently so
+    //    large mailboxes make incremental progress — a crash mid-sync
+    //    loses at most one folder's work, and git history records each
+    //    folder's state as it's captured.
     for f in &folders {
         let folder_dir = format!(
             "sources/forwardemail/{}/mail/{}",
@@ -178,6 +181,9 @@ pub async fn pull_mail(
             folder_safe(&f.path)
         );
         let local_meta = read_local_message_meta(repo, &folder_dir)?;
+        let mut folder_added = 0usize;
+        let mut folder_updated = 0usize;
+        let mut folder_deleted = 0usize;
 
         // Build a reverse index: source-specific id → canonical filename
         // stem. This lets us match remote summaries (keyed by source id)
@@ -260,9 +266,9 @@ pub async fn pull_mail(
             }
 
             if prev.is_some() {
-                summary.updated += 1;
+                folder_updated += 1;
             } else {
-                summary.added += 1;
+                folder_added += 1;
             }
         }
 
@@ -290,15 +296,11 @@ pub async fn pull_mail(
                     repo.root()
                         .join(format!("{folder_dir}/{canonical}.attachments.json")),
                 );
-                summary.deleted += 1;
+                folder_deleted += 1;
             }
         }
         // 5. Write/update _folder.json with the latest CONDSTORE state so
-        //    the next pull can pass a stable since_modseq hint. We fold
-        //    the source-returned ListResult values into the Folder from
-        //    list_folders() — REST populates modify_index/uid_validity up
-        //    front; IMAP leaves them None and we fill them here from
-        //    ListResult.
+        //    the next pull can pass a stable since_modseq hint.
         let mut folder_meta = f.clone();
         if list_result.highest_modseq.is_some() {
             folder_meta.modify_index = list_result.highest_modseq;
@@ -311,16 +313,41 @@ pub async fn pull_mail(
             &folder_manifest_path,
             serde_json::to_vec_pretty(&folder_meta)?.as_slice(),
         )?;
+
+        // 6. Commit this folder's changes immediately. On a large initial
+        //    sync this means each folder is a separate git commit —
+        //    partial progress is preserved across crashes and the git
+        //    history shows per-folder snapshots.
+        summary.added += folder_added;
+        summary.updated += folder_updated;
+        summary.deleted += folder_deleted;
+        if folder_added > 0 || folder_updated > 0 || folder_deleted > 0 {
+            let folder_msg = format!(
+                "mail/{}: +{} ~{} -{}",
+                folder_safe(&f.path),
+                folder_added,
+                folder_updated,
+                folder_deleted
+            );
+            if let Some(sha) = repo.commit_all(author_name, author_email, &folder_msg)? {
+                summary.commit_sha = Some(sha);
+            }
+        }
     }
 
-    // Also detect folder removals: local folder dir exists but not in remote list
+    // Detect folder removals and commit if anything was cleaned up.
     cleanup_removed_folders(repo, alias, &folders)?;
-
+    // Final commit captures folder removals + any stragglers. If all
+    // folders already committed their changes above, this is a no-op.
     let msg = format!(
         "mail: +{} ~{} -{}",
         summary.added, summary.updated, summary.deleted
     );
-    summary.commit_sha = repo.commit_all(author_name, author_email, &msg)?;
+    // Only overwrite if the final commit actually produced a new sha
+    // (folder removals or other stragglers). Per-folder shas are preserved.
+    if let Some(sha) = repo.commit_all(author_name, author_email, &msg)? {
+        summary.commit_sha = Some(sha);
+    }
     Ok(summary)
 }
 
