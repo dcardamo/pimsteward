@@ -136,7 +136,7 @@ impl PimstewardServer {
             .inner
             .repo
             .root()
-            .join(format!("sources/forwardemail/{}/mail", self.inner.alias));
+            .join("mail");
         if !mail_root.exists() {
             return Err(McpError::invalid_params(
                 format!("no mail tree for alias {}", self.inner.alias),
@@ -236,8 +236,7 @@ pub struct ListEventsParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct HistoryParams {
     /// Path within the backup tree, e.g.
-    /// `sources/forwardemail/dan-hld.ca/calendars/` or
-    /// `sources/forwardemail/dan-hld.ca/mail/INBOX/abc.json`.
+    /// `calendars/` or `mail/INBOX/abc.json`.
     pub path: String,
     /// Max number of commits to return (default 20, max 200).
     #[serde(default)]
@@ -495,7 +494,7 @@ pub struct DeleteEventParams {
 pub struct RestoreContactDryRunParams {
     /// iCard UID of the contact (the filename stem in the backup tree).
     /// Find it via list_contacts (uid field) or history (path like
-    /// `sources/.../contacts/default/<uid>.vcf`).
+    /// `contacts/default/<uid>.vcf`).
     pub contact_uid: String,
     /// Git commit SHA to restore from. Use the `history` tool to find
     /// candidate commits.
@@ -574,10 +573,8 @@ pub struct RestoreMailApplyParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestorePathDryRunParams {
-    /// Backup-tree path prefix to restore, e.g.
-    /// `sources/forwardemail/<alias>/contacts/` to restore all contacts,
-    /// or `sources/forwardemail/<alias>/calendars/<id>/events/` for one
-    /// calendar.
+    /// Backup-tree path prefix to restore, e.g. `contacts/` to restore
+    /// all contacts, or `calendars/<id>/events/` for one calendar.
     pub path_prefix: String,
     /// Git commit SHA to restore from.
     pub at_sha: String,
@@ -660,7 +657,7 @@ impl PimstewardServer {
             .inner
             .repo
             .root()
-            .join(format!("sources/forwardemail/{}/mail", self.inner.alias));
+            .join("mail");
         let folder_safe = folder.replace('/', "_");
         let eml_path = mail_root.join(&folder_safe).join(format!("{}.eml", p.id));
 

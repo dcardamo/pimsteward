@@ -35,11 +35,11 @@ pub enum SieveOperation {
 pub async fn plan_sieve(
     client: &Client,
     repo: &Repo,
-    alias: &str,
+    _alias: &str,
     script_name: &str,
     at_sha: &str,
 ) -> Result<(SieveRestorePlan, String), Error> {
-    let rel_path = format!("sources/forwardemail/{alias}/sieve/{script_name}.sieve");
+    let rel_path = format!("sieve/{script_name}.sieve");
     let historical = String::from_utf8_lossy(&read_git_blob(repo, at_sha, &rel_path)?).into_owned();
 
     let live = client.list_sieve_scripts().await?;

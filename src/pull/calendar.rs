@@ -150,15 +150,11 @@ fn event_key(e: &CalendarEvent) -> String {
     filename_safe(e.uid.as_deref().unwrap_or(&e.id))
 }
 
-fn calendar_dir(alias: &str, c: &Calendar) -> String {
+fn calendar_dir(_alias: &str, c: &Calendar) -> String {
     // Use calendar id as the directory name — names can change and collide,
     // ids are stable. The _calendar.json manifest inside records the
     // human-readable name + color + etc.
-    format!(
-        "sources/forwardemail/{}/calendars/{}",
-        alias,
-        filename_safe(&c.id)
-    )
+    format!("calendars/{}", filename_safe(&c.id))
 }
 
 fn read_local_event_meta(repo: &Repo, cal_dir: &str) -> Result<HashMap<String, EventMeta>, Error> {
@@ -185,12 +181,10 @@ fn read_local_event_meta(repo: &Repo, cal_dir: &str) -> Result<HashMap<String, E
 
 fn cleanup_removed_calendars(
     repo: &Repo,
-    alias: &str,
+    _alias: &str,
     current_dirs: &HashSet<String>,
 ) -> Result<(), Error> {
-    let cals_root = repo
-        .root()
-        .join(format!("sources/forwardemail/{alias}/calendars"));
+    let cals_root = repo.root().join("calendars");
     if !cals_root.exists() {
         return Ok(());
     }

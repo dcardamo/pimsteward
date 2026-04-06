@@ -9,7 +9,7 @@
 //!    list are deleted.
 //! 4. For each changed message, fetch the full response, extract the
 //!    `raw` field (byte-identical RFC822), write it to
-//!    `mail/<folder_path>/<msg_id>.eml` (write-once, immutable). Write the
+//!    `mail/<folder>/<msg_id>.eml` (write-once, immutable). Write the
 //!    mutable metadata (flags, folder, modseq, uid, updated_at, etc.) to
 //!    a sidecar `<msg_id>.meta.json`.
 //! 5. Atomic commit.
@@ -156,7 +156,7 @@ impl MessageMeta {
 pub async fn pull_mail(
     source: &dyn MailSource,
     repo: &Repo,
-    alias: &str,
+    _alias: &str,
     author_name: &str,
     author_email: &str,
 ) -> PullResult<PullSummary> {
@@ -175,11 +175,7 @@ pub async fn pull_mail(
     //    loses at most one folder's work, and git history records each
     //    folder's state as it's captured.
     for f in &folders {
-        let folder_dir = format!(
-            "sources/forwardemail/{}/mail/{}",
-            alias,
-            folder_safe(&f.path)
-        );
+        let folder_dir = format!("mail/{}", folder_safe(&f.path));
         let local_meta = read_local_message_meta(repo, &folder_dir)?;
         let mut folder_added = 0usize;
         let mut folder_updated = 0usize;
@@ -253,7 +249,7 @@ pub async fn pull_mail(
             // a sidecar. REST-only — IMAP's `extra` is None.
             let attachments_sidecar = format!("{folder_dir}/{canonical}.attachments.json");
             let attachments_sidecar_fs = repo.root().join(&attachments_sidecar);
-            match extract_attachments(&fetched, alias, repo)? {
+            match extract_attachments(&fetched, repo)? {
                 Some(refs) if !refs.is_empty() => {
                     repo.write_file(
                         &attachments_sidecar,
@@ -336,7 +332,7 @@ pub async fn pull_mail(
     }
 
     // Detect folder removals and commit if anything was cleaned up.
-    cleanup_removed_folders(repo, alias, &folders)?;
+    cleanup_removed_folders(repo, &folders)?;
     // Final commit captures folder removals + any stragglers. If all
     // folders already committed their changes above, this is a no-op.
     let msg = format!(
@@ -393,10 +389,8 @@ fn read_local_message_meta(
     Ok(out)
 }
 
-fn cleanup_removed_folders(repo: &Repo, alias: &str, folders: &[Folder]) -> Result<(), Error> {
-    let mail_root = repo
-        .root()
-        .join(format!("sources/forwardemail/{alias}/mail"));
+fn cleanup_removed_folders(repo: &Repo, folders: &[Folder]) -> Result<(), Error> {
+    let mail_root = repo.root().join("mail");
     if !mail_root.exists() {
         return Ok(());
     }
@@ -494,7 +488,6 @@ fn extract_message_id_header(raw: &[u8]) -> Option<String> {
 /// of the pulled state.
 fn extract_attachments(
     fetched: &crate::source::FetchedMessage,
-    alias: &str,
     repo: &Repo,
 ) -> Result<Option<Vec<AttachmentRef>>, Error> {
     let Some(extra) = fetched.extra.as_ref() else {
@@ -526,7 +519,7 @@ fn extract_attachments(
         hasher.update(&bytes);
         let sha = format!("{:x}", hasher.finalize());
 
-        let blob_path = format!("sources/forwardemail/{alias}/mail/_attachments/{sha}");
+        let blob_path = format!("mail/_attachments/{sha}");
         // Write-once: if a blob with the same content hash already exists on
         // disk the write is a no-op, which keeps the repo churn-free.
         if !repo.root().join(&blob_path).exists() {
@@ -623,7 +616,7 @@ mod tests {
             extra: Some(extra),
         };
 
-        let refs = extract_attachments(&fetched, "alias", &repo)
+        let refs = extract_attachments(&fetched, &repo)
             .unwrap()
             .unwrap();
         assert_eq!(refs.len(), 2);
@@ -636,7 +629,7 @@ mod tests {
 
         let blob = repo
             .root()
-            .join(format!("sources/forwardemail/alias/mail/_attachments/{}", refs[0].sha256));
+            .join(format!("mail/_attachments/{}", refs[0].sha256));
         assert!(blob.exists());
         assert_eq!(std::fs::read(&blob).unwrap(), b"hello world");
     }
@@ -650,7 +643,7 @@ mod tests {
             raw: b"".to_vec(),
             extra: None,
         };
-        assert!(extract_attachments(&fetched, "alias", &repo)
+        assert!(extract_attachments(&fetched, &repo)
             .unwrap()
             .is_none());
     }
@@ -664,7 +657,7 @@ mod tests {
             raw: b"".to_vec(),
             extra: Some(serde_json::json!({})),
         };
-        let refs = extract_attachments(&fetched, "alias", &repo)
+        let refs = extract_attachments(&fetched, &repo)
             .unwrap()
             .unwrap();
         assert!(refs.is_empty());
@@ -674,7 +667,7 @@ mod tests {
     fn read_prev_folder_state_reads_uid_validity_and_modify_index() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::open_or_init(tmp.path()).unwrap();
-        let folder_dir = "sources/forwardemail/alias/mail/INBOX";
+        let folder_dir = "mail/INBOX";
         let body = serde_json::json!({
             "id": "INBOX",
             "path": "INBOX",
@@ -698,7 +691,7 @@ mod tests {
     fn read_prev_folder_state_missing_file_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::open_or_init(tmp.path()).unwrap();
-        let (uv, mi) = read_prev_folder_state(&repo, "sources/forwardemail/alias/mail/INBOX");
+        let (uv, mi) = read_prev_folder_state(&repo, "mail/INBOX");
         assert_eq!((uv, mi), (None, None));
     }
 

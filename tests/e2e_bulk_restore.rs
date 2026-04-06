@@ -150,7 +150,7 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     .expect("bad event update");
 
     // 4. Bulk restore across the whole alias subtree
-    let path_prefix = format!("sources/forwardemail/{}/", ctx.alias_slug());
+    let path_prefix = "".to_string();
     let (plan, token) = restore::bulk::plan_bulk(
         &ctx.client,
         &ctx.repo,

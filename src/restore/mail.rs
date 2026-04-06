@@ -53,7 +53,7 @@ pub enum MailOperation {
 pub async fn plan_mail(
     client: &Client,
     repo: &Repo,
-    alias: &str,
+    _alias: &str,
     folder: &str,
     message_id: &str,
     at_sha: &str,
@@ -67,7 +67,7 @@ pub async fn plan_mail(
     // and legacy source-named backup trees.
     let meta_path = {
         let direct =
-            format!("sources/forwardemail/{alias}/mail/{folder_safe}/{message_id}.meta.json");
+            format!("mail/{folder_safe}/{message_id}.meta.json");
         if read_git_blob(repo, at_sha, &direct).is_ok() {
             direct
         } else {
@@ -77,7 +77,7 @@ pub async fn plan_mail(
             // but the historical path (at_sha) uses the specified folder.
             let mail_root = repo
                 .root()
-                .join(format!("sources/forwardemail/{alias}/mail"));
+                .join("mail".to_string());
             let mut found = None;
             'outer: for folder_entry in std::fs::read_dir(&mail_root).into_iter().flatten().flatten() {
                 let fname = folder_entry.file_name().into_string().unwrap_or_default();
@@ -96,7 +96,7 @@ pub async fn plan_mail(
                                 // Use the REQUESTED folder (from the historical
                                 // path at at_sha), not the current folder.
                                 found = Some(format!(
-                                    "sources/forwardemail/{alias}/mail/{folder_safe}/{stem}.meta.json"
+                                    "mail/{folder_safe}/{stem}.meta.json"
                                 ));
                                 break 'outer;
                             }
@@ -107,8 +107,7 @@ pub async fn plan_mail(
             // If HEAD scan failed (message deleted), scan at at_sha using
             // git ls-tree to find meta.json files in the historical folder.
             if found.is_none() {
-                let tree_path =
-                    format!("sources/forwardemail/{alias}/mail/{folder_safe}");
+                let tree_path = format!("mail/{folder_safe}");
                 if let Ok(out) = Command::new("git")
                     .args(["ls-tree", "--name-only", at_sha, &format!("{tree_path}/")])
                     .current_dir(repo.root())

@@ -87,7 +87,7 @@ pub async fn plan_bulk(
     for file in &files {
         let path = file.as_str();
 
-        // Contact vCards: sources/forwardemail/<alias>/contacts/default/<uid>.vcf
+        // Contact vCards: contacts/default/<uid>.vcf
         if let Some(uid) = extract_contact_uid(path, alias) {
             let (plan, _token) =
                 crate::restore::contacts::plan_contact(client, repo, alias, &uid, at_sha).await?;
@@ -95,7 +95,7 @@ pub async fn plan_bulk(
             continue;
         }
 
-        // Sieve scripts: sources/forwardemail/<alias>/sieve/<name>.sieve
+        // Sieve scripts: sieve/<name>.sieve
         if let Some(name) = extract_sieve_name(path, alias) {
             let (plan, _token) =
                 crate::restore::sieve::plan_sieve(client, repo, alias, &name, at_sha).await?;
@@ -103,7 +103,7 @@ pub async fn plan_bulk(
             continue;
         }
 
-        // Calendar events: sources/forwardemail/<alias>/calendars/<cal>/events/<uid>.ics
+        // Calendar events: calendars/<cal>/events/<uid>.ics
         if let Some((cal_id, event_uid)) = extract_calendar_event(path, alias) {
             let (plan, _token) = crate::restore::calendar::plan_calendar(
                 client, repo, alias, &cal_id, &event_uid, at_sha,
@@ -245,29 +245,24 @@ fn ls_tree_files(repo: &Repo, sha: &str, prefix: &str) -> Result<Vec<String>, Er
         .collect())
 }
 
-/// Extract the contact UID from a path like
-/// `sources/forwardemail/<alias>/contacts/default/<uid>.vcf`.
-fn extract_contact_uid(path: &str, alias: &str) -> Option<String> {
-    let prefix = format!("sources/forwardemail/{alias}/contacts/default/");
-    let rest = path.strip_prefix(&prefix)?;
+/// Extract the contact UID from a path like `contacts/default/<uid>.vcf`.
+fn extract_contact_uid(path: &str, _alias: &str) -> Option<String> {
+    let rest = path.strip_prefix("contacts/default/")?;
     let uid = rest.strip_suffix(".vcf")?;
     Some(uid.to_string())
 }
 
-/// Extract the sieve script name from a path like
-/// `sources/forwardemail/<alias>/sieve/<name>.sieve`.
-fn extract_sieve_name(path: &str, alias: &str) -> Option<String> {
-    let prefix = format!("sources/forwardemail/{alias}/sieve/");
-    let rest = path.strip_prefix(&prefix)?;
+/// Extract the sieve script name from a path like `sieve/<name>.sieve`.
+fn extract_sieve_name(path: &str, _alias: &str) -> Option<String> {
+    let rest = path.strip_prefix("sieve/")?;
     let name = rest.strip_suffix(".sieve")?;
     Some(name.to_string())
 }
 
 /// Extract (calendar_id, event_uid) from a path like
-/// `sources/forwardemail/<alias>/calendars/<cal>/events/<uid>.ics`.
-fn extract_calendar_event(path: &str, alias: &str) -> Option<(String, String)> {
-    let prefix = format!("sources/forwardemail/{alias}/calendars/");
-    let rest = path.strip_prefix(&prefix)?;
+/// `calendars/<cal>/events/<uid>.ics`.
+fn extract_calendar_event(path: &str, _alias: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("calendars/")?;
     let (cal_id, after) = rest.split_once('/')?;
     let event_file = after.strip_prefix("events/")?;
     let event_uid = event_file.strip_suffix(".ics")?;
@@ -288,14 +283,11 @@ mod tests {
     #[test]
     fn extract_contact_uid_works() {
         assert_eq!(
-            extract_contact_uid(
-                "sources/forwardemail/test/contacts/default/uid-1.vcf",
-                "test"
-            ),
+            extract_contact_uid("contacts/default/uid-1.vcf", "test"),
             Some("uid-1".into())
         );
         assert_eq!(
-            extract_contact_uid("sources/forwardemail/test/mail/INBOX/foo.json", "test"),
+            extract_contact_uid("mail/INBOX/foo.json", "test"),
             None
         );
     }
@@ -303,7 +295,7 @@ mod tests {
     #[test]
     fn extract_sieve_name_works() {
         assert_eq!(
-            extract_sieve_name("sources/forwardemail/test/sieve/filter1.sieve", "test"),
+            extract_sieve_name("sieve/filter1.sieve", "test"),
             Some("filter1".into())
         );
     }
@@ -311,10 +303,7 @@ mod tests {
     #[test]
     fn extract_calendar_event_works() {
         assert_eq!(
-            extract_calendar_event(
-                "sources/forwardemail/test/calendars/cal-1/events/uid-1.ics",
-                "test"
-            ),
+            extract_calendar_event("calendars/cal-1/events/uid-1.ics", "test"),
             Some(("cal-1".into(), "uid-1".into()))
         );
     }
@@ -322,11 +311,11 @@ mod tests {
     #[test]
     fn no_false_positives() {
         assert_eq!(
-            extract_contact_uid("sources/forwardemail/test/sieve/script.sieve", "test"),
+            extract_contact_uid("sieve/script.sieve", "test"),
             None
         );
         assert_eq!(
-            extract_sieve_name("sources/forwardemail/test/contacts/default/uid.vcf", "test"),
+            extract_sieve_name("contacts/default/uid.vcf", "test"),
             None
         );
     }
@@ -339,24 +328,24 @@ mod tests {
 
     #[test]
     fn validate_path_prefix_accepts_normal_paths() {
-        assert!(validate_path_prefix("sources/forwardemail/foo/contacts/").is_ok());
-        assert!(validate_path_prefix("sources/forwardemail/foo/").is_ok());
+        assert!(validate_path_prefix("contacts/").is_ok());
+        assert!(validate_path_prefix("mail/").is_ok());
         assert!(validate_path_prefix("").is_ok()); // whole repo
-        assert!(validate_path_prefix("sources/forwardemail/foo/calendars/cal-1/events/").is_ok());
+        assert!(validate_path_prefix("calendars/cal-1/events/").is_ok());
     }
 
     #[test]
     fn validate_path_prefix_rejects_parent_dir_escape() {
         assert!(validate_path_prefix("..").is_err());
         assert!(validate_path_prefix("../etc/passwd").is_err());
-        assert!(validate_path_prefix("sources/../../../etc").is_err());
+        assert!(validate_path_prefix("mail/../../../etc").is_err());
     }
 
     #[test]
     fn validate_path_prefix_rejects_embedded_dotdot() {
         // Even as a substring — we don't try to be clever about trailing
         // slashes or normalized forms, we just refuse any occurrence.
-        assert!(validate_path_prefix("sources/..hidden/").is_err());
-        assert!(validate_path_prefix("sources/forwardemail/../other/").is_err());
+        assert!(validate_path_prefix("mail/..hidden/").is_err());
+        assert!(validate_path_prefix("calendars/../other/").is_err());
     }
 }

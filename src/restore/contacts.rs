@@ -56,11 +56,11 @@ pub enum RestoreOperation {
 pub async fn plan_contact(
     client: &Client,
     repo: &Repo,
-    alias: &str,
+    _alias: &str,
     contact_uid: &str,
     at_sha: &str,
 ) -> Result<(RestorePlan, String), Error> {
-    let rel_path = format!("sources/forwardemail/{alias}/contacts/default/{contact_uid}.meta.json");
+    let rel_path = format!("contacts/default/{contact_uid}.meta.json");
 
     // Read historical meta + vcard from the target commit using `git show`
     let historical_meta = read_git_blob(repo, at_sha, &rel_path)?;
@@ -72,7 +72,7 @@ pub async fn plan_contact(
     drop(historical_name);
 
     // Historical vCard for the full_name
-    let vcf_rel = format!("sources/forwardemail/{alias}/contacts/default/{contact_uid}.vcf");
+    let vcf_rel = format!("contacts/default/{contact_uid}.vcf");
     let historical_vcf =
         String::from_utf8_lossy(&read_git_blob(repo, at_sha, &vcf_rel)?).into_owned();
     let historical_full_name =

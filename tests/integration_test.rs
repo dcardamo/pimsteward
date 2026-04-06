@@ -67,7 +67,7 @@ async fn contacts_pull_creates_then_updates_then_deletes() {
     assert!(s1.commit_sha.is_some());
 
     let vcf1 = repo
-        .read_file("sources/forwardemail/test-alias/contacts/default/u1.vcf")
+        .read_file("contacts/default/u1.vcf")
         .unwrap();
     assert!(std::str::from_utf8(&vcf1).unwrap().contains("FN:Alice"));
 
@@ -110,13 +110,13 @@ async fn contacts_pull_creates_then_updates_then_deletes() {
 
     // Alice file now contains the updated vCard
     let vcf1b = repo
-        .read_file("sources/forwardemail/test-alias/contacts/default/u1.vcf")
+        .read_file("contacts/default/u1.vcf")
         .unwrap();
     assert!(std::str::from_utf8(&vcf1b).unwrap().contains("Alice Smith"));
 
     // Bob file is gone
     assert!(repo
-        .read_file("sources/forwardemail/test-alias/contacts/default/u2.vcf")
+        .read_file("contacts/default/u2.vcf")
         .is_err());
 
     // --- Third pull: no changes → no-op, no new commit ---
@@ -194,7 +194,7 @@ async fn sieve_pull_creates_then_detects_content_change() {
     assert!(s1.commit_sha.is_some());
 
     let body = repo
-        .read_file("sources/forwardemail/test-alias/sieve/filter1.sieve")
+        .read_file("sieve/filter1.sieve")
         .unwrap();
     assert!(std::str::from_utf8(&body)
         .unwrap()
@@ -230,7 +230,7 @@ async fn sieve_pull_creates_then_detects_content_change() {
     assert_eq!(s2.updated, 1);
     assert_eq!(s2.added, 0);
     let body2 = repo
-        .read_file("sources/forwardemail/test-alias/sieve/filter1.sieve")
+        .read_file("sieve/filter1.sieve")
         .unwrap();
     assert!(std::str::from_utf8(&body2)
         .unwrap()
@@ -313,7 +313,7 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
     // raw RFC822 is written as <canonical_id>.eml
     let eml = repo
         .read_file(format!(
-            "sources/forwardemail/test-alias/mail/INBOX/{canonical_m1}.eml"
+            "mail/INBOX/{canonical_m1}.eml"
         ))
         .unwrap();
     let eml_str = std::str::from_utf8(&eml).unwrap();
@@ -384,7 +384,7 @@ async fn mail_pull_handles_create_flag_change_and_delete() {
     .unwrap();
     assert_eq!(s3.deleted, 1, "missing-from-remote detected as deletion");
     assert!(repo
-        .read_file("sources/forwardemail/test-alias/mail/INBOX/m1.eml")
+        .read_file("mail/INBOX/m1.eml")
         .is_err());
 }
 
@@ -433,7 +433,7 @@ async fn calendar_pull_handles_events_with_raw_ical() {
     .unwrap();
     assert_eq!(s1.added, 1);
     let ics = repo
-        .read_file("sources/forwardemail/test-alias/calendars/cal-1/events/uid-1.ics")
+        .read_file("calendars/cal-1/events/uid-1.ics")
         .unwrap();
     assert!(std::str::from_utf8(&ics).unwrap().contains("SUMMARY:v1"));
 
@@ -464,7 +464,7 @@ async fn calendar_pull_handles_events_with_raw_ical() {
     assert_eq!(s2.updated, 1);
     assert_eq!(s2.added, 0);
     let ics2 = repo
-        .read_file("sources/forwardemail/test-alias/calendars/cal-1/events/uid-1.ics")
+        .read_file("calendars/cal-1/events/uid-1.ics")
         .unwrap();
     assert!(std::str::from_utf8(&ics2).unwrap().contains("SUMMARY:v2"));
 
@@ -485,6 +485,6 @@ async fn calendar_pull_handles_events_with_raw_ical() {
     .unwrap();
     assert_eq!(s3.deleted, 1);
     assert!(repo
-        .read_file("sources/forwardemail/test-alias/calendars/cal-1/events/uid-1.ics")
+        .read_file("calendars/cal-1/events/uid-1.ics")
         .is_err());
 }

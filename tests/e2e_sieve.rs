@@ -43,11 +43,7 @@ async fn sieve_install_update_delete_lifecycle() {
     let script_id = installed.id.clone();
 
     // .sieve file lands in git
-    let sieve_path = format!(
-        "sources/forwardemail/{}/sieve/{}.sieve",
-        ctx.alias_slug(),
-        name
-    );
+    let sieve_path = format!("sieve/{}.sieve", name);
     let body = String::from_utf8_lossy(&ctx.repo.read_file(&sieve_path).expect("sieve in repo"))
         .into_owned();
     assert!(body.contains("\"Junk\""));

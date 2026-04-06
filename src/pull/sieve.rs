@@ -24,7 +24,7 @@ pub async fn pull_sieve(
         full.push(one);
     }
 
-    let subdir = format!("sources/forwardemail/{}/sieve", alias);
+    let subdir = "sieve".to_string();
     let mut local_hashes = read_local_sieve_hashes(repo, alias)?;
     let mut seen = std::collections::HashSet::new();
     let mut summary = PullSummary {
@@ -94,11 +94,9 @@ fn content_sha256(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-fn read_local_sieve_hashes(repo: &Repo, alias: &str) -> Result<HashMap<String, String>, Error> {
+fn read_local_sieve_hashes(repo: &Repo, _alias: &str) -> Result<HashMap<String, String>, Error> {
     let mut out = HashMap::new();
-    let dir = repo
-        .root()
-        .join(format!("sources/forwardemail/{}/sieve", alias));
+    let dir = repo.root().join("sieve");
     if !dir.exists() {
         return Ok(out);
     }

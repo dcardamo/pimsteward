@@ -1492,7 +1492,7 @@ async fn bulk_restore_scoped_to_contacts_touches_only_contact_paths() {
     .expect("bad contact");
 
     // Bulk restore scoped to contacts path only.
-    let contacts_prefix = format!("sources/forwardemail/{}/contacts/", ctx.alias_slug());
+    let contacts_prefix = "contacts/".to_string();
     let (plan, token) = restore::bulk::plan_bulk(
         &ctx.client,
         &ctx.repo,

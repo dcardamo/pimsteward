@@ -72,12 +72,7 @@ async fn calendar_event_create_update_delete_lifecycle() {
     let event_id = created.id.clone();
 
     // .ics in repo
-    let ics_path = format!(
-        "sources/forwardemail/{}/calendars/{}/events/{}.ics",
-        ctx.alias_slug(),
-        calendar_id,
-        uid
-    );
+    let ics_path = format!("calendars/{}/events/{}.ics", calendar_id, uid);
     let ics =
         String::from_utf8_lossy(&ctx.repo.read_file(&ics_path).expect("ics in repo")).into_owned();
     assert!(ics.contains("SUMMARY:original summary"));

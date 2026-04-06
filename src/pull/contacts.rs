@@ -1,7 +1,7 @@
 //! Contact pull loop.
 //!
 //! Strategy: list all contacts, diff against the existing tree under
-//! `sources/forwardemail/<alias>/contacts/default/`, write new/changed vCards,
+//! `contacts/default/`, write new/changed vCards,
 //! remove deleted ones, commit as a single batch.
 //!
 //! vCard bytes come from the `content` field of the API response and are
@@ -31,9 +31,8 @@ struct ContactMeta {
 
 /// Run one pull cycle for contacts.
 ///
-/// `alias` is the forwardemail alias (used as the path segment under
-/// `sources/forwardemail/`). Typically the alias email with `@` replaced by
-/// `-`, e.g. `dan-hld.ca`.
+/// `alias` is the forwardemail alias (e.g. `dan-hld.ca`). Each account
+/// has its own repo, so the alias is not used in file paths.
 pub async fn pull_contacts(
     source: &dyn ContactsSource,
     repo: &Repo,
@@ -52,7 +51,7 @@ pub async fn pull_contacts(
         ..Default::default()
     };
 
-    let subdir = format!("sources/forwardemail/{}/contacts/default", alias);
+    let subdir = "contacts/default".to_string();
 
     // Upserts
     for c in &remote {
@@ -102,11 +101,9 @@ pub async fn pull_contacts(
     Ok(summary)
 }
 
-fn read_local_contacts(repo: &Repo, alias: &str) -> Result<HashMap<String, ContactMeta>, Error> {
+fn read_local_contacts(repo: &Repo, _alias: &str) -> Result<HashMap<String, ContactMeta>, Error> {
     let mut out = HashMap::new();
-    let dir: PathBuf = repo
-        .root()
-        .join(format!("sources/forwardemail/{}/contacts/default", alias));
+    let dir: PathBuf = repo.root().join("contacts/default");
     if !dir.exists() {
         return Ok(out);
     }

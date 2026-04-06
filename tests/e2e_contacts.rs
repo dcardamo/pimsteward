@@ -57,11 +57,7 @@ async fn contact_create_update_delete_lifecycle() {
     let contact_uid = created.uid.clone();
 
     // 3. Verify the .vcf is in the git tree
-    let vcf_path = format!(
-        "sources/forwardemail/{}/contacts/default/{}.vcf",
-        ctx.alias_slug(),
-        contact_uid
-    );
+    let vcf_path = format!("contacts/default/{}.vcf", contact_uid);
     let vcf_bytes = ctx.repo.read_file(&vcf_path).expect("vcf in repo");
     let vcf = String::from_utf8_lossy(&vcf_bytes);
     assert!(

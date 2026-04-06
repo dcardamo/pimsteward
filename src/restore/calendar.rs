@@ -44,13 +44,12 @@ pub enum CalendarOperation {
 pub async fn plan_calendar(
     client: &Client,
     repo: &Repo,
-    alias: &str,
+    _alias: &str,
     calendar_id: &str,
     event_uid: &str,
     at_sha: &str,
 ) -> Result<(CalendarRestorePlan, String), Error> {
-    let rel_path =
-        format!("sources/forwardemail/{alias}/calendars/{calendar_id}/events/{event_uid}.ics");
+    let rel_path = format!("calendars/{calendar_id}/events/{event_uid}.ics");
     let historical_ical =
         String::from_utf8_lossy(&read_git_blob(repo, at_sha, &rel_path)?).into_owned();
 
