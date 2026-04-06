@@ -33,12 +33,38 @@ use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use std::sync::Arc;
 use std::time::Duration;
+use socket2::SockRef;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+
+/// TCP keepalive interval. Sends a probe every 60 seconds on an idle
+/// connection, which prevents NAT/firewall/load-balancer timeouts from
+/// silently dropping the socket. Without this, forwardemail.net's
+/// infrastructure closes idle connections after a few minutes — breaking
+/// both the cached puller session and the IDLE long-poll.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
+/// Open a TcpStream with SO_KEEPALIVE enabled before handing it to TLS.
+async fn tcp_connect_with_keepalive(host: &str, port: u16) -> Result<TcpStream, Error> {
+    let tcp = TcpStream::connect((host, port))
+        .await
+        .map_err(|e| Error::config(format!("IMAP TCP connect: {e}")))?;
+
+    let sock = SockRef::from(&tcp);
+    let ka = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE);
+    // with_interval is Linux-only; set it when available so probes
+    // repeat at the same cadence if the first goes unanswered.
+    #[cfg(target_os = "linux")]
+    let ka = ka.with_interval(TCP_KEEPALIVE);
+    sock.set_tcp_keepalive(&ka)
+        .map_err(|e| Error::config(format!("TCP keepalive: {e}")))?;
+
+    Ok(tcp)
+}
 
 /// Configuration for connecting to an IMAP server.
 #[derive(Debug, Clone)]
@@ -97,10 +123,8 @@ impl ImapMailSource {
     }
 
     /// Establish a fresh IMAP connection + login. Called lazily by
-    /// `with_session` when no cached session is available.
+    /// `session_guard` when no cached session is available.
     async fn connect(&self) -> Result<ImapSession, Error> {
-        // TLS setup using rustls with webpki-roots. Matches pimsteward's
-        // reqwest TLS story so we have one TLS stack, not two.
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let tls_config = ClientConfig::builder()
@@ -108,9 +132,7 @@ impl ImapMailSource {
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(tls_config));
 
-        let tcp = TcpStream::connect((self.config.host.as_str(), self.config.port))
-            .await
-            .map_err(|e| Error::config(format!("IMAP TCP connect: {e}")))?;
+        let tcp = tcp_connect_with_keepalive(&self.config.host, self.config.port).await?;
         let server_name = ServerName::try_from(self.config.host.clone())
             .map_err(|e| Error::config(format!("IMAP server name: {e}")))?;
         let tls = connector
@@ -569,8 +591,7 @@ async fn run_one_idle_connection(
     notify: &Notify,
     ready: &IdleReady,
 ) -> Result<(), Error> {
-    // Connect using the same TLS path as ImapMailSource::connect. This is
-    // a dedicated connection; the puller's session is untouched.
+    // Dedicated connection; the puller's cached session is untouched.
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls_config = ClientConfig::builder()
@@ -578,9 +599,7 @@ async fn run_one_idle_connection(
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls_config));
 
-    let tcp = TcpStream::connect((config.host.as_str(), config.port))
-        .await
-        .map_err(|e| Error::config(format!("IDLE TCP connect: {e}")))?;
+    let tcp = tcp_connect_with_keepalive(&config.host, config.port).await?;
     let server_name = ServerName::try_from(config.host.clone())
         .map_err(|e| Error::config(format!("IDLE server name: {e}")))?;
     let tls = connector
