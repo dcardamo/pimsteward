@@ -426,11 +426,11 @@ git -C /var/lib/pimsteward log --all --grep='^tool: move_email$'
 
 # Everything the AI did to one folder's worth of mail.
 git -C /var/lib/pimsteward log --author='^ai$' -- \
-    'sources/forwardemail/*/mail/INBOX/'
+    'mail/INBOX/'
 
 # "Who last touched this calendar event?"
 git -C /var/lib/pimsteward blame \
-    sources/forwardemail/*/calendars/<cal_id>/events/<uid>.ics
+    calendars/<cal_id>/events/<uid>.ics
 ```
 
 Because the repo is just git, **everything you already know about git works
@@ -675,24 +675,23 @@ commits at a glance.
 ```
 /var/lib/pimsteward/
 ├── .git/
-└── sources/forwardemail/<alias_slug>/
-    ├── calendars/<cal_id>/
-    │   ├── _calendar.json               # calendar manifest (name, colour, ctag…)
-    │   └── events/
-    │       ├── <uid>.ics                # canonical event body
-    │       └── <uid>.meta.json          # etag, updated_at, sync hints
-    ├── contacts/default/                # one hard-coded book per alias
-    │   ├── <uid>.vcf
-    │   └── <uid>.meta.json
-    ├── mail/
-    │   ├── _attachments/<sha256>        # content-addressed, dedup across msgs
-    │   └── <folder_path>/               # folder path slugified, e.g. INBOX, Sent
-    │       ├── _folder.json             # uid_validity, modseq, last sync
-    │       ├── <canonical_id>.eml       # RFC822 body, immutable
-    │       └── <canonical_id>.meta.json # flags, source id, labels — mutable
-    └── sieve/
-        ├── <script_name>.sieve
-        └── <script_name>.meta.json
+├── calendars/<cal_id>/
+│   ├── _calendar.json               # calendar manifest (name, colour, ctag…)
+│   └── events/
+│       ├── <uid>.ics                # canonical event body
+│       └── <uid>.meta.json          # etag, updated_at, sync hints
+├── contacts/default/                # one hard-coded book per alias
+│   ├── <uid>.vcf
+│   └── <uid>.meta.json
+├── mail/
+│   ├── _attachments/<sha256>        # content-addressed, dedup across msgs
+│   └── <folder_path>/               # folder path slugified, e.g. INBOX, Sent
+│       ├── _folder.json             # uid_validity, modseq, last sync
+│       ├── <canonical_id>.eml       # RFC822 body, immutable
+│       └── <canonical_id>.meta.json # flags, source id, labels — mutable
+└── sieve/
+    ├── <script_name>.sieve
+    └── <script_name>.meta.json
 ```
 
 Sync state is colocated with the resource it tracks: mail folders carry
