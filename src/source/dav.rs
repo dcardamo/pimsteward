@@ -143,7 +143,9 @@ impl DavMultistatus {
         use quick_xml::reader::Reader;
 
         let mut reader = Reader::from_reader(xml);
-        reader.config_mut().trim_text(true);
+        // Don't use trim_text(true) — it strips \r\n from vCard/iCal
+        // content embedded in address-data/calendar-data elements.
+        // We trim manually for fields that need it (href, etag, etc.).
         let mut buf = Vec::new();
         let mut out = DavMultistatus::default();
         let mut stack: Vec<String> = Vec::new();
@@ -321,5 +323,36 @@ END:VCARD</card:address-data>
         assert_eq!(local_name(b"D:response"), "response");
         assert_eq!(local_name(b"card:address-data"), "address-data");
         assert_eq!(local_name(b"foo"), "foo");
+    }
+
+    /// Forwardemail's CardDAV server returns vCard lines separated by
+    /// `&#xD;\n` (CR entity + literal newline). Verify trim_text(true)
+    /// doesn't collapse the content into a single line.
+    #[test]
+    fn parses_carddav_with_cr_entities() {
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<d:multistatus xmlns:d=\"DAV:\" xmlns:card=\"urn:ietf:params:xml:ns:carddav\">\n\
+  <d:response>\n\
+    <d:href>/dav/test/addressbooks/card/abc-123.vcf</d:href>\n\
+    <d:propstat>\n\
+      <d:prop>\n\
+        <d:getetag>\"etag1\"</d:getetag>\n\
+        <card:address-data>BEGIN:VCARD&#xD;\nVERSION:3.0&#xD;\nUID:abc-123&#xD;\nFN:Alice Smith&#xD;\nEND:VCARD&#xD;\n</card:address-data>\n\
+      </d:prop>\n\
+      <d:status>HTTP/1.1 200 OK</d:status>\n\
+    </d:propstat>\n\
+  </d:response>\n\
+</d:multistatus>";
+        let ms = DavMultistatus::parse(xml).unwrap();
+        assert_eq!(ms.responses.len(), 1);
+        let r = &ms.responses[0];
+        let data = r.address_data.as_deref().unwrap();
+        // Must preserve line structure so UID/FN extraction works
+        assert!(
+            data.contains("UID:abc-123"),
+            "UID line must be findable in: {:?}",
+            data
+        );
+        assert!(data.lines().count() > 1, "vCard must have multiple lines, got: {:?}", data);
     }
 }

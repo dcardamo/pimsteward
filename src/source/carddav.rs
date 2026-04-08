@@ -1,9 +1,10 @@
 //! CardDAV-backed ContactsSource.
 //!
-//! Queries the default addressbook at
-//! `/dav/<user>/addressbooks/default/` via REPORT `addressbook-query`.
-//! Forwardemail exposes one addressbook per alias, so there's no need to
-//! enumerate multiple collections.
+//! Discovers all addressbooks via PROPFIND on
+//! `/dav/<user>/addressbooks/`, then queries each via REPORT
+//! `addressbook-query`. Forwardemail may expose multiple addressbooks
+//! per alias (e.g. `default` and `card`), so we enumerate all of them
+//! and merge the results — same pattern CalDAV uses for calendars.
 //!
 //! Live-tested against `carddav.forwardemail.net` with a forwardemail
 //! alias. Note the different subdomain vs CalDAV — forwardemail runs the
@@ -43,18 +44,40 @@ impl DavContactsSource {
         Ok(Self { client, user })
     }
 
-    fn default_addressbook_path(&self) -> String {
-        format!("/dav/{}/addressbooks/default/", self.user)
-    }
-}
-
-#[async_trait]
-impl ContactsSource for DavContactsSource {
-    fn tag(&self) -> &'static str {
-        "carddav"
+    /// PROPFIND path for discovering all addressbooks.
+    fn addressbooks_home_path(&self) -> String {
+        format!("/dav/{}/addressbooks/", self.user)
     }
 
-    async fn list_contacts(&self) -> Result<Vec<Contact>, Error> {
+    /// Discover all addressbook collections via PROPFIND on the
+    /// addressbooks home. Returns the href of each collection that
+    /// advertises `<card:addressbook/>` in its resourcetype.
+    async fn discover_addressbooks(&self) -> Result<Vec<String>, Error> {
+        let body = r#"<?xml version="1.0"?>
+<D:propfind xmlns:D="DAV:" xmlns:CR="urn:ietf:params:xml:ns:carddav">
+  <D:prop>
+    <D:resourcetype/>
+    <D:displayname/>
+  </D:prop>
+</D:propfind>"#;
+        let ms = self
+            .client
+            .propfind(&self.addressbooks_home_path(), 1, body)
+            .await?;
+
+        let books: Vec<String> = ms
+            .responses
+            .into_iter()
+            .filter(|r| r.is_addressbook)
+            .map(|r| r.href)
+            .collect();
+
+        tracing::debug!(count = books.len(), ?books, "discovered CardDAV addressbooks");
+        Ok(books)
+    }
+
+    /// Fetch all contacts from a single addressbook collection.
+    async fn list_contacts_in(&self, addressbook_href: &str) -> Result<Vec<Contact>, Error> {
         let body = r#"<?xml version="1.0"?>
 <CR:addressbook-query xmlns:D="DAV:" xmlns:CR="urn:ietf:params:xml:ns:carddav">
   <D:prop>
@@ -62,10 +85,7 @@ impl ContactsSource for DavContactsSource {
     <CR:address-data/>
   </D:prop>
 </CR:addressbook-query>"#;
-        let ms = self
-            .client
-            .report(&self.default_addressbook_path(), 1, body)
-            .await?;
+        let ms = self.client.report(addressbook_href, 1, body).await?;
 
         Ok(ms
             .responses
@@ -95,6 +115,24 @@ impl ContactsSource for DavContactsSource {
                 })
             })
             .collect())
+    }
+}
+
+#[async_trait]
+impl ContactsSource for DavContactsSource {
+    fn tag(&self) -> &'static str {
+        "carddav"
+    }
+
+    async fn list_contacts(&self) -> Result<Vec<Contact>, Error> {
+        let books = self.discover_addressbooks().await?;
+        let mut all = Vec::new();
+        for href in &books {
+            let contacts = self.list_contacts_in(href).await?;
+            tracing::debug!(addressbook = %href, count = contacts.len(), "fetched contacts");
+            all.extend(contacts);
+        }
+        Ok(all)
     }
 }
 
