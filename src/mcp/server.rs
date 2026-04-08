@@ -15,6 +15,14 @@ use rmcp::{
 use std::process::Command;
 use std::sync::Arc;
 
+/// Schema for `plan` fields in *ApplyParams. serde_json::Value generates
+/// `true` (accept anything) via schemars, which is valid JSON Schema 2020-12
+/// but Claude Code's MCP client rejects it, causing zero tools to register.
+/// This explicit schema says "any JSON object" instead.
+fn plan_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::json!({"type": "object"}).as_object().unwrap().clone().into()
+}
+
 /// JSON-RPC server-specific error code (the -32000..-32099 band is reserved
 /// for application-defined errors by the JSON-RPC 2.0 spec). We use -32001
 /// for "permission denied" so the LLM can distinguish a policy refusal from
@@ -506,6 +514,7 @@ pub struct RestoreContactApplyParams {
     /// The RestorePlan object returned by restore_contact_dry_run. Must
     /// be passed back verbatim — any modification changes the plan_token
     /// and the apply will be refused.
+    #[schemars(schema_with = "plan_schema")]
     pub plan: serde_json::Value,
     /// The plan_token returned alongside the plan in the dry-run response.
     pub plan_token: String,
@@ -524,6 +533,7 @@ pub struct RestoreSieveDryRunParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestoreSieveApplyParams {
+    #[schemars(schema_with = "plan_schema")]
     pub plan: serde_json::Value,
     pub plan_token: String,
     #[serde(default)]
@@ -542,6 +552,7 @@ pub struct RestoreCalendarDryRunParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestoreCalendarApplyParams {
+    #[schemars(schema_with = "plan_schema")]
     pub plan: serde_json::Value,
     pub plan_token: String,
     #[serde(default)]
@@ -565,6 +576,7 @@ pub struct RestoreMailDryRunParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestoreMailApplyParams {
+    #[schemars(schema_with = "plan_schema")]
     pub plan: serde_json::Value,
     pub plan_token: String,
     #[serde(default)]
@@ -582,6 +594,7 @@ pub struct RestorePathDryRunParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestorePathApplyParams {
+    #[schemars(schema_with = "plan_schema")]
     pub plan: serde_json::Value,
     pub plan_token: String,
     #[serde(default)]
