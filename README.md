@@ -143,6 +143,10 @@ a demo and starts being a daily driver. Some of the things it's built for:
 - **"Auto-archive newsletters older than a week."** — pimsteward edits
   your sieve script, commits to git, and you get a clean rollback path if
   the rule turns out to be too aggressive.
+- **"Activate my dan-filters script."** — pimsteward uses ManageSieve
+  (RFC 5804) to activate scripts, since forwardemail's REST API treats
+  `is_active` as read-only. Note: forwardemail allows exactly **one active
+  script** at a time — multiple rules must be combined into a single script.
 - Every sieve change is a git diff you can `blame`, `revert`, or time-travel.
 
 #### 📅 Calendar — scheduling without the dance
@@ -548,8 +552,13 @@ alias_password_file = "/run/pimsteward-secrets/forwardemail-alias-password"
 # Source backends. Default is REST for everything; switch calendar/contacts
 # to dav for faster bulk pulls, or mail to imap for CONDSTORE/IDLE push.
 mail_source     = "rest"    # or "imap"
+imap_idle       = false     # IMAP IDLE push for sub-minute mail latency (imap only)
 calendar_source = "rest"    # or "caldav"
 contacts_source = "rest"    # or "carddav"
+
+# ManageSieve for sieve script activation (REST API is read-only for is_active)
+managesieve_host = "imap.forwardemail.net"
+managesieve_port = 4190
 
 [storage]
 repo_path = "/var/lib/pimsteward"
@@ -791,13 +800,14 @@ Early development, but the core is working end-to-end:
 - **Pull daemon** — functional for mail (REST + IMAP with CONDSTORE/IDLE),
   calendar (REST + CalDAV), contacts (REST + CardDAV), and sieve scripts.
   Weekly `git gc --auto` runs alongside the pull tasks.
-- **MCP server** — read tools (`search_email`, `get_email`, `list_folders`,
-  `list_calendars`, `list_events`, `list_contacts`, `list_sieve`, `history`)
-  and write tools for all four resources (`create_draft`, **`send_email`**,
-  `move_email`, `delete_email`, `update_email_flags`, `create_event`,
-  `update_event`, `delete_event`, `create_contact`, `update_contact`,
-  `delete_contact`, `install_sieve_script`, `update_sieve_script`,
-  `delete_sieve_script`).
+- **MCP server** — served over HTTP SSE (Streamable HTTP) with bearer token
+  auth. Read tools (`search_email`, `get_email`, `list_folders`,
+  `list_calendars`, `list_events`, `list_contacts`, `list_sieve`, `history`,
+  `get_permissions`) and write tools for all four resources (`create_draft`,
+  **`send_email`**, `move_email`, `delete_email`, `update_email_flags`,
+  `create_event`, `update_event`, `delete_event`, `create_contact`,
+  `update_contact`, `delete_contact`, `install_sieve_script`,
+  `update_sieve_script`, `delete_sieve_script`, `activate_sieve_script`).
 - **Restore** — dry-run + apply tool pairs for contacts, sieve, calendar
   events, mail, and arbitrary paths, all gated by a content-derived
   `plan_token`.
