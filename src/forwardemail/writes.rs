@@ -107,16 +107,32 @@ impl Client {
     }
 
     /// PUT /v1/sieve-scripts/:id — update content and/or active state.
+    ///
+    /// Forwardemail requires `content` in every PUT, even if you're only
+    /// toggling `is_active`. When `content` is None, we fetch the current
+    /// script and re-send its existing content alongside the new fields.
     pub async fn update_sieve_script(
         &self,
         id: &str,
         content: Option<&str>,
         is_active: Option<bool>,
     ) -> Result<SieveScript, Error> {
-        let mut body = json!({});
-        if let Some(c) = content {
-            body["content"] = json!(c);
-        }
+        // Forwardemail 400s with "Sieve script content is required" if
+        // content is missing from the PUT body, even for is_active-only
+        // changes. Fetch the current content when the caller omits it.
+        let fetched;
+        let content = match content {
+            Some(c) => c,
+            None => {
+                let current = self.get_sieve_script(id).await?;
+                fetched = current.content.ok_or_else(|| crate::Error::Api {
+                    status: 500,
+                    message: format!("sieve script {id} has no content to re-send"),
+                })?;
+                &fetched
+            }
+        };
+        let mut body = json!({"content": content});
         if let Some(a) = is_active {
             body["is_active"] = json!(a);
         }
