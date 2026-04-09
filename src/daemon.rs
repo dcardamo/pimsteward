@@ -258,6 +258,12 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
                         .map(|v| v.trim().to_string())
                         .filter(|v| !v.is_empty())
                         .unwrap_or_else(|| "ai".to_string());
+                    let managesieve = crate::mcp::ManageSieveConfig {
+                        host: cfg.forwardemail.managesieve_host.clone(),
+                        port: cfg.forwardemail.managesieve_port,
+                        user: user.clone(),
+                        password: pass.clone(),
+                    };
                     Ok(PimstewardServer::new(
                         client,
                         repo,
@@ -266,6 +272,7 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
                         caller,
                         mail_source,
                         mail_writer,
+                        managesieve,
                     ))
                 },
                 Default::default(),

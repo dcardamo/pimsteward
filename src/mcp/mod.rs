@@ -23,4 +23,4 @@
 
 pub mod server;
 
-pub use server::PimstewardServer;
+pub use server::{ManageSieveConfig, PimstewardServer};

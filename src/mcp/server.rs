@@ -56,6 +56,18 @@ struct Inner {
     mail_source: Arc<dyn MailSource>,
     /// Mail write backend: REST or IMAP, matching the read source.
     mail_writer: Arc<dyn MailWriter>,
+    /// ManageSieve connection info for sieve script activation.
+    /// Forwardemail's REST API treats is_active as read-only.
+    managesieve: ManageSieveConfig,
+}
+
+/// ManageSieve connection parameters, passed through from Config.
+#[derive(Clone)]
+pub struct ManageSieveConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: String,
 }
 
 impl std::fmt::Debug for PimstewardServer {
@@ -67,6 +79,7 @@ impl std::fmt::Debug for PimstewardServer {
 }
 
 impl PimstewardServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Client,
         repo: Repo,
@@ -75,6 +88,7 @@ impl PimstewardServer {
         caller: String,
         mail_source: Arc<dyn MailSource>,
         mail_writer: Arc<dyn MailWriter>,
+        managesieve: ManageSieveConfig,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -85,6 +99,7 @@ impl PimstewardServer {
                 caller,
                 mail_source,
                 mail_writer,
+                managesieve,
             }),
             tool_router: Self::tool_router(),
         }
@@ -329,6 +344,16 @@ pub struct UpdateSieveParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeleteSieveParams {
     pub id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ActivateSieveParams {
+    /// Name of the script to activate. ManageSieve allows exactly one
+    /// active script at a time — activating a script deactivates any
+    /// previously active one. Pass an empty string to deactivate all.
+    pub name: String,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -825,16 +850,37 @@ impl PimstewardServer {
 
     #[tool(
         name = "list_sieve",
-        description = "List server-side sieve filter scripts for the alias with their activation state and validation status."
+        description = "List server-side sieve filter scripts for the alias with their activation state and validation status. Note: forwardemail allows exactly ONE active script at a time. The is_active field is sourced from ManageSieve (the REST API reports it incorrectly)."
     )]
     async fn list_sieve(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
         self.check(Resource::Sieve)?;
-        let scripts = self
+        let mut scripts = self
             .inner
             .client
             .list_sieve_scripts()
             .await
             .map_err(|e| self.api_error(e))?;
+
+        // Forwardemail's REST API reports is_active incorrectly (always
+        // false). Get the real active state from ManageSieve LISTSCRIPTS.
+        let ms = &self.inner.managesieve;
+        match crate::forwardemail::managesieve::get_active_script(
+            &ms.host, ms.port, &ms.user, &ms.password,
+        )
+        .await
+        {
+            Ok(active_name) => {
+                for s in &mut scripts {
+                    s.is_active = active_name.as_deref() == Some(&s.name);
+                }
+            }
+            Err(e) => {
+                // Non-fatal: return REST data with a warning rather than
+                // failing the entire list.
+                tracing::warn!(error = %e, "ManageSieve LISTSCRIPTS failed, is_active may be inaccurate");
+            }
+        }
+
         serde_json::to_string_pretty(&scripts)
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
@@ -1005,6 +1051,41 @@ impl PimstewardServer {
         .await
         .map_err(|e| self.api_error(e))?;
         Ok(format!("deleted sieve script {}", p.id))
+    }
+
+    #[tool(
+        name = "activate_sieve_script",
+        description = "Activate a sieve script by name via ManageSieve. Forwardemail allows exactly ONE active script at a time — activating a script deactivates any previously active one. To have multiple filter rules active simultaneously, combine them into a single script. Pass an empty name to deactivate all scripts."
+    )]
+    async fn activate_sieve_script(
+        &self,
+        Parameters(p): Parameters<ActivateSieveParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Sieve)?;
+        let ms = &self.inner.managesieve;
+        crate::forwardemail::managesieve::activate_script(
+            &ms.host, ms.port, &ms.user, &ms.password, &p.name,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+
+        // Audit the activation in git.
+        let attr = self.attribution(None, p.reason);
+        let msg = format!(
+            "sieve: activate \"{}\"\n\nCaller: {}\nEmail: {}",
+            p.name, attr.caller, attr.caller_email
+        );
+        let _ = self.inner.repo.commit_all(
+            &attr.caller,
+            &attr.caller_email,
+            &msg,
+        );
+
+        if p.name.is_empty() {
+            Ok("all sieve scripts deactivated".to_string())
+        } else {
+            Ok(format!("activated sieve script \"{}\"", p.name))
+        }
     }
 
     #[tool(
@@ -1838,6 +1919,7 @@ const TOOL_REQS: &[(&str, ToolReq)] = &[
     ("install_sieve_script", ToolReq::Write(Resource::Sieve)),
     ("update_sieve_script", ToolReq::Write(Resource::Sieve)),
     ("delete_sieve_script", ToolReq::Write(Resource::Sieve)),
+    ("activate_sieve_script", ToolReq::Write(Resource::Sieve)),
     // Restore — dry-runs require READ, applies require WRITE. Bulk
     // restore touches three resources, so we expose it whenever any of
     // them is writable; the handler re-checks each resource per-op.
@@ -2268,7 +2350,7 @@ mod tests {
             "list_calendars", "list_events",
             "create_event", "update_event", "delete_event",
             "list_contacts", "create_contact", "update_contact", "delete_contact",
-            "list_sieve", "install_sieve_script", "update_sieve_script", "delete_sieve_script",
+            "list_sieve", "install_sieve_script", "update_sieve_script", "delete_sieve_script", "activate_sieve_script",
             "restore_contact_dry_run", "restore_contact_apply",
             "restore_sieve_dry_run", "restore_sieve_apply",
             "restore_calendar_event_dry_run", "restore_calendar_event_apply",

@@ -148,6 +148,16 @@ pub struct ForwardemailConfig {
     /// `contacts_source = "carddav"`.
     #[serde(default = "default_carddav_base_url")]
     pub carddav_base_url: String,
+
+    /// ManageSieve host for sieve script activation. Forwardemail's REST
+    /// API treats `is_active` as read-only; activation requires the
+    /// ManageSieve protocol (RFC 5804).
+    #[serde(default = "default_managesieve_host")]
+    pub managesieve_host: String,
+
+    /// ManageSieve port (implicit TLS).
+    #[serde(default = "default_managesieve_port")]
+    pub managesieve_port: u16,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +200,14 @@ fn default_carddav_base_url() -> String {
     "https://carddav.forwardemail.net".into()
 }
 
+fn default_managesieve_host() -> String {
+    "imap.forwardemail.net".into()
+}
+
+fn default_managesieve_port() -> u16 {
+    4190
+}
+
 impl Default for ForwardemailConfig {
     fn default() -> Self {
         Self {
@@ -204,6 +222,8 @@ impl Default for ForwardemailConfig {
             imap_idle: false,
             caldav_base_url: default_caldav_base_url(),
             carddav_base_url: default_carddav_base_url(),
+            managesieve_host: default_managesieve_host(),
+            managesieve_port: default_managesieve_port(),
         }
     }
 }

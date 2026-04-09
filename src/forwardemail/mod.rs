@@ -16,6 +16,7 @@ pub mod calendar;
 pub mod client;
 pub mod contacts;
 pub mod mail;
+pub mod managesieve;
 pub mod sieve;
 pub mod writes;
 
