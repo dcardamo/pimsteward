@@ -44,15 +44,19 @@ pub async fn update_sieve_script(
     alias: &str,
     attribution: &Attribution,
     id: &str,
-    content: &str,
+    content: Option<&str>,
+    is_active: Option<bool>,
 ) -> Result<SieveScript, Error> {
-    let updated = client.update_sieve_script(id, content).await?;
+    let updated = client.update_sieve_script(id, content, is_active).await?;
     let audit = WriteAudit {
         attribution,
         tool: "update_sieve_script",
         resource: "sieve",
         resource_id: id.to_string(),
-        args: serde_json::json!({"content_bytes": content.len()}),
+        args: serde_json::json!({
+            "content_bytes": content.map(|c| c.len()),
+            "is_active": is_active,
+        }),
         summary: format!("sieve: update {id}"),
     };
     refresh(client, repo, alias, attribution, &audit).await?;

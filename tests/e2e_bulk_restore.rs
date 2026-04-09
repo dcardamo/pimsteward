@@ -130,7 +130,8 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
         &ctx.alias_slug(),
         &attr,
         &sieve_script.id,
-        bad_sieve,
+        Some(bad_sieve),
+        None,
     )
     .await
     .expect("bad sieve update");

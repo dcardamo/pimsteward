@@ -100,13 +100,26 @@ impl Client {
         name: &str,
         content: &str,
     ) -> Result<SieveScript, Error> {
-        let body = json!({"name": name, "content": content});
+        // New scripts are active by default — you don't install a filter
+        // to leave it off. Callers can deactivate via update_sieve_script.
+        let body = json!({"name": name, "content": content, "is_active": true});
         self.post_json("/v1/sieve-scripts", &body).await
     }
 
-    /// PUT /v1/sieve-scripts/:id — update an existing script.
-    pub async fn update_sieve_script(&self, id: &str, content: &str) -> Result<SieveScript, Error> {
-        let body = json!({"content": content});
+    /// PUT /v1/sieve-scripts/:id — update content and/or active state.
+    pub async fn update_sieve_script(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        is_active: Option<bool>,
+    ) -> Result<SieveScript, Error> {
+        let mut body = json!({});
+        if let Some(c) = content {
+            body["content"] = json!(c);
+        }
+        if let Some(a) = is_active {
+            body["is_active"] = json!(a);
+        }
         self.put_json(&format!("/v1/sieve-scripts/{id}"), &body, None)
             .await
     }

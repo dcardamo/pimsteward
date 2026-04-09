@@ -321,7 +321,12 @@ pub struct InstallSieveParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateSieveParams {
     pub id: String,
-    pub content: String,
+    /// New script content. Optional — omit to change only is_active.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Activate or deactivate the script. Optional — omit to change only content.
+    #[serde(default)]
+    pub is_active: Option<bool>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -963,12 +968,18 @@ impl PimstewardServer {
 
     #[tool(
         name = "update_sieve_script",
-        description = "Update an existing sieve script's content."
+        description = "Update a sieve script's content and/or active state. Pass `content` to change the script body, `is_active` to enable/disable it, or both. At least one must be provided."
     )]
     async fn update_sieve_script(
         &self,
         Parameters(p): Parameters<UpdateSieveParams>,
     ) -> Result<String, McpError> {
+        if p.content.is_none() && p.is_active.is_none() {
+            return Err(McpError::invalid_params(
+                "at least one of `content` or `is_active` must be provided",
+                None,
+            ));
+        }
         self.check_write(Resource::Sieve)?;
         let attr = self.attribution(None, p.reason);
         let updated = crate::write::sieve::update_sieve_script(
@@ -977,7 +988,8 @@ impl PimstewardServer {
             &self.inner.alias,
             &attr,
             &p.id,
-            &p.content,
+            p.content.as_deref(),
+            p.is_active,
         )
         .await
         .map_err(|e| self.api_error(e))?;

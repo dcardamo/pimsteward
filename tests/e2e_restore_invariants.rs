@@ -625,7 +625,8 @@ async fn sieve_restore_isolation_from_new_scripts() {
         &ctx.alias_slug(),
         &attr,
         &script_a.id,
-        bad_a,
+        Some(bad_a),
+        None,
     )
     .await
     .expect("bad A");
@@ -1259,7 +1260,8 @@ async fn sieve_restore_rejects_wrong_token() {
         &ctx.alias_slug(),
         &attr,
         &script.id,
-        v2,
+        Some(v2),
+        None,
     )
     .await
     .expect("bad update");
