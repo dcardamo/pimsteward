@@ -57,8 +57,7 @@ async fn sieve_install_update_delete_lifecycle() {
         &ctx.alias_slug(),
         &attr,
         &script_id,
-        Some(v2_content),
-        None,
+        v2_content,
     )
     .await
     .expect("update");
@@ -104,8 +103,7 @@ async fn sieve_restore_content_change() {
         &ctx.alias_slug(),
         &attr,
         &script_id,
-        Some(bad_content),
-        None,
+        bad_content,
     )
     .await
     .expect("bad update");

@@ -100,42 +100,21 @@ impl Client {
         name: &str,
         content: &str,
     ) -> Result<SieveScript, Error> {
-        // New scripts are active by default — you don't install a filter
-        // to leave it off. Callers can deactivate via update_sieve_script.
-        let body = json!({"name": name, "content": content, "is_active": true});
+        // Note: is_active is read-only in forwardemail's REST API — the
+        // API silently ignores it on both POST and PUT. Scripts must be
+        // activated via the forwardemail dashboard or ManageSieve protocol.
+        let body = json!({"name": name, "content": content});
         self.post_json("/v1/sieve-scripts", &body).await
     }
 
-    /// PUT /v1/sieve-scripts/:id — update content and/or active state.
+    /// PUT /v1/sieve-scripts/:id — update script content.
     ///
-    /// Forwardemail requires `content` in every PUT, even if you're only
-    /// toggling `is_active`. When `content` is None, we fetch the current
-    /// script and re-send its existing content alongside the new fields.
-    pub async fn update_sieve_script(
-        &self,
-        id: &str,
-        content: Option<&str>,
-        is_active: Option<bool>,
-    ) -> Result<SieveScript, Error> {
-        // Forwardemail 400s with "Sieve script content is required" if
-        // content is missing from the PUT body, even for is_active-only
-        // changes. Fetch the current content when the caller omits it.
-        let fetched;
-        let content = match content {
-            Some(c) => c,
-            None => {
-                let current = self.get_sieve_script(id).await?;
-                fetched = current.content.ok_or_else(|| crate::Error::Api {
-                    status: 500,
-                    message: format!("sieve script {id} has no content to re-send"),
-                })?;
-                &fetched
-            }
-        };
-        let mut body = json!({"content": content});
-        if let Some(a) = is_active {
-            body["is_active"] = json!(a);
-        }
+    /// Note: `is_active` is read-only in forwardemail's REST API. The API
+    /// silently ignores it on both POST and PUT (returns 200 but the field
+    /// stays unchanged). Scripts must be activated through forwardemail's
+    /// dashboard or ManageSieve protocol (port 4190).
+    pub async fn update_sieve_script(&self, id: &str, content: &str) -> Result<SieveScript, Error> {
+        let body = json!({"content": content});
         self.put_json(&format!("/v1/sieve-scripts/{id}"), &body, None)
             .await
     }

@@ -123,8 +123,7 @@ pub async fn apply_sieve(
                 .live_id
                 .as_ref()
                 .ok_or_else(|| Error::config("UpdateContent op requires live_id in plan"))?;
-            // Restore only changes content, not active state.
-            client.update_sieve_script(id, Some(target_content), None).await?;
+            client.update_sieve_script(id, target_content).await?;
         }
         SieveOperation::Recreate { content } => {
             client
