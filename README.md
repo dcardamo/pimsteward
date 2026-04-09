@@ -176,48 +176,56 @@ reversible, everything is attributable.**
 
 ## Architecture
 
-pimsteward is a **two-process** system that owns your forwardemail credentials
-and sits between the AI assistant and the service. A long-running daemon
-(`pimsteward daemon`) runs the pull loop and weekly `git gc`; a short-lived
-`pimsteward mcp` child is spawned by your MCP client (Claude Desktop, Claude
-Code, etc.) for each session and handles the AI's read, write, and restore
-calls. Both processes share one on-disk git repo, which is how the AI's
-writes and the daemon's pulls reconcile.
+pimsteward runs as a **single daemon** (`pimsteward daemon --port 8100`) that
+owns your forwardemail credentials and sits between the AI assistant and the
+service. The daemon does two things in one process:
+
+1. **Pull loops** — IMAP IDLE + CalDAV + CardDAV for real-time backup
+2. **MCP HTTP server** — Streamable HTTP / SSE endpoint for AI clients
+
+AI clients connect via URL (e.g. `http://host:8100/mcp`) with a bearer token.
+There is no stdio transport — HTTP is the only AI-facing interface. This keeps
+credentials and the pimsteward binary in an isolated container while AI clients
+connect over the network. A compromised AI container cannot read credentials
+or inspect pimsteward process memory.
+
+Clients can call `get_permissions` to discover their effective access levels
+before using other tools.
 
 ```mermaid
 flowchart TB
     subgraph client["AI side"]
-        AI["AI assistant<br/>Claude Desktop / Claude Code<br/>any MCP client"]
+        AI["AI assistant<br/>Claude Code / any MCP client"]
     end
 
-    subgraph mcp["pimsteward mcp (stdio child of the AI client)"]
+    subgraph daemon["pimsteward daemon (single process)"]
         direction TB
-        MCP["MCP server<br/>typed, high-level tools"]
-        PERM["Permission gate<br/>none / read / read_write<br/>flat or scoped"]
-        WRITE["Write path<br/>API → re-pull → commit"]
-        REST["Restore engine<br/>git @ T → diff → dry-run + apply"]
-        MCP --> PERM
-        PERM --> WRITE
-        PERM --> REST
-    end
 
-    subgraph daemon["pimsteward daemon (long-running)"]
-        direction TB
-        PULL["Pull loop<br/>forwardemail → diff → git"]
+        subgraph mcphttp["MCP HTTP server (:port/mcp)"]
+            MCP["MCP tools<br/>read / write / restore"]
+            PERM["Permission gate<br/>none / read / read_write<br/>flat or scoped"]
+            WRITE["Write path<br/>API → re-pull → commit"]
+            REST["Restore engine<br/>git @ T → diff → dry-run + apply"]
+            MCP --> PERM
+            PERM --> WRITE
+            PERM --> REST
+        end
+
+        PULL["Pull loops<br/>IMAP IDLE + CalDAV + CardDAV"]
         GC["git gc --auto<br/>weekly"]
     end
 
     subgraph storage["Local git repo (backed up offsite)"]
-        GIT[("repo_path<br/>gix / gitoxide")]
+        GIT[("repo_path")]
     end
 
     FE["forwardemail.net<br/>authoritative store"]
 
-    AI -- "MCP / stdio" --> MCP
-    PULL -- "REST / DAV / IMAP" --> FE
+    AI -- "HTTP SSE + Bearer token" --> MCP
+    PULL -- "IMAP / CalDAV / CardDAV / REST" --> FE
     WRITE -- "REST" --> FE
     REST -- "REST" --> FE
-    FE -. "poll 5 min" .-> PULL
+    FE -. "IDLE + poll" .-> PULL
     PULL --> GIT
     WRITE --> GIT
     REST --> GIT
@@ -240,9 +248,10 @@ flowchart TB
 | **Restore** | MCP tool (dry-run then apply)    | Read git tree at time T, compute diff vs live, apply as a new commit |
 | **GC**      | `pimsteward daemon` (weekly)     | `git gc --auto` so the offsite-mirrored backup stays compact         |
 
-The daemon owns Pull and GC. MCP is a separate process: the AI client spawns
-`pimsteward mcp` as a stdio child, so Write and Restore run in that short-lived
-process and commit to the same git repo the daemon is pulling into.
+The daemon handles everything in one process: Pull and GC run as background
+tasks, while the MCP HTTP server handles AI requests. Write and Restore
+execute in MCP request handlers and commit to the same git repo the pull
+loops are syncing into.
 
 ---
 
@@ -258,7 +267,7 @@ than pimsteward's optimistic guess.
 sequenceDiagram
     autonumber
     participant AI as AI assistant
-    participant MCP as pimsteward mcp
+    participant MCP as pimsteward MCP HTTP
     participant P as Permission gate
     participant FE as forwardemail.net
     participant G as git repo
@@ -554,11 +563,9 @@ contacts_interval_seconds = 900
 sieve_interval_seconds    = 3600
 ```
 
-There is no `[mcp]` section: pimsteward's MCP server is a stdio transport,
-and your MCP client is expected to spawn `pimsteward mcp` as a child
-process. Claude Desktop, Claude Code, Cursor, and rockycc all do this the
-same way — point them at the `pimsteward` binary and they own the
-lifecycle.
+There is no `[mcp]` section: the daemon serves MCP over HTTP when you pass
+`--port` (e.g. `pimsteward daemon --port 8100`). AI clients connect via URL
+(e.g. `http://host:8100/mcp`) with a bearer token for authentication.
 
 Permission checks happen **before** any API call and **before** any git write.
 A `none` resource is invisible to the AI: the corresponding MCP tools are not

@@ -15,14 +15,12 @@ pub mod store;
 pub mod write;
 
 pub use config::Config;
+pub use daemon::HttpOptions;
 pub use error::Error;
 pub use permission::{Access, Permissions, Resource};
 
-/// Daemon entry point — long-running mode with periodic pull timers.
-///
-/// MCP is intentionally NOT part of the daemon. AI clients spawn the
-/// `pimsteward mcp` subcommand as a child process with stdio transport,
-/// matching the forwardemail MCP server pattern.
-pub async fn run(cfg: Config) -> Result<(), Error> {
-    daemon::run(cfg).await
+/// Daemon entry point — long-running mode with periodic pull timers and
+/// an optional MCP HTTP server for AI clients.
+pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
+    daemon::run(cfg, http).await
 }

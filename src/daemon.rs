@@ -1,33 +1,71 @@
 //! Long-running daemon: spawns one tokio task per resource with its own
-//! pull interval. Errors are logged and the loop keeps running — a flaky
-//! network shouldn't kill the whole daemon.
+//! pull interval, plus an HTTP MCP server so AI clients can connect via
+//! Streamable HTTP / SSE. Errors are logged and pull loops keep running —
+//! a flaky network shouldn't kill the whole daemon.
 //!
-//! MCP is intentionally NOT part of the daemon. AI clients (Claude Desktop,
-//! rockycc, etc.) spawn `pimsteward mcp` as a child process with stdio
-//! transport, matching the forwardemail MCP server pattern. Decoupling
-//! means the daemon can run as a low-privilege user doing nothing but
-//! pulling, and each MCP client gets its own isolated process on demand.
+//! Each MCP session gets a fresh `PimstewardServer` via the HTTP service's
+//! factory closure, giving session isolation without process-per-client
+//! overhead.
 
 use crate::config::{CalendarSourceKind, Config, ContactsSourceKind, MailSourceKind};
 use crate::error::Error;
 use crate::forwardemail::Client;
+use crate::mcp::PimstewardServer;
 use crate::permission::Resource;
 use crate::pull;
 use crate::source::{
     imap::{idle_loop, ImapConfig},
     CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource, ImapMailSource,
-    MailSource, RestCalendarSource, RestContactsSource, RestMailSource,
+    MailSource, MailWriter, RestCalendarSource, RestContactsSource, RestMailSource,
 };
 use crate::store::Repo;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-/// Run the pull daemon indefinitely. Returns when a fatal error occurs or
-/// when a shutdown signal is received.
-pub async fn run(cfg: Config) -> Result<(), Error> {
+/// HTTP server options for the embedded MCP endpoint. When `port` is
+/// `Some`, the daemon serves MCP over Streamable HTTP alongside its pull
+/// loops. When `None`, the daemon only pulls (useful for testing or
+/// headless backup-only deployments).
+pub struct HttpOptions {
+    pub host: String,
+    pub port: u16,
+    pub bearer_token_file: Option<PathBuf>,
+}
+
+/// Build the configured MailSource + MailWriter pair. Extracted here so
+/// both the pull loops and the MCP server factory can reuse it.
+fn build_mail_source(
+    cfg: &Config,
+    client: Client,
+    user: &str,
+    password: &str,
+) -> (Arc<dyn MailSource>, Arc<dyn MailWriter>) {
+    match cfg.forwardemail.mail_source {
+        MailSourceKind::Rest => {
+            let rest = Arc::new(crate::source::RestMailSource::new(client));
+            (rest.clone(), rest)
+        }
+        MailSourceKind::Imap => {
+            let imap_cfg = ImapConfig {
+                host: cfg.forwardemail.imap_host.clone(),
+                port: cfg.forwardemail.imap_port,
+                user: user.to_string(),
+                password: password.to_string(),
+            };
+            let imap = Arc::new(ImapMailSource::new(imap_cfg));
+            (imap.clone(), imap)
+        }
+    }
+}
+
+/// Run the pull daemon indefinitely, optionally serving MCP over HTTP.
+/// Returns when a fatal error occurs or when a shutdown signal is received.
+pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     let (user, pass) = cfg.load_credentials()?;
     let alias = user.replace('@', "-");
     let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
@@ -154,21 +192,141 @@ pub async fn run(cfg: Config) -> Result<(), Error> {
         handles.push(h);
     }
 
-    if handles.is_empty() {
-        return Err(Error::config(
-            "daemon has nothing to do — config.permissions grants no resource read access",
-        ));
-    }
-
     // Weekly git gc timer. Runs `git gc --auto` against the backup repo
     // on a fixed cadence. Tiny cost, prevents long-term loose-object
     // fragmentation on long-running deployments.
     handles.push(spawn_gc_timer(repo.clone()));
 
+    // ── MCP HTTP server (optional) ────────────────────────────────
+    let ct = CancellationToken::new();
+    if let Some(http_opts) = http {
+        let expected_token = match &http_opts.bearer_token_file {
+            Some(path) => {
+                let token = std::fs::read_to_string(path)
+                    .map_err(|e| Error::config(format!("reading bearer token file: {e}")))?
+                    .trim()
+                    .to_string();
+                if token.is_empty() {
+                    return Err(Error::config(format!(
+                        "bearer token file is empty: {}",
+                        path.display()
+                    )));
+                }
+                tracing::info!("bearer token auth enabled");
+                Some(token)
+            }
+            None => {
+                tracing::warn!("no --bearer-token-file set, MCP HTTP endpoint is unauthenticated");
+                None
+            }
+        };
+
+        let cfg_for_factory = cfg.clone();
+        let ct_http = ct.clone();
+
+        use axum::{
+            extract::Request,
+            http::StatusCode,
+            middleware::{self, Next},
+            response::{IntoResponse, Response},
+        };
+        use rmcp::transport::streamable_http_server::{
+            session::local::LocalSessionManager, StreamableHttpServerConfig,
+            StreamableHttpService,
+        };
+
+        let service: StreamableHttpService<PimstewardServer, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || {
+                    let cfg = cfg_for_factory.clone();
+                    let (user, pass) = cfg
+                        .load_credentials()
+                        .map_err(std::io::Error::other)?;
+                    let alias = user.replace('@', "-");
+                    let client = Client::new(
+                        cfg.forwardemail.api_base.clone(),
+                        user.clone(),
+                        pass.clone(),
+                    )
+                    .map_err(std::io::Error::other)?;
+                    let (mail_source, mail_writer) =
+                        build_mail_source(&cfg, client.clone(), &user, &pass);
+                    let repo = Repo::open_or_init(&cfg.storage.repo_path)
+                        .map_err(std::io::Error::other)?;
+                    let caller = std::env::var("PIMSTEWARD_CALLER")
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "ai".to_string());
+                    Ok(PimstewardServer::new(
+                        client,
+                        repo,
+                        cfg.permissions.clone(),
+                        alias,
+                        caller,
+                        mail_source,
+                        mail_writer,
+                    ))
+                },
+                Default::default(),
+                StreamableHttpServerConfig::default()
+                    .with_cancellation_token(ct_http.child_token()),
+            );
+
+        let router = axum::Router::new().nest_service("/mcp", service).layer(
+            middleware::from_fn(move |req: Request, next: Next| {
+                let token = expected_token.clone();
+                async move {
+                    if let Some(ref expected) = token {
+                        let provided = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.strip_prefix("Bearer "));
+                        use subtle::ConstantTimeEq;
+                        let ok = match provided {
+                            Some(t) if t.len() == expected.len() => {
+                                t.as_bytes().ct_eq(expected.as_bytes()).into()
+                            }
+                            _ => false,
+                        };
+                        if !ok {
+                            return Ok(StatusCode::UNAUTHORIZED.into_response());
+                        }
+                    }
+                    Ok::<Response, std::convert::Infallible>(next.run(req).await)
+                }
+            }),
+        );
+
+        let bind_addr = format!("{}:{}", http_opts.host, http_opts.port);
+        let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .map_err(|e| Error::config(format!("binding {bind_addr}: {e}")))?;
+        tracing::info!(addr = %bind_addr, "mcp-http server listening");
+
+        let ct_shutdown = ct.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(tcp_listener, router)
+                .with_graceful_shutdown(async move { ct_shutdown.cancelled().await })
+                .await
+            {
+                tracing::error!(error = %e, "mcp-http server error");
+            }
+        }));
+    }
+
+    if handles.is_empty() {
+        return Err(Error::config(
+            "daemon has nothing to do — config.permissions grants no resource read access and no HTTP server configured",
+        ));
+    }
+
     // Wait for a shutdown signal (SIGINT/SIGTERM on unix). Whichever comes
-    // first, log it and return. The tokio task for each puller is detached;
+    // first, cancel the HTTP server and return. Pull tasks are detached;
     // they'll be cancelled when the main task returns and tokio shuts down.
     wait_for_shutdown().await;
+    ct.cancel();
     tracing::info!("shutdown signal received, daemon exiting");
     Ok(())
 }

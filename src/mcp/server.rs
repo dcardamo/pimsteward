@@ -1670,6 +1670,51 @@ impl PimstewardServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
+    // ── Introspection ────────────────────────────────────────────────
+
+    #[tool(
+        name = "get_permissions",
+        description = "Returns the effective permission matrix for this MCP session as structured JSON. Use this to discover which resources you can read, write, or send before calling other tools. The response includes per-resource access levels and any scoped overrides (per-folder for email, per-calendar-id for calendar)."
+    )]
+    async fn get_permissions(
+        &self,
+        Parameters(_p): Parameters<EmptyParams>,
+    ) -> Result<String, McpError> {
+        let perms = &self.inner.permissions;
+
+        // Build a structured view of the permission matrix. This is NOT
+        // the raw config.toml — it's the resolved, effective permissions
+        // as the MCP server sees them.
+        let email = match &perms.email {
+            crate::permission::EmailPermission::Flat(a) => {
+                serde_json::json!({ "default": a, "folders": {} })
+            }
+            crate::permission::EmailPermission::Scoped(s) => {
+                serde_json::json!({ "default": s.default, "folders": s.folders })
+            }
+        };
+
+        let calendar = match &perms.calendar {
+            crate::permission::CalendarPermission::Flat(a) => {
+                serde_json::json!({ "default": a, "by_id": {} })
+            }
+            crate::permission::CalendarPermission::Scoped(s) => {
+                serde_json::json!({ "default": s.default, "by_id": s.by_id })
+            }
+        };
+
+        let result = serde_json::json!({
+            "email": email,
+            "email_send": perms.email_send,
+            "calendar": calendar,
+            "contacts": perms.contacts,
+            "sieve": perms.sieve,
+        });
+
+        serde_json::to_string_pretty(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
     // ── History / audit ──────────────────────────────────────────────
 
     #[tool(
@@ -1806,7 +1851,8 @@ const TOOL_REQS: &[(&str, ToolReq)] = &[
     ("restore_mail_apply", ToolReq::Write(Resource::Email)),
     ("restore_path_dry_run", ToolReq::Read(Resource::Contacts)),
     ("restore_path_apply", ToolReq::Write(Resource::Contacts)),
-    // Always-available audit tools.
+    // Always-available introspection + audit tools.
+    ("get_permissions", ToolReq::Always),
     ("history", ToolReq::Always),
 ];
 
@@ -1885,6 +1931,9 @@ impl ServerHandler for PimstewardServer {
                  Read, write, and restore tools for email, calendar, contacts, \
                  and sieve scripts, gated by the configured permission matrix. \
                  Every mutation produces an attributed git commit in the backup repo.\n\n\
+                 PERMISSIONS: call `get_permissions` to discover your effective \
+                 access levels before using other tools. Tools whose resource is \
+                 denied are hidden from this list entirely.\n\n\
                  UNDO: almost every mutation is reversible. Each resource has a \
                  `restore_*_dry_run` tool that computes what a rollback would do \
                  (returning a plan + plan_token) and a matching `restore_*_apply` \
@@ -1894,8 +1943,7 @@ impl ServerHandler for PimstewardServer {
                  for delivery, there is no rewind, only an audit trailer.\n\n\
                  AUDIT: the `history` tool is `git log` for any path under the \
                  backup tree, returning structured commits so you can see who \
-                 changed what. Tools whose resource is denied in the current \
-                 permission configuration are hidden from this list entirely.",
+                 changed what.",
                 self.inner.alias, self.inner.caller
             ),
         )
@@ -2226,6 +2274,7 @@ mod tests {
             "restore_calendar_event_dry_run", "restore_calendar_event_apply",
             "restore_mail_dry_run", "restore_mail_apply",
             "restore_path_dry_run", "restore_path_apply",
+            "get_permissions",
             "history",
         ] {
             let _ = req_for(name);
@@ -2297,8 +2346,9 @@ mod tests {
     }
 
     #[test]
-    fn history_is_always_visible() {
+    fn introspection_tools_are_always_visible() {
         let p = Permissions::default(); // everything denied
+        assert!(req_for("get_permissions").is_satisfied(&p));
         assert!(req_for("history").is_satisfied(&p));
     }
 

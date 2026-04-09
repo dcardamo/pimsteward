@@ -77,7 +77,7 @@ pub async fn plan_mail(
             // but the historical path (at_sha) uses the specified folder.
             let mail_root = repo
                 .root()
-                .join("mail".to_string());
+                .join("mail");
             let mut found = None;
             'outer: for folder_entry in std::fs::read_dir(&mail_root).into_iter().flatten().flatten() {
                 let fname = folder_entry.file_name().into_string().unwrap_or_default();

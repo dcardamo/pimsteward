@@ -1,21 +1,20 @@
 //! pimsteward binary entry point.
 //!
-//! v1 subcommands (what ships in this first shipment):
+//! Subcommands:
 //!
 //! - `probe` — hit `GET /v1/account` to verify auth + network
 //! - `pull-contacts` — run one pull cycle for contacts
 //! - `pull-sieve` — run one pull cycle for sieve scripts
-//!
-//! Everything else (pull-mail, pull-calendar, daemon mode, MCP server,
-//! write tools, restore) lands in later phases — the scaffolding is in
-//! place but those code paths return `NotImplemented`.
+//! - `pull-mail` — run one pull cycle for mail
+//! - `pull-calendar` — run one pull cycle for calendars
+//! - `pull-all` — run all pull cycles in sequence
+//! - `daemon` — long-running service: pull timers + MCP HTTP server
 
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::Result;
 use pimsteward::{
     config::{CalendarSourceKind, ContactsSourceKind, MailSourceKind},
     forwardemail::Client,
-    mcp::PimstewardServer,
     pull,
     source::{
         imap::ImapConfig, CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource,
@@ -23,9 +22,8 @@ use pimsteward::{
         RestMailSource,
     },
     store::Repo,
-    Config,
+    Config, HttpOptions,
 };
-use rmcp::{transport::stdio, ServiceExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -127,17 +125,28 @@ enum Command {
     /// Run all pull cycles in sequence.
     PullAll,
 
-    /// Run the MCP server over stdio — exposes read tools to an AI assistant.
-    /// Pipe its stdin/stdout to any MCP-compatible client (Claude Desktop,
-    /// Cursor, etc.) via their server configuration.
-    Mcp,
+    /// Long-running service: pull timers for every resource granted at
+    /// least `read` in config, weekly `git gc --auto`, and (when --port
+    /// is set) an MCP HTTP server for AI clients. This is the only way
+    /// AI accesses pimsteward — all interaction goes through the MCP
+    /// HTTP endpoint.
+    Daemon {
+        /// Address to bind the MCP HTTP server to.
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
 
-    /// Long-running daemon: runs a per-resource pull timer for every
-    /// resource granted at least `read` in config, plus a weekly
-    /// `git gc --auto` on the backup repo. The MCP server is a separate
-    /// stdio subcommand (`pimsteward mcp`) spawned by your MCP client —
-    /// the daemon does not host it.
-    Daemon,
+        /// Port for the MCP HTTP server. When set, the daemon serves the
+        /// MCP protocol over Streamable HTTP / SSE at `/mcp`.
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Path to a file containing a bearer token for authentication.
+        /// If set, every MCP HTTP request must include
+        /// `Authorization: Bearer <token>`. Recommended for any
+        /// network-accessible deployment.
+        #[arg(long)]
+        bearer_token_file: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -330,40 +339,17 @@ async fn main() -> Result<()> {
                 println!("{s}");
             }
         }
-        Command::Mcp => {
-            let (user, pass) = cfg.load_credentials()?;
-            let alias = alias_from_user(&user);
-            let client = Client::new(
-                cfg.forwardemail.api_base.clone(),
-                user.clone(),
-                pass.clone(),
-            )?;
-            let (mail_source, mail_writer) = build_mail_source(&cfg, client.clone(), &user, &pass);
-            let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
-            // Caller name for git-commit attribution on AI-driven writes.
-            // Operators set PIMSTEWARD_CALLER to distinguish multiple
-            // assistants sharing one backup repo (e.g. `PIMSTEWARD_CALLER=claude-desktop`
-            // vs `rockycc`). Falls back to "ai" to preserve v1 behaviour.
-            let caller = std::env::var("PIMSTEWARD_CALLER")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "ai".to_string());
-            let server = PimstewardServer::new(
-                client,
-                repo,
-                cfg.permissions.clone(),
-                alias.clone(),
-                caller,
-                mail_source,
-                mail_writer,
-            );
-            tracing::info!(alias = %alias, "mcp server starting over stdio");
-            let running = server.serve(stdio()).await?;
-            running.waiting().await?;
-        }
-        Command::Daemon => {
-            pimsteward::run(cfg).await?;
+        Command::Daemon {
+            host,
+            port,
+            bearer_token_file,
+        } => {
+            let http = port.map(|p| HttpOptions {
+                host,
+                port: p,
+                bearer_token_file,
+            });
+            pimsteward::run(cfg, http).await?;
         }
     }
     Ok(())
