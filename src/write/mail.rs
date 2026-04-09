@@ -192,7 +192,7 @@ pub async fn delete_message(
     refresh(source, repo, alias, attribution, &audit).await
 }
 
-async fn refresh(
+pub async fn refresh(
     source: &dyn MailSource,
     repo: &Repo,
     alias: &str,

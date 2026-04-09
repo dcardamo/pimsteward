@@ -397,6 +397,32 @@ pub struct CreateDraftParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct CreateReplyDraftParams {
+    /// Recipient email addresses (To:). For reply-all, include all
+    /// original recipients except yourself.
+    pub to: Vec<String>,
+    /// CC recipients. Optional — include original CC recipients for reply-all.
+    #[serde(default)]
+    pub cc: Vec<String>,
+    /// Email subject line. Usually "Re: <original subject>".
+    pub subject: String,
+    /// Message-ID of the email being replied to. Found in the original
+    /// email's Message-ID header. Required for proper threading.
+    pub in_reply_to: String,
+    /// References chain from the original email's References header,
+    /// as a list of Message-IDs. Pass the original References array
+    /// verbatim — the tool appends in_reply_to automatically.
+    #[serde(default)]
+    pub references: Vec<String>,
+    /// Plain-text reply body.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Free-text reason for the audit trail.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SendEmailParams {
     /// Recipient email addresses (To:). Must be non-empty.
     pub to: Vec<String>,
@@ -1128,6 +1154,87 @@ impl PimstewardServer {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         Ok(format!("draft created: {id} in {folder}"))
+    }
+
+    #[tool(
+        name = "create_reply_draft",
+        description = "Create a threaded reply draft in the Drafts folder. Like create_draft but with proper In-Reply-To and References headers so the draft threads correctly in any email client. Use this when drafting a reply to an existing email — provide the original message's Message-ID and References chain. Reply-all by default: pass all original recipients in to/cc."
+    )]
+    async fn create_reply_draft(
+        &self,
+        Parameters(p): Parameters<CreateReplyDraftParams>,
+    ) -> Result<String, McpError> {
+        let folder = "Drafts";
+        self.check_write_scoped(Scope::Email {
+            folder: Some(folder),
+        })?;
+
+        let from = self.inner.client.alias_user();
+        let attr = self.attribution(None, p.reason.clone());
+
+        // Build RFC822 message with threading headers
+        let mut headers = format!(
+            "From: {from}\r\nTo: {to}\r\n",
+            from = from,
+            to = p.to.join(", "),
+        );
+        if !p.cc.is_empty() {
+            headers.push_str(&format!("Cc: {}\r\n", p.cc.join(", ")));
+        }
+        headers.push_str(&format!("Subject: {}\r\n", p.subject));
+        headers.push_str(&format!("In-Reply-To: {}\r\n", p.in_reply_to));
+
+        // References = original References + original Message-ID
+        let mut refs = p.references.clone();
+        if !refs.contains(&p.in_reply_to) {
+            refs.push(p.in_reply_to.clone());
+        }
+        headers.push_str(&format!("References: {}\r\n", refs.join(" ")));
+        headers.push_str("X-Rocky-Draft: true\r\n");
+        headers.push_str("MIME-Version: 1.0\r\n");
+        headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+        headers.push_str("Content-Transfer-Encoding: 8bit\r\n");
+        headers.push_str("\r\n");
+
+        let body = p.text.as_deref().unwrap_or("");
+        let raw = format!("{headers}{body}");
+
+        let result = self
+            .inner
+            .client
+            .append_raw_message(folder, raw.as_bytes())
+            .await
+            .map_err(|e| self.api_error(e))?;
+
+        // Audit + refresh backup tree (same pattern as create_draft)
+        let msg_id = result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let audit = crate::write::audit::WriteAudit {
+            attribution: &attr,
+            tool: "create_reply_draft",
+            resource: "mail",
+            resource_id: msg_id.to_string(),
+            args: serde_json::json!({
+                "folder": folder,
+                "to": &p.to,
+                "subject": &p.subject,
+                "in_reply_to": &p.in_reply_to,
+            }),
+            summary: format!("mail: reply draft in {} → {} (replying to {})",
+                folder, p.subject, p.in_reply_to),
+        };
+        let _ = crate::write::mail::refresh(
+            self.inner.mail_source.as_ref(),
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &audit,
+        )
+        .await;
+
+        Ok(format!("reply draft created: {msg_id} in {folder} (threaded via In-Reply-To: {})", p.in_reply_to))
     }
 
     #[tool(
@@ -1897,6 +2004,7 @@ const TOOL_REQS: &[(&str, ToolReq)] = &[
     ("list_folders", ToolReq::Read(Resource::Email)),
     // Email writes
     ("create_draft", ToolReq::Write(Resource::Email)),
+    ("create_reply_draft", ToolReq::Write(Resource::Email)),
     ("update_email_flags", ToolReq::Write(Resource::Email)),
     ("move_email", ToolReq::Write(Resource::Email)),
     ("delete_email", ToolReq::Write(Resource::Email)),
@@ -2346,7 +2454,7 @@ mod tests {
     fn every_known_tool_has_a_visibility_rule() {
         for name in [
             "search_email", "get_email", "list_folders",
-            "create_draft", "update_email_flags", "move_email", "delete_email", "send_email",
+            "create_draft", "create_reply_draft", "update_email_flags", "move_email", "delete_email", "send_email",
             "list_calendars", "list_events",
             "create_event", "update_event", "delete_event",
             "list_contacts", "create_contact", "update_contact", "delete_contact",
@@ -2368,8 +2476,8 @@ mod tests {
         let p = perms_with(Access::None, Access::ReadWrite, Access::ReadWrite, Access::ReadWrite);
         // Email is none → every email tool must be hidden.
         for t in ["search_email", "get_email", "list_folders", "create_draft",
-                  "update_email_flags", "move_email", "delete_email",
-                  "restore_mail_dry_run", "restore_mail_apply"] {
+                  "create_reply_draft", "update_email_flags", "move_email",
+                  "delete_email", "restore_mail_dry_run", "restore_mail_apply"] {
             assert!(!req_for(t).is_satisfied(&p), "{t} should be hidden when email=none");
         }
         // Unrelated resources stay visible.
