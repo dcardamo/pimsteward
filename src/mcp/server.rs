@@ -463,6 +463,16 @@ pub struct SendEmailParams {
     /// HTML body. Optional.
     #[serde(default)]
     pub html: Option<String>,
+    /// RFC822 Message-ID of the message being replied to. Sets the
+    /// In-Reply-To header so the reply threads correctly in mail clients.
+    /// Get this from the original email's headers via get_email.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// References chain for threading. Should contain the Message-IDs from
+    /// the original email's References header plus its Message-ID. Combined
+    /// with in_reply_to to form proper threading.
+    #[serde(default)]
+    pub references: Vec<String>,
     /// REQUIRED. Free-text reason explaining *why* this message is being
     /// sent. Send is an irreversible outbound action — the reason lands
     /// in the git audit trail so you (or a reviewer) can reconstruct the
@@ -1169,6 +1179,8 @@ impl PimstewardServer {
             subject: p.subject,
             text: p.text,
             html: p.html,
+            in_reply_to: None,
+            references: vec![],
         };
         let result = crate::write::mail::create_draft(
             &self.inner.client,
@@ -1270,7 +1282,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "send_email",
-        description = "Send an email over SMTP via forwardemail's outgoing bridge. IRREVERSIBLE: once this returns success, the message has been accepted for delivery to third parties and there is no 'undo'. A copy is saved to the Sent folder automatically and captured into git on the next pull. Every send is recorded in the git audit log with tool=send_email plus recipients, subject, and body sha256 — `git log --grep='tool: send_email'` enumerates them.\n\nRequires the separate `email_send` permission (default: denied). Granting `email = \"read_write\"` does NOT grant send — you must set `email_send = \"allowed\"` in [permissions] explicitly. If you only want the assistant to prepare outgoing mail for human review, use `create_draft` instead; drafts are safely reversible."
+        description = "Send an email over SMTP via forwardemail's outgoing bridge. IRREVERSIBLE: once this returns success, the message has been accepted for delivery to third parties and there is no 'undo'. A copy is saved to the Sent folder automatically and captured into git on the next pull. Every send is recorded in the git audit log with tool=send_email plus recipients, subject, and body sha256 — `git log --grep='tool: send_email'` enumerates them.\n\nRequires the separate `email_send` permission (default: denied). Granting `email = \"read_write\"` does NOT grant send — you must set `email_send = \"allowed\"` in [permissions] explicitly. If you only want the assistant to prepare outgoing mail for human review, use `create_draft` instead; drafts are safely reversible.\n\nFor threaded replies: pass `in_reply_to` (the original Message-ID from get_email headers) and `references` (the original References chain) to set proper threading headers. The reply will appear in the same thread in mail clients."
     )]
     async fn send_email(
         &self,
@@ -1319,6 +1331,8 @@ impl PimstewardServer {
             subject: p.subject,
             text: p.text,
             html: p.html,
+            in_reply_to: p.in_reply_to,
+            references: p.references,
         };
         let result = crate::write::mail::send_email(
             &self.inner.client,

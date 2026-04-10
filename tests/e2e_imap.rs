@@ -57,6 +57,8 @@ async fn seed_test_message(ctx: &E2eContext) -> String {
         subject,
         text: Some("IMAP e2e test body".to_string()),
         html: None,
+        in_reply_to: None,
+        references: vec![],
     };
     let result = ctx.client.create_message(&msg).await.expect("seed msg");
     result
@@ -226,6 +228,8 @@ async fn imap_idle_fires_on_new_message() {
         subject,
         text: Some("IDLE test body".to_string()),
         html: None,
+        in_reply_to: None,
+        references: vec![],
     };
     let result = ctx.client.create_message(&msg).await.expect("create msg");
     let msg_id = result

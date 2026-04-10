@@ -24,6 +24,11 @@ pub struct NewMessage {
     pub subject: String,
     pub text: Option<String>,
     pub html: Option<String>,
+    /// RFC822 Message-ID of the message being replied to. Sets In-Reply-To.
+    pub in_reply_to: Option<String>,
+    /// References chain for threading. Combined with in_reply_to to form
+    /// the References header.
+    pub references: Vec<String>,
 }
 
 impl Client {
@@ -175,6 +180,14 @@ impl Client {
         &self,
         msg: &NewMessage,
     ) -> Result<serde_json::Value, Error> {
+        // If threading headers are present, build raw RFC822 so we can set
+        // In-Reply-To and References directly. Forwardemail's structured
+        // /v1/emails endpoint doesn't expose these fields, but it does
+        // accept a `raw` field containing a complete RFC822 message.
+        if msg.in_reply_to.is_some() || !msg.references.is_empty() {
+            return self.send_raw_threaded(msg).await;
+        }
+
         let mut body = json!({
             "from": self.alias_user(),
             "to": msg.to,
@@ -196,6 +209,48 @@ impl Client {
         self.post_json("/v1/emails", &body).await
     }
 
+    /// Build a raw RFC822 message with In-Reply-To/References headers and
+    /// send it via the /v1/emails endpoint's `raw` field.
+    async fn send_raw_threaded(
+        &self,
+        msg: &NewMessage,
+    ) -> Result<serde_json::Value, Error> {
+        let from = self.alias_user();
+        let mut headers = format!("From: {from}\r\n");
+        headers.push_str(&format!("To: {}\r\n", msg.to.join(", ")));
+        if !msg.cc.is_empty() {
+            headers.push_str(&format!("Cc: {}\r\n", msg.cc.join(", ")));
+        }
+        headers.push_str(&format!("Subject: {}\r\n", msg.subject));
+
+        if let Some(ref irt) = msg.in_reply_to {
+            headers.push_str(&format!("In-Reply-To: {irt}\r\n"));
+        }
+        // References = provided chain + in_reply_to (if not already present)
+        let mut refs = msg.references.clone();
+        if let Some(ref irt) = msg.in_reply_to {
+            if !refs.contains(irt) {
+                refs.push(irt.clone());
+            }
+        }
+        if !refs.is_empty() {
+            headers.push_str(&format!("References: {}\r\n", refs.join(" ")));
+        }
+        headers.push_str("MIME-Version: 1.0\r\n");
+        headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+        headers.push_str("Content-Transfer-Encoding: 8bit\r\n");
+        headers.push_str("\r\n");
+
+        let text = msg.text.as_deref().unwrap_or("");
+        let raw = format!("{headers}{text}");
+
+        let body = json!({
+            "from": from,
+            "raw": raw,
+        });
+        self.post_json("/v1/emails", &body).await
+    }
+
     /// POST /v1/messages with structured fields — creates a new message in
     /// the specified folder. Forwardemail constructs the RFC822 envelope and
     /// body server-side from the structured fields (to, cc, bcc, subject,
@@ -205,6 +260,37 @@ impl Client {
         &self,
         msg: &NewMessage,
     ) -> Result<serde_json::Value, Error> {
+        // If threading headers are present, use raw append so
+        // In-Reply-To/References are preserved in the stored message.
+        if msg.in_reply_to.is_some() || !msg.references.is_empty() {
+            let from = self.alias_user();
+            let mut headers = format!("From: {from}\r\n");
+            headers.push_str(&format!("To: {}\r\n", msg.to.join(", ")));
+            if !msg.cc.is_empty() {
+                headers.push_str(&format!("Cc: {}\r\n", msg.cc.join(", ")));
+            }
+            headers.push_str(&format!("Subject: {}\r\n", msg.subject));
+            if let Some(ref irt) = msg.in_reply_to {
+                headers.push_str(&format!("In-Reply-To: {irt}\r\n"));
+            }
+            let mut refs = msg.references.clone();
+            if let Some(ref irt) = msg.in_reply_to {
+                if !refs.contains(irt) {
+                    refs.push(irt.clone());
+                }
+            }
+            if !refs.is_empty() {
+                headers.push_str(&format!("References: {}\r\n", refs.join(" ")));
+            }
+            headers.push_str("MIME-Version: 1.0\r\n");
+            headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+            headers.push_str("Content-Transfer-Encoding: 8bit\r\n");
+            headers.push_str("\r\n");
+            let text = msg.text.as_deref().unwrap_or("");
+            let raw = format!("{headers}{text}");
+            return self.append_raw_message(&msg.folder, raw.as_bytes()).await;
+        }
+
         let mut body = json!({
             "folder": msg.folder,
             "to": msg.to,

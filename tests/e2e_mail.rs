@@ -365,6 +365,8 @@ async fn mail_create_draft() {
         subject: subject.clone(),
         text: Some("Draft body from e2e test".to_string()),
         html: None,
+        in_reply_to: None,
+        references: vec![],
     };
 
     let result = write::mail::create_draft(

@@ -124,6 +124,8 @@ async fn send_email_delivers_and_records_audit_commit() {
         subject: subject.clone(),
         text: Some(text_body.clone()),
         html: Some(html_body.clone()),
+        in_reply_to: None,
+        references: vec![],
     };
 
     // The MailSource/MailWriter plumbing in the e2e context uses REST
