@@ -34,6 +34,25 @@ fn perm_denied(msg: impl Into<std::borrow::Cow<'static, str>>) -> McpError {
     McpError::new(PERMISSION_DENIED_CODE, msg, None)
 }
 
+/// Check if a calendar event has STATUS:CANCELLED. Checks the struct field
+/// first (populated by the REST API), then falls back to parsing the raw
+/// iCalendar text (needed for CalDAV-sourced events where the field may
+/// not be populated by upstream).
+fn is_cancelled(ev: &crate::forwardemail::calendar::CalendarEvent) -> bool {
+    // Struct field — populated by REST API responses
+    if let Some(ref s) = ev.status {
+        return s.eq_ignore_ascii_case("CANCELLED");
+    }
+    // Fallback: grep the raw iCal for STATUS:CANCELLED
+    if let Some(ref ical) = ev.ical {
+        return ical.lines().any(|line| {
+            let l = line.trim();
+            l.eq_ignore_ascii_case("STATUS:CANCELLED")
+        });
+    }
+    false
+}
+
 /// Shared state held by every tool handler.
 #[derive(Clone)]
 pub struct PimstewardServer {
@@ -254,6 +273,10 @@ pub struct ListEventsParams {
     /// access to are filtered out (rather than failing the whole call).
     #[serde(default)]
     pub calendar_id: Option<String>,
+    /// Include cancelled events in the result. Defaults to false —
+    /// events with STATUS:CANCELLED are excluded by default.
+    #[serde(default)]
+    pub include_cancelled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -806,12 +829,14 @@ impl PimstewardServer {
 
     #[tool(
         name = "list_events",
-        description = "List calendar events. Pass `calendar_id` to restrict to one calendar (checked against scoped per-calendar permissions). With no `calendar_id`, events are returned for every calendar the caller has read access to — events in calendars you can't read are filtered out silently rather than failing the call. Returns event JSON including the raw iCalendar text."
+        description = "List calendar events. Pass `calendar_id` to restrict to one calendar (checked against scoped per-calendar permissions). With no `calendar_id`, events are returned for every calendar the caller has read access to — events in calendars you can't read are filtered out silently rather than failing the call. Cancelled events (STATUS:CANCELLED) are excluded by default; pass `include_cancelled: true` to include them. Returns event JSON including the raw iCalendar text."
     )]
     async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
     ) -> Result<String, McpError> {
+        let include_cancelled = p.include_cancelled.unwrap_or(false);
+
         // Scoped path: caller asked for one calendar. Gate that specific
         // calendar id and pass it through to forwardemail as a filter.
         if let Some(ref cal_id) = p.calendar_id {
@@ -824,7 +849,12 @@ impl PimstewardServer {
                 .list_calendar_events(Some(cal_id))
                 .await
                 .map_err(|e| self.api_error(e))?;
-            return serde_json::to_string_pretty(&events)
+            let filtered: Vec<_> = if include_cancelled {
+                events
+            } else {
+                events.into_iter().filter(|ev| !is_cancelled(ev)).collect()
+            };
+            return serde_json::to_string_pretty(&filtered)
                 .map_err(|e| McpError::internal_error(e.to_string(), None));
         }
 
@@ -852,6 +882,7 @@ impl PimstewardServer {
                         calendar_id: ev.calendar_id.as_deref(),
                     })
                     .is_ok()
+                    && (include_cancelled || !is_cancelled(ev))
             })
             .collect();
         serde_json::to_string_pretty(&filtered)

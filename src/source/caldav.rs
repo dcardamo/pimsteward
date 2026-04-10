@@ -136,6 +136,7 @@ impl CalendarSource for DavCalendarSource {
                 // uses UID as the canonical event identifier, same as the
                 // REST source.
                 let uid = extract_ical_uid(&ical);
+                let status = extract_ical_status(&ical);
                 // The forwardemail REST `id` field is the last path segment
                 // of the href, minus the .ics extension.
                 let href_id = r
@@ -155,7 +156,7 @@ impl CalendarSource for DavCalendarSource {
                     location: None,
                     start_date: None,
                     end_date: None,
-                    status: None,
+                    status,
                     created_at: None,
                     updated_at: None,
                 });
@@ -168,7 +169,19 @@ impl CalendarSource for DavCalendarSource {
 /// Extract the first UID: line from a VEVENT in an iCalendar blob. Minimal
 /// parser — good enough for forwardemail output.
 fn extract_ical_uid(ics: &str) -> Option<String> {
-    // Find the first VEVENT block and look for a UID: line inside it.
+    extract_ical_field(ics, "UID")
+}
+
+/// Extract the first STATUS: line from a VEVENT in an iCalendar blob.
+/// Returns values like "CONFIRMED", "TENTATIVE", or "CANCELLED".
+fn extract_ical_status(ics: &str) -> Option<String> {
+    extract_ical_field(ics, "STATUS")
+}
+
+/// Extract the first occurrence of a named property from the first VEVENT
+/// block in an iCalendar blob. Minimal line-by-line parser.
+fn extract_ical_field(ics: &str, field: &str) -> Option<String> {
+    let prefix = format!("{}:", field);
     let mut in_vevent = false;
     for line in ics.lines() {
         let l = line.trim();
@@ -176,8 +189,8 @@ fn extract_ical_uid(ics: &str) -> Option<String> {
             in_vevent = true;
         } else if l.eq_ignore_ascii_case("END:VEVENT") {
             in_vevent = false;
-        } else if in_vevent && l.to_ascii_uppercase().starts_with("UID:") {
-            return Some(l[4..].trim().to_string());
+        } else if in_vevent && l.to_ascii_uppercase().starts_with(&prefix) {
+            return Some(l[prefix.len()..].trim().to_string());
         }
     }
     None
@@ -200,5 +213,23 @@ mod tests {
         // outside the VEVENT. We should skip it and take the VEVENT UID.
         let ics = "BEGIN:VCALENDAR\nUID:cal-level\nBEGIN:VEVENT\nUID:event-level\nEND:VEVENT\nEND:VCALENDAR";
         assert_eq!(extract_ical_uid(ics), Some("event-level".into()));
+    }
+
+    #[test]
+    fn extract_status_cancelled() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSTATUS:CANCELLED\nEND:VEVENT\nEND:VCALENDAR";
+        assert_eq!(extract_ical_status(ics), Some("CANCELLED".into()));
+    }
+
+    #[test]
+    fn extract_status_confirmed() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSTATUS:CONFIRMED\nSUMMARY:Hi\nEND:VEVENT\nEND:VCALENDAR";
+        assert_eq!(extract_ical_status(ics), Some("CONFIRMED".into()));
+    }
+
+    #[test]
+    fn extract_status_absent() {
+        let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSUMMARY:Hi\nEND:VEVENT\nEND:VCALENDAR";
+        assert_eq!(extract_ical_status(ics), None);
     }
 }
