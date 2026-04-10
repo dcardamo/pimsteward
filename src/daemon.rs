@@ -22,10 +22,27 @@ use crate::store::Repo;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
+
+/// Notification emitted when the mail pull loop detects changes.
+/// Consumers (e.g. rockycc email watchers) subscribe via the
+/// `/notifications` SSE endpoint instead of watching files.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MailNotification {
+    /// Which account (alias) this notification is for.
+    pub alias: String,
+    /// Number of new messages added.
+    pub added: usize,
+    /// Number of messages updated (flags, folder moves).
+    pub updated: usize,
+    /// Number of messages deleted.
+    pub deleted: usize,
+    /// ISO8601 timestamp of the pull.
+    pub timestamp: String,
+}
 
 /// HTTP server options for the embedded MCP endpoint. When `port` is
 /// `Some`, the daemon serves MCP over Streamable HTTP alongside its pull
@@ -134,6 +151,12 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
         ));
     }
 
+    // Broadcast channel for mail notifications. Consumers subscribe via
+    // the /notifications SSE endpoint. Buffer 64 events — slow consumers
+    // that fall behind will miss events (acceptable; they'll catch up on
+    // the next pull cycle).
+    let (mail_tx, _) = broadcast::channel::<MailNotification>(64);
+
     if cfg.permissions.check_read(Resource::Email).is_ok() {
         // Mail has a dedicated puller because it dispatches on a
         // MailSource trait object, not a concrete Client.
@@ -188,6 +211,7 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
             repo.clone(),
             alias.clone(),
             idle_notify,
+            mail_tx.clone(),
         );
         handles.push(h);
     }
@@ -280,7 +304,14 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
                     .with_cancellation_token(ct_http.child_token()),
             );
 
-        let router = axum::Router::new().nest_service("/mcp", service).layer(
+        let mail_rx = mail_tx.clone();
+        let router = axum::Router::new()
+            .nest_service("/mcp", service)
+            .route("/notifications", axum::routing::get(move || {
+                let rx = mail_rx.subscribe();
+                async move { notifications_sse(rx) }
+            }))
+            .layer(
             middleware::from_fn(move |req: Request, next: Next| {
                 let token = expected_token.clone();
                 async move {
@@ -461,13 +492,12 @@ fn spawn_mail_puller(
     repo: Arc<Repo>,
     alias: String,
     idle_notify: Option<Arc<Notify>>,
+    mail_tx: broadcast::Sender<MailNotification>,
 ) -> tokio::task::JoinHandle<()> {
     let span = tracing::info_span!("puller", resource = "mail");
     tokio::spawn(
         async move {
             let mut ticker = interval(period);
-            // The first tick fires immediately, so we always do an initial
-            // pull on startup regardless of whether IDLE is wired up.
             tracing::info!(
                 period_secs = period.as_secs(),
                 source = source.tag(),
@@ -475,11 +505,6 @@ fn spawn_mail_puller(
                 "mail puller started"
             );
             loop {
-                // Wake on whichever fires first: the periodic ticker, or
-                // (when IDLE is enabled) a signal from the idle listener.
-                // `Notify` semantics: a notify_one() that arrives while
-                // nobody is notified().await-ing is latched, so we never
-                // miss an event between pulls.
                 match &idle_notify {
                     Some(n) => {
                         tokio::select! {
@@ -505,7 +530,19 @@ fn spawn_mail_puller(
                 )
                 .await;
                 match result {
-                    Ok(s) => tracing::info!(summary = %s, "pull ok"),
+                    Ok(ref s) => {
+                        tracing::info!(summary = %s, "pull ok");
+                        // Broadcast notification if there were changes
+                        if !s.is_noop() {
+                            let _ = mail_tx.send(MailNotification {
+                                alias: alias.clone(),
+                                added: s.added,
+                                updated: s.updated,
+                                deleted: s.deleted,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            });
+                        }
+                    }
                     Err(e) => tracing::error!(error = %e, "pull failed"),
                 }
             }
@@ -554,6 +591,45 @@ fn spawn_puller(
             }
         }
         .instrument(span),
+    )
+}
+
+/// SSE handler for `/notifications`. Streams mail pull notifications as
+/// Server-Sent Events. Consumers (e.g. rockycc email watchers) subscribe
+/// to this instead of watching pimsteward's git repo via bind mounts.
+fn notifications_sse(
+    rx: broadcast::Receiver<MailNotification>,
+) -> axum::response::Sse<impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    use axum::response::sse::Event;
+    use futures_util::stream;
+
+    let stream = stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(notif) => {
+                    let data = serde_json::to_string(&notif).unwrap_or_default();
+                    let event = Event::default()
+                        .event("mail")
+                        .data(data);
+                    return Some((Ok(event), rx));
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(missed = n, "SSE subscriber lagged, skipping events");
+                    // Continue receiving — don't disconnect lagged clients
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return None; // Channel closed, end stream
+                }
+            }
+        }
+    });
+
+    axum::response::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("ping"),
     )
 }
 

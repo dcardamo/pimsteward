@@ -205,8 +205,9 @@ flowchart TB
     subgraph daemon["pimsteward daemon (single process)"]
         direction TB
 
-        subgraph mcphttp["MCP HTTP server (:port/mcp)"]
-            MCP["MCP tools<br/>read / write / restore"]
+        subgraph mcphttp["HTTP server (:port)"]
+            MCP["MCP tools (/mcp)<br/>read / write / restore"]
+            SSE["SSE notifications (/notifications)<br/>mail change events"]
             PERM["Permission gate<br/>none / read / read_write<br/>flat or scoped"]
             WRITE["Write path<br/>API → re-pull → commit"]
             REST["Restore engine<br/>git @ T → diff → dry-run + apply"]
@@ -226,6 +227,8 @@ flowchart TB
     FE["forwardemail.net<br/>authoritative store"]
 
     AI -- "HTTP SSE + Bearer token" --> MCP
+    AI -. "SSE subscribe" .-> SSE
+    PULL -- "broadcast" --> SSE
     PULL -- "IMAP / CalDAV / CardDAV / REST" --> FE
     WRITE -- "REST" --> FE
     REST -- "REST" --> FE
@@ -256,6 +259,58 @@ The daemon handles everything in one process: Pull and GC run as background
 tasks, while the MCP HTTP server handles AI requests. Write and Restore
 execute in MCP request handlers and commit to the same git repo the pull
 loops are syncing into.
+
+### SSE notifications endpoint
+
+pimsteward exposes a Server-Sent Events endpoint at `/notifications` (same
+port as `/mcp`, same bearer token auth). When the mail pull loop detects
+changes (new messages, flag updates, deletions), it broadcasts a notification
+to all connected SSE clients.
+
+This is the **intended integration point for consumers** like email watchers.
+Consumers subscribe to the SSE stream and react to events — they never read
+pimsteward's git repo directly. This enforces the security boundary: even if
+a consumer container is compromised, the attacker only sees notifications
+(alias, counts, timestamps) not email content. To read actual email data,
+the consumer must call MCP tools which are subject to the permission gate.
+
+**Event format** (`event: mail`):
+
+```json
+{
+  "alias": "rocky-hld.ca",
+  "added": 1,
+  "updated": 0,
+  "deleted": 0,
+  "timestamp": "2026-04-10T12:00:00Z"
+}
+```
+
+**Usage:**
+
+```bash
+curl -N -H "Authorization: Bearer $TOKEN" \
+     -H "Accept: text/event-stream" \
+     http://host:8100/notifications
+```
+
+A 30-second keepalive ping prevents idle timeouts. Lagged clients that fall
+behind the 64-event buffer will miss events (acceptable — the next pull cycle
+will catch them up).
+
+### Security boundary
+
+pimsteward is designed to run in an **isolated container** separate from the
+AI assistant. The AI container:
+
+- Connects to pimsteward **only via HTTP** (MCP + SSE)
+- Has **zero access** to pimsteward's git repo, credentials, or process memory
+- Cannot bypass the MCP permission layer
+- Cannot read email/calendar/contact data from the filesystem
+
+No bind mounts, no shared volumes, no credential files. If the AI container
+is compromised, the attacker can only access what the permission matrix allows
+through MCP — they cannot exfiltrate bulk data or read credentials.
 
 ---
 
