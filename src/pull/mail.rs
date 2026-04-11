@@ -389,12 +389,61 @@ fn read_local_message_meta(
     Ok(out)
 }
 
+/// Maximum fraction of on-disk folders that a single pull is allowed
+/// to remove. If the current server-reported folder list would cause
+/// us to delete more than this fraction of what's on disk, the cleanup
+/// is refused and logged loudly — the input is treated as a transient
+/// server glitch rather than a legitimate rename/delete.
+///
+/// Chosen at 0.5 (50%) so that a user can still delete half their
+/// folders in a single manual action if they really want to, while
+/// a bogus "server returned only INBOX" skeleton list against a
+/// 20-folder account (which would want to remove 19/20 = 95%) is
+/// blocked.
+const MAX_CLEANUP_REMOVAL_FRACTION: f64 = 0.5;
+
+/// Delete folders from the backup tree that are no longer on the
+/// server. Guarded heavily against transient IMAP glitches that would
+/// otherwise nuke large portions of the archive — see the Apr 11 2026
+/// incident where forwardemail's IMAP server restart caused
+/// `list_folders()` to return a sparse list mid-recovery and this
+/// routine deleted every Archive/YYYY folder (2005–2020+) under a
+/// `mail: +0 ~0 -0` commit message. The deletion was committed and the
+/// puller then spent hours re-syncing everything from scratch.
+///
+/// Safeguards, in order:
+///   1. Empty folder list → refuse. An active IMAP account always has
+///      at least INBOX; an empty result is definitively bogus.
+///   2. Removal would exceed [`MAX_CLEANUP_REMOVAL_FRACTION`] of the
+///      folders currently on disk → refuse. Real user actions touch
+///      one folder at a time; catastrophic server state returns a
+///      skeleton list that would remove most of them.
+///   3. Otherwise, remove the unexpected folders as before.
+///
+/// Refusal is NOT an error — it's logged at WARN and the pull
+/// continues normally. A refusal today does not prevent cleanup from
+/// running next pull with a correct folder list.
 fn cleanup_removed_folders(repo: &Repo, folders: &[Folder]) -> Result<(), Error> {
     let mail_root = repo.root().join("mail");
     if !mail_root.exists() {
         return Ok(());
     }
+
+    // Safeguard #1: never act on an empty folder list.
+    if folders.is_empty() {
+        tracing::warn!(
+            "cleanup_removed_folders: list_folders returned empty set, \
+             refusing to delete anything (likely transient IMAP state)"
+        );
+        return Ok(());
+    }
+
     let current: HashSet<String> = folders.iter().map(|f| folder_safe(&f.path)).collect();
+
+    // Enumerate on-disk folders first (and stash them) so we can make
+    // the removal-fraction decision before mutating anything.
+    let mut on_disk: Vec<PathBuf> = Vec::new();
+    let mut candidates_for_removal: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&mail_root)
         .map_err(|e| Error::store(format!("readdir {}: {}", mail_root.display(), e)))?
     {
@@ -406,10 +455,34 @@ fn cleanup_removed_folders(repo: &Repo, folders: &[Folder]) -> Result<(), Error>
         if name == "_attachments" {
             continue;
         }
+        on_disk.push(entry.path());
         if !current.contains(&name) {
-            // Remove the whole folder subtree
-            let _ = std::fs::remove_dir_all(entry.path());
+            candidates_for_removal.push(entry.path());
         }
+    }
+
+    // Safeguard #2: refuse a mass-removal that looks like a transient
+    // glitch.
+    if !on_disk.is_empty() && !candidates_for_removal.is_empty() {
+        let removal_fraction =
+            candidates_for_removal.len() as f64 / on_disk.len() as f64;
+        if removal_fraction > MAX_CLEANUP_REMOVAL_FRACTION {
+            tracing::warn!(
+                on_disk = on_disk.len(),
+                candidates = candidates_for_removal.len(),
+                removal_fraction = removal_fraction,
+                max_allowed = MAX_CLEANUP_REMOVAL_FRACTION,
+                "cleanup_removed_folders: refusing mass folder deletion \
+                 (remote folder list likely transient). Folders preserved; \
+                 cleanup will re-evaluate on the next pull with a fresh \
+                 list_folders result."
+            );
+            return Ok(());
+        }
+    }
+
+    for path in candidates_for_removal {
+        let _ = std::fs::remove_dir_all(&path);
     }
     Ok(())
 }
@@ -693,6 +766,200 @@ mod tests {
         let repo = Repo::open_or_init(tmp.path()).unwrap();
         let (uv, mi) = read_prev_folder_state(&repo, "mail/INBOX");
         assert_eq!((uv, mi), (None, None));
+    }
+
+    // ── cleanup_removed_folders safety guards ────────────────────────
+    //
+    // Regression tests for the Apr 11 2026 "nuke every Archive folder
+    // on a transient IMAP glitch" incident. The whole set is tagged
+    // with what it's guarding against — future refactorers please
+    // don't delete these lightly.
+
+    fn seed_folder(repo: &Repo, name: &str) {
+        repo.write_file(
+            format!("mail/{name}/_folder.json"),
+            br#"{"id":"placeholder"}"#,
+        )
+        .unwrap();
+    }
+
+    fn folder_for(name: &str) -> Folder {
+        Folder {
+            id: name.to_string(),
+            path: name.to_string(),
+            name: name.to_string(),
+            uid_validity: None,
+            uid_next: None,
+            modify_index: None,
+            subscribed: true,
+            special_use: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn folder_exists_on_disk(repo: &Repo, safe_name: &str) -> bool {
+        repo.root().join("mail").join(safe_name).exists()
+    }
+
+    #[test]
+    fn cleanup_refuses_empty_folder_list() {
+        // Scenario: list_folders() returned Ok(vec![]) because
+        // forwardemail's IMAP server was still coming back up from a
+        // restart. Without the guard, this used to wipe every folder
+        // on disk. With the guard, everything is preserved and a
+        // warning is logged.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        seed_folder(&repo, "INBOX");
+        seed_folder(&repo, "Archive_2010");
+        seed_folder(&repo, "Archive_2011");
+
+        cleanup_removed_folders(&repo, &[]).unwrap();
+
+        assert!(folder_exists_on_disk(&repo, "INBOX"));
+        assert!(folder_exists_on_disk(&repo, "Archive_2010"));
+        assert!(folder_exists_on_disk(&repo, "Archive_2011"));
+    }
+
+    #[test]
+    fn cleanup_refuses_mass_removal_above_threshold() {
+        // Scenario: 20 folders on disk, list_folders returned only
+        // INBOX. That would remove 19/20 = 95% of the archive — way
+        // above the 50% threshold. Refuse.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        for y in 2005..=2019 {
+            seed_folder(&repo, &format!("Archive_{y}"));
+        }
+        seed_folder(&repo, "INBOX");
+        seed_folder(&repo, "Drafts");
+        seed_folder(&repo, "Sent");
+        seed_folder(&repo, "Spam");
+        seed_folder(&repo, "Trash");
+
+        // Server only reports INBOX — the rest should look "missing"
+        // but the guard refuses to act.
+        cleanup_removed_folders(&repo, &[folder_for("INBOX")]).unwrap();
+
+        for y in 2005..=2019 {
+            assert!(
+                folder_exists_on_disk(&repo, &format!("Archive_{y}")),
+                "Archive_{y} should have survived the refused mass-removal"
+            );
+        }
+        assert!(folder_exists_on_disk(&repo, "Drafts"));
+        assert!(folder_exists_on_disk(&repo, "Sent"));
+    }
+
+    #[test]
+    fn cleanup_allows_small_removal() {
+        // Scenario: user actually deleted one folder. Removal of 1/20
+        // is 5%, well under the 50% threshold → cleanup proceeds.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        for y in 2005..=2019 {
+            seed_folder(&repo, &format!("Archive_{y}"));
+        }
+        seed_folder(&repo, "INBOX");
+        seed_folder(&repo, "Drafts");
+        seed_folder(&repo, "Old_Project");
+        seed_folder(&repo, "Sent");
+        seed_folder(&repo, "Spam");
+
+        // Server reports everything except Old_Project.
+        let mut folders: Vec<Folder> = (2005..=2019)
+            .map(|y| folder_for(&format!("Archive/{y}")))
+            .collect();
+        folders.push(folder_for("INBOX"));
+        folders.push(folder_for("Drafts"));
+        folders.push(folder_for("Sent"));
+        folders.push(folder_for("Spam"));
+
+        cleanup_removed_folders(&repo, &folders).unwrap();
+
+        assert!(!folder_exists_on_disk(&repo, "Old_Project"),
+                "single-folder removal should have been allowed");
+        // Everything else preserved.
+        for y in 2005..=2019 {
+            assert!(folder_exists_on_disk(&repo, &format!("Archive_{y}")));
+        }
+        assert!(folder_exists_on_disk(&repo, "INBOX"));
+    }
+
+    #[test]
+    fn cleanup_refuses_at_exactly_over_threshold() {
+        // Boundary test: 10 folders on disk, removing 6 = 60% > 50%
+        // threshold → refuse. Removing 5 = 50% is NOT strictly above
+        // the threshold and would be allowed (sibling test below).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        for i in 0..10 {
+            seed_folder(&repo, &format!("Folder_{i}"));
+        }
+        // Server reports only 4 → would remove 6/10 = 60%.
+        let folders: Vec<Folder> = (0..4).map(|i| folder_for(&format!("Folder/{i}"))).collect();
+
+        cleanup_removed_folders(&repo, &folders).unwrap();
+
+        // All 10 preserved — the 60% removal was refused.
+        for i in 0..10 {
+            assert!(
+                folder_exists_on_disk(&repo, &format!("Folder_{i}")),
+                "Folder_{i} should have survived (removal fraction exceeds threshold)"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_allows_at_exactly_threshold() {
+        // Boundary test: 10 folders on disk, removing 5 = 50% which
+        // is NOT strictly greater than MAX_CLEANUP_REMOVAL_FRACTION
+        // (0.5), so cleanup proceeds. This is a deliberate choice:
+        // if a user really wants to delete half their folders in one
+        // sweep, allow it. Anything more extreme looks like a bug.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        for i in 0..10 {
+            seed_folder(&repo, &format!("Folder_{i}"));
+        }
+        let folders: Vec<Folder> = (0..5).map(|i| folder_for(&format!("Folder/{i}"))).collect();
+
+        cleanup_removed_folders(&repo, &folders).unwrap();
+
+        // Folder_0..4 preserved, Folder_5..9 removed.
+        for i in 0..5 {
+            assert!(folder_exists_on_disk(&repo, &format!("Folder_{i}")));
+        }
+        for i in 5..10 {
+            assert!(!folder_exists_on_disk(&repo, &format!("Folder_{i}")));
+        }
+    }
+
+    #[test]
+    fn cleanup_preserves_attachments_directory() {
+        // _attachments is the content-addressed blob store, not a
+        // folder. It must never be touched by cleanup regardless of
+        // what list_folders returned. (This was already handled by
+        // the original code; the test pins the behavior so the
+        // guard refactor didn't regress it.)
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        repo.write_file("mail/_attachments/some_blob", b"data").unwrap();
+        seed_folder(&repo, "INBOX");
+
+        cleanup_removed_folders(&repo, &[folder_for("INBOX")]).unwrap();
+
+        assert!(folder_exists_on_disk(&repo, "_attachments"));
+        assert!(folder_exists_on_disk(&repo, "INBOX"));
+    }
+
+    #[test]
+    fn cleanup_no_mail_root_is_ok() {
+        // Fresh repo with no mail/ subdir yet — nothing to clean up.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        cleanup_removed_folders(&repo, &[folder_for("INBOX")]).unwrap();
     }
 
     #[test]
