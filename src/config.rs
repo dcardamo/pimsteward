@@ -28,6 +28,26 @@ pub struct Config {
 
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Additional MCP HTTP listeners with their own bearer token and
+    /// permission profile. Each entry spawns an extra HTTP listener on
+    /// the configured `port`, allowing multiple MCP clients to share the
+    /// same daemon (and the same underlying mail/calendar/contact data)
+    /// with *different* permission matrices.
+    ///
+    /// Why: rockycc (AI assistant) and spamguard (mail filter) both need
+    /// access to `dan@hld.ca`, but want very different capabilities.
+    /// Rockycc is limited to read-only + Drafts write. Spamguard needs
+    /// read_write on the whole mailbox so it can move scored messages to
+    /// Spam. A single-token daemon forces both callers into the same
+    /// permission matrix; profiles break that tie.
+    ///
+    /// The default `--bearer-token-file` + `[permissions]` combination
+    /// is always served on the CLI-provided `--port`, regardless of what
+    /// is configured here — profiles are strictly additive so back-compat
+    /// is preserved.
+    #[serde(default)]
+    pub mcp_profiles: Vec<McpProfile>,
 }
 
 impl Default for Config {
@@ -38,7 +58,43 @@ impl Default for Config {
             permissions: Permissions::default(),
             pull: PullConfig::default(),
             log_level: default_log_level(),
+            mcp_profiles: Vec::new(),
         }
+    }
+}
+
+/// One named MCP HTTP profile. Serves a separate `axum::serve` listener
+/// on its own `port`, authenticated by its own `bearer_token_file`, with
+/// tool calls gated by its own `permissions` matrix. Lets a single
+/// pimsteward daemon mediate the same alias to multiple callers with
+/// different access levels.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpProfile {
+    /// Profile name — used in log lines and the caller-attribution git
+    /// trailer on any mutation originating from this endpoint.
+    pub name: String,
+    /// TCP port for this profile's MCP HTTP listener. Must differ from
+    /// the CLI `--port` and from every other profile's `port`.
+    pub port: u16,
+    /// Path to a file containing this profile's bearer token. Required
+    /// — profiles without auth are a design smell.
+    pub bearer_token_file: PathBuf,
+    /// Caller name recorded in git commit attribution for every write
+    /// initiated through this profile. Defaults to the profile `name`.
+    #[serde(default)]
+    pub caller: Option<String>,
+    /// Permission matrix for this profile. Independent of the top-level
+    /// `[permissions]`; must be set explicitly (the default is
+    /// `Permissions::default()` which denies everything).
+    #[serde(default)]
+    pub permissions: Permissions,
+}
+
+impl McpProfile {
+    /// The caller name to attribute writes to. Falls back to the profile
+    /// `name` when no explicit `caller` is set.
+    pub fn caller_name(&self) -> &str {
+        self.caller.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -398,6 +454,106 @@ repo_path = "/tmp/repo"
         let (user, pass) = cfg.load_credentials().unwrap();
         assert_eq!(user, "alice@example.com");
         assert_eq!(pass, "secret123");
+    }
+
+    #[test]
+    fn mcp_profiles_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&dir.path().join("none.toml")).unwrap();
+        assert!(cfg.mcp_profiles.is_empty());
+    }
+
+    #[test]
+    fn mcp_profiles_parse_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[forwardemail]
+alias_user_file = "/tmp/u"
+alias_password_file = "/tmp/p"
+
+[storage]
+repo_path = "/tmp/repo"
+
+# Top-level (default) permissions — used by the primary MCP listener on
+# the CLI --port. Restricted, so read-only for rockycc.
+[permissions]
+email_send = "denied"
+calendar   = "read_write"
+
+[permissions.email]
+default = "read"
+[permissions.email.folders]
+Drafts = "read_write"
+
+# Profile used by spamguard — needs full mailbox write to move spam.
+[[mcp_profiles]]
+name = "spamguard"
+port = 8102
+bearer_token_file = "/run/secrets/spamguard-token"
+caller = "spamguard"
+
+[mcp_profiles.permissions]
+email_send = "denied"
+
+[mcp_profiles.permissions.email]
+default = "read_write"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+
+        // Default top-level permissions unchanged — rockycc still read-only.
+        assert_eq!(cfg.permissions.email.default_access(), Access::Read);
+        assert_eq!(
+            cfg.permissions.email.for_folder(Some("Drafts")),
+            Access::ReadWrite
+        );
+        assert_eq!(
+            cfg.permissions.email.for_folder(Some("INBOX")),
+            Access::Read,
+            "rockycc must NOT be granted write on INBOX",
+        );
+
+        // Profile is additive.
+        assert_eq!(cfg.mcp_profiles.len(), 1);
+        let p = &cfg.mcp_profiles[0];
+        assert_eq!(p.name, "spamguard");
+        assert_eq!(p.port, 8102);
+        assert_eq!(
+            p.bearer_token_file,
+            PathBuf::from("/run/secrets/spamguard-token")
+        );
+        assert_eq!(p.caller_name(), "spamguard");
+        assert_eq!(p.permissions.email.default_access(), Access::ReadWrite);
+        // Confirms the two permission matrices are independent.
+        assert_eq!(
+            p.permissions.email.for_folder(Some("INBOX")),
+            Access::ReadWrite,
+            "spamguard profile must grant INBOX write",
+        );
+    }
+
+    #[test]
+    fn mcp_profile_caller_defaults_to_name() {
+        // caller = None → caller_name() returns the profile name so git
+        // trailers are still attributed to something meaningful.
+        let p = McpProfile {
+            name: "spamguard".into(),
+            port: 8102,
+            bearer_token_file: PathBuf::from("/tmp/t"),
+            caller: None,
+            permissions: Permissions::default(),
+        };
+        assert_eq!(p.caller_name(), "spamguard");
+
+        let p = McpProfile {
+            caller: Some("filter-bot".into()),
+            ..p
+        };
+        assert_eq!(p.caller_name(), "filter-bot");
     }
 
     #[test]

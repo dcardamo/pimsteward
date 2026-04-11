@@ -11,7 +11,7 @@ use crate::config::{CalendarSourceKind, Config, ContactsSourceKind, MailSourceKi
 use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::mcp::PimstewardServer;
-use crate::permission::Resource;
+use crate::permission::{Permissions, Resource};
 use crate::pull;
 use crate::source::{
     imap::{idle_loop, ImapConfig},
@@ -19,7 +19,7 @@ use crate::source::{
     MailSource, MailWriter, RestCalendarSource, RestContactsSource, RestMailSource,
 };
 use crate::store::Repo;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Notify};
@@ -78,6 +78,152 @@ fn build_mail_source(
             (imap.clone(), imap)
         }
     }
+}
+
+/// Read and validate a bearer token from a file. Trims whitespace and
+/// rejects empty files so a deployment bug can never silently produce
+/// an unauthenticated endpoint.
+fn read_bearer_token(path: &Path) -> Result<String, Error> {
+    let token = std::fs::read_to_string(path)
+        .map_err(|e| {
+            Error::config(format!("reading bearer token file {}: {e}", path.display()))
+        })?
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(Error::config(format!(
+            "bearer token file is empty: {}",
+            path.display()
+        )));
+    }
+    Ok(token)
+}
+
+/// Spawn a single MCP HTTP listener with its own bearer token and
+/// permission matrix. Shared between the default CLI-configured
+/// listener and every entry in `config.mcp_profiles`.
+///
+/// Each listener is a fully independent axum service: its factory
+/// closure clones `profile_permissions` into every new `PimstewardServer`
+/// session, and its auth middleware checks the caller's bearer against
+/// the token captured here — no shared state between listeners.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_mcp_http_listener(
+    profile_name: &str,
+    host: &str,
+    port: u16,
+    expected_token: Option<String>,
+    cfg: Arc<Config>,
+    profile_permissions: Permissions,
+    caller: String,
+    mail_tx: broadcast::Sender<MailNotification>,
+    ct: CancellationToken,
+) -> Result<tokio::task::JoinHandle<()>, Error> {
+    use axum::{
+        extract::Request,
+        http::StatusCode,
+        middleware::{self, Next},
+        response::{IntoResponse, Response},
+    };
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let cfg_for_factory = cfg.clone();
+    let perms_for_factory = profile_permissions;
+    let caller_for_factory = caller;
+    let ct_http = ct.clone();
+
+    let service: StreamableHttpService<PimstewardServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || {
+                let cfg = cfg_for_factory.clone();
+                let perms = perms_for_factory.clone();
+                let caller = caller_for_factory.clone();
+                let (user, pass) = cfg.load_credentials().map_err(std::io::Error::other)?;
+                let alias = user.replace('@', "-");
+                let client =
+                    Client::new(cfg.forwardemail.api_base.clone(), user.clone(), pass.clone())
+                        .map_err(std::io::Error::other)?;
+                let (mail_source, mail_writer) =
+                    build_mail_source(&cfg, client.clone(), &user, &pass);
+                let repo =
+                    Repo::open_or_init(&cfg.storage.repo_path).map_err(std::io::Error::other)?;
+                let managesieve = crate::mcp::ManageSieveConfig {
+                    host: cfg.forwardemail.managesieve_host.clone(),
+                    port: cfg.forwardemail.managesieve_port,
+                    user: user.clone(),
+                    password: pass.clone(),
+                };
+                Ok(PimstewardServer::new(
+                    client,
+                    repo,
+                    perms,
+                    alias,
+                    caller,
+                    mail_source,
+                    mail_writer,
+                    managesieve,
+                ))
+            },
+            Default::default(),
+            StreamableHttpServerConfig::default().with_cancellation_token(ct_http.child_token()),
+        );
+
+    let mail_rx = mail_tx.clone();
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .route(
+            "/notifications",
+            axum::routing::get(move || {
+                let rx = mail_rx.subscribe();
+                async move { notifications_sse(rx) }
+            }),
+        )
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let token = expected_token.clone();
+            async move {
+                if let Some(ref expected) = token {
+                    let provided = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "));
+                    use subtle::ConstantTimeEq;
+                    let ok = match provided {
+                        Some(t) if t.len() == expected.len() => {
+                            t.as_bytes().ct_eq(expected.as_bytes()).into()
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        return Ok(StatusCode::UNAUTHORIZED.into_response());
+                    }
+                }
+                Ok::<Response, std::convert::Infallible>(next.run(req).await)
+            }
+        }));
+
+    let bind_addr = format!("{host}:{port}");
+    let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| Error::config(format!("binding {bind_addr}: {e}")))?;
+    tracing::info!(
+        addr = %bind_addr,
+        profile = profile_name,
+        "mcp-http server listening"
+    );
+
+    let ct_shutdown = ct.clone();
+    let profile_log = profile_name.to_string();
+    Ok(tokio::spawn(async move {
+        if let Err(e) = axum::serve(tcp_listener, router)
+            .with_graceful_shutdown(async move { ct_shutdown.cancelled().await })
+            .await
+        {
+            tracing::error!(profile = %profile_log, error = %e, "mcp-http server error");
+        }
+    }))
 }
 
 /// Run the pull daemon indefinitely, optionally serving MCP over HTTP.
@@ -221,137 +367,85 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     // fragmentation on long-running deployments.
     handles.push(spawn_gc_timer(repo.clone()));
 
-    // ── MCP HTTP server (optional) ────────────────────────────────
+    // ── MCP HTTP servers ─────────────────────────────────────────
+    //
+    // Always spawn:
+    //   1. (optional) the "default" listener on `http.port` using
+    //      `--bearer-token-file` and the top-level `[permissions]`
+    //   2. (optional) one additional listener per entry in
+    //      `config.mcp_profiles`, each with its own port, token, caller,
+    //      and permission matrix
+    //
+    // Profiles are additive and never mutate the default listener's
+    // permissions — rockycc keeps hitting `:8101/mcp` with its
+    // unchanged restricted token, while spamguard gets its own
+    // `:8102/mcp` with full mailbox-write access.
     let ct = CancellationToken::new();
+
     if let Some(http_opts) = http {
+        // Default listener.
+        let default_caller = std::env::var("PIMSTEWARD_CALLER")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "ai".to_string());
         let expected_token = match &http_opts.bearer_token_file {
-            Some(path) => {
-                let token = std::fs::read_to_string(path)
-                    .map_err(|e| Error::config(format!("reading bearer token file: {e}")))?
-                    .trim()
-                    .to_string();
-                if token.is_empty() {
-                    return Err(Error::config(format!(
-                        "bearer token file is empty: {}",
-                        path.display()
-                    )));
-                }
-                tracing::info!("bearer token auth enabled");
-                Some(token)
-            }
+            Some(path) => Some(read_bearer_token(path)?),
             None => {
-                tracing::warn!("no --bearer-token-file set, MCP HTTP endpoint is unauthenticated");
+                tracing::warn!(
+                    "no --bearer-token-file set, default MCP HTTP endpoint is unauthenticated"
+                );
                 None
             }
         };
+        if expected_token.is_some() {
+            tracing::info!("bearer token auth enabled for default MCP endpoint");
+        }
 
-        let cfg_for_factory = cfg.clone();
-        let ct_http = ct.clone();
+        let listener = spawn_mcp_http_listener(
+            "default",
+            &http_opts.host,
+            http_opts.port,
+            expected_token,
+            cfg.clone(),
+            cfg.permissions.clone(),
+            default_caller,
+            mail_tx.clone(),
+            ct.clone(),
+        )
+        .await?;
+        handles.push(listener);
+    }
 
-        use axum::{
-            extract::Request,
-            http::StatusCode,
-            middleware::{self, Next},
-            response::{IntoResponse, Response},
-        };
-        use rmcp::transport::streamable_http_server::{
-            session::local::LocalSessionManager, StreamableHttpServerConfig,
-            StreamableHttpService,
-        };
-
-        let service: StreamableHttpService<PimstewardServer, LocalSessionManager> =
-            StreamableHttpService::new(
-                move || {
-                    let cfg = cfg_for_factory.clone();
-                    let (user, pass) = cfg
-                        .load_credentials()
-                        .map_err(std::io::Error::other)?;
-                    let alias = user.replace('@', "-");
-                    let client = Client::new(
-                        cfg.forwardemail.api_base.clone(),
-                        user.clone(),
-                        pass.clone(),
-                    )
-                    .map_err(std::io::Error::other)?;
-                    let (mail_source, mail_writer) =
-                        build_mail_source(&cfg, client.clone(), &user, &pass);
-                    let repo = Repo::open_or_init(&cfg.storage.repo_path)
-                        .map_err(std::io::Error::other)?;
-                    let caller = std::env::var("PIMSTEWARD_CALLER")
-                        .ok()
-                        .map(|v| v.trim().to_string())
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or_else(|| "ai".to_string());
-                    let managesieve = crate::mcp::ManageSieveConfig {
-                        host: cfg.forwardemail.managesieve_host.clone(),
-                        port: cfg.forwardemail.managesieve_port,
-                        user: user.clone(),
-                        password: pass.clone(),
-                    };
-                    Ok(PimstewardServer::new(
-                        client,
-                        repo,
-                        cfg.permissions.clone(),
-                        alias,
-                        caller,
-                        mail_source,
-                        mail_writer,
-                        managesieve,
-                    ))
-                },
-                Default::default(),
-                StreamableHttpServerConfig::default()
-                    .with_cancellation_token(ct_http.child_token()),
-            );
-
-        let mail_rx = mail_tx.clone();
-        let router = axum::Router::new()
-            .nest_service("/mcp", service)
-            .route("/notifications", axum::routing::get(move || {
-                let rx = mail_rx.subscribe();
-                async move { notifications_sse(rx) }
-            }))
-            .layer(
-            middleware::from_fn(move |req: Request, next: Next| {
-                let token = expected_token.clone();
-                async move {
-                    if let Some(ref expected) = token {
-                        let provided = req
-                            .headers()
-                            .get("authorization")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.strip_prefix("Bearer "));
-                        use subtle::ConstantTimeEq;
-                        let ok = match provided {
-                            Some(t) if t.len() == expected.len() => {
-                                t.as_bytes().ct_eq(expected.as_bytes()).into()
-                            }
-                            _ => false,
-                        };
-                        if !ok {
-                            return Ok(StatusCode::UNAUTHORIZED.into_response());
-                        }
-                    }
-                    Ok::<Response, std::convert::Infallible>(next.run(req).await)
-                }
-            }),
+    // Additional per-profile listeners.
+    //
+    // Each profile is independent — its token is read once at daemon
+    // start and baked into a closure, its permissions are cloned into
+    // the factory closure so every new MCP session gets its own
+    // baked-in view. If a profile's token file is missing the daemon
+    // refuses to start rather than silently falling back to the default
+    // permissions (that would be a dangerous privilege surprise).
+    for profile in &cfg.mcp_profiles {
+        tracing::info!(
+            profile = %profile.name,
+            port = profile.port,
+            caller = profile.caller_name(),
+            "spawning per-profile MCP HTTP listener",
         );
-
-        let bind_addr = format!("{}:{}", http_opts.host, http_opts.port);
-        let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
-            .await
-            .map_err(|e| Error::config(format!("binding {bind_addr}: {e}")))?;
-        tracing::info!(addr = %bind_addr, "mcp-http server listening");
-
-        let ct_shutdown = ct.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = axum::serve(tcp_listener, router)
-                .with_graceful_shutdown(async move { ct_shutdown.cancelled().await })
-                .await
-            {
-                tracing::error!(error = %e, "mcp-http server error");
-            }
-        }));
+        let token = read_bearer_token(&profile.bearer_token_file)?;
+        let listener = spawn_mcp_http_listener(
+            &profile.name,
+            "0.0.0.0",
+            profile.port,
+            Some(token),
+            cfg.clone(),
+            profile.permissions.clone(),
+            profile.caller_name().to_string(),
+            mail_tx.clone(),
+            ct.clone(),
+        )
+        .await?;
+        handles.push(listener);
     }
 
     if handles.is_empty() {
