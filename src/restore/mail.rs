@@ -14,7 +14,7 @@
 
 use crate::error::Error;
 use crate::forwardemail::Client;
-use crate::pull::mail::pull_mail;
+use crate::pull::mail::sync_folders;
 use crate::restore::read_git_blob;
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
@@ -248,17 +248,23 @@ pub async fn apply_mail(
         )));
     }
 
-    match &plan.operation {
+    // Track the folder(s) the restore touches so we only refresh those.
+    // Matches write::mail::refresh's per-folder behavior — a full
+    // pull_mail used to block for minutes per restore call during an
+    // initial-sync backlog.
+    let affected: Vec<&str> = match &plan.operation {
         MailOperation::NoOp => return Ok(()),
         MailOperation::RestoreFlags { target_flags } => {
             writer
                 .update_flags(&plan.folder, &plan.message_id, target_flags)
                 .await?;
+            vec![plan.folder.as_str()]
         }
         MailOperation::MoveBack { target_folder } => {
             writer
                 .move_message(&plan.folder, &plan.message_id, target_folder)
                 .await?;
+            vec![plan.folder.as_str(), target_folder.as_str()]
         }
         MailOperation::Append {
             target_folder,
@@ -268,16 +274,18 @@ pub async fn apply_mail(
             // construction which the MailWriter trait doesn't cover.
             // This is the one restore op that still needs the REST client.
             client.append_raw_message(target_folder, raw_bytes).await?;
+            vec![target_folder.as_str()]
         }
-    }
+    };
 
-    // Refresh using the configured source so IDs stay consistent.
-    let _ = pull_mail(
+    // Refresh only the affected folder(s) — not the whole mailbox.
+    let _ = sync_folders(
         source,
         repo,
         alias,
         &attribution.caller,
         &attribution.caller_email,
+        &affected,
     )
     .await?;
     let audit = WriteAudit {

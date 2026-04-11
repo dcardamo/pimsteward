@@ -175,160 +175,7 @@ pub async fn pull_mail(
     //    loses at most one folder's work, and git history records each
     //    folder's state as it's captured.
     for f in &folders {
-        let folder_dir = format!("mail/{}", folder_safe(&f.path));
-        let local_meta = read_local_message_meta(repo, &folder_dir)?;
-        let mut folder_added = 0usize;
-        let mut folder_updated = 0usize;
-        let mut folder_deleted = 0usize;
-
-        // Build a reverse index: source-specific id → canonical filename
-        // stem. This lets us match remote summaries (keyed by source id)
-        // to local files (keyed by canonical id).
-        let source_to_canonical: HashMap<String, String> = local_meta
-            .iter()
-            .map(|(canonical, meta)| (filename_safe(&meta.id), canonical.clone()))
-            .collect();
-
-        // Read the previous _folder.json (if any) to recover the last
-        // observed uid_validity + modify_index. These drive CONDSTORE
-        // delta sync on sources that support it. If uid_validity has
-        // changed under us, the source will ignore the modseq hint.
-        let (prev_uid_validity, prev_modseq) = read_prev_folder_state(repo, &folder_dir);
-        let list_result = source
-            .list_messages(&f.path, prev_modseq, prev_uid_validity)
-            .await?;
-
-        // 3. Detect changes and re-fetch full bodies where needed.
-        for msg in &list_result.changed {
-            let source_id = filename_safe(&msg.id);
-            let prev_canonical = source_to_canonical.get(&source_id);
-            let prev = prev_canonical.and_then(|c| local_meta.get(c));
-            let needs_refetch = match prev {
-                None => true,
-                Some(p) => p.modseq != msg.modseq || p.flags != msg.flags,
-            };
-
-            if !needs_refetch {
-                continue;
-            }
-
-            // Source-agnostic fetch: REST extracts `raw` from the JSON
-            // response; IMAP uses `UID FETCH BODY[]`. Both return raw
-            // RFC822 bytes in FetchedMessage.raw.
-            let fetched = source.fetch_message(&f.path, &msg.id).await?;
-            let canonical = derive_canonical_id(&fetched);
-
-            let eml_path = format!("{folder_dir}/{canonical}.eml");
-            repo.write_file(&eml_path, &fetched.raw)?;
-
-            // Remove any legacy file using the old source-specific id as
-            // filename stem (migration from pre-canonical naming).
-            if prev_canonical.is_none() {
-                let _ = std::fs::remove_file(
-                    repo.root().join(format!("{folder_dir}/{source_id}.eml")),
-                );
-                let _ = std::fs::remove_file(
-                    repo.root().join(format!("{folder_dir}/{source_id}.meta.json")),
-                );
-                let _ = std::fs::remove_file(
-                    repo.root().join(format!("{folder_dir}/{source_id}.json")),
-                );
-                let _ = std::fs::remove_file(
-                    repo.root()
-                        .join(format!("{folder_dir}/{source_id}.attachments.json")),
-                );
-            }
-
-            let mut meta = MessageMeta::from_fetched(&fetched);
-            meta.canonical_id = Some(canonical.clone());
-            let meta_path = format!("{folder_dir}/{canonical}.meta.json");
-            repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
-
-            // Attachment index: parse nodemailer.attachments[], write each
-            // blob to _attachments/<sha256>, and write the reference list as
-            // a sidecar. REST-only — IMAP's `extra` is None.
-            let attachments_sidecar = format!("{folder_dir}/{canonical}.attachments.json");
-            let attachments_sidecar_fs = repo.root().join(&attachments_sidecar);
-            match extract_attachments(&fetched, repo)? {
-                Some(refs) if !refs.is_empty() => {
-                    repo.write_file(
-                        &attachments_sidecar,
-                        serde_json::to_vec_pretty(&refs)?.as_slice(),
-                    )?;
-                }
-                _ => {
-                    let _ = std::fs::remove_file(attachments_sidecar_fs);
-                }
-            }
-
-            if prev.is_some() {
-                folder_updated += 1;
-            } else {
-                folder_added += 1;
-            }
-        }
-
-        // 4. Detect deletions. Build the set of source ids currently on
-        //    the remote, then find local entries whose source id is no
-        //    longer present.
-        let remote_source_ids: HashSet<String> = list_result
-            .all_ids
-            .iter()
-            .map(|id| filename_safe(id))
-            .collect();
-        for (canonical, meta) in &local_meta {
-            let source_id = filename_safe(&meta.id);
-            if !remote_source_ids.contains(&source_id) {
-                let _ = std::fs::remove_file(
-                    repo.root().join(format!("{folder_dir}/{canonical}.eml")),
-                );
-                let _ = std::fs::remove_file(
-                    repo.root().join(format!("{folder_dir}/{canonical}.json")),
-                );
-                let _ = std::fs::remove_file(
-                    repo.root().join(format!("{folder_dir}/{canonical}.meta.json")),
-                );
-                let _ = std::fs::remove_file(
-                    repo.root()
-                        .join(format!("{folder_dir}/{canonical}.attachments.json")),
-                );
-                folder_deleted += 1;
-            }
-        }
-        // 5. Write/update _folder.json with the latest CONDSTORE state so
-        //    the next pull can pass a stable since_modseq hint.
-        let mut folder_meta = f.clone();
-        if list_result.highest_modseq.is_some() {
-            folder_meta.modify_index = list_result.highest_modseq;
-        }
-        if list_result.uid_validity.is_some() {
-            folder_meta.uid_validity = list_result.uid_validity;
-        }
-        let folder_manifest_path = format!("{folder_dir}/_folder.json");
-        repo.write_file(
-            &folder_manifest_path,
-            serde_json::to_vec_pretty(&folder_meta)?.as_slice(),
-        )?;
-
-        // 6. Commit this folder's changes immediately. On a large initial
-        //    sync this means each folder is a separate git commit —
-        //    partial progress is preserved across crashes and the git
-        //    history shows per-folder snapshots.
-        summary.added += folder_added;
-        summary.updated += folder_updated;
-        summary.deleted += folder_deleted;
-        if folder_added > 0 || folder_updated > 0 || folder_deleted > 0 {
-            let folder_msg = format!(
-                "mail/{}: +{} ~{} -{}",
-                folder_safe(&f.path),
-                folder_added,
-                folder_updated,
-                folder_deleted
-            );
-            if let Some(sha) = repo.commit_all(author_name, author_email, &folder_msg)? {
-                summary.commit_sha = Some(sha);
-            }
-        }
+        sync_one_folder(source, repo, f, author_name, author_email, &mut summary).await?;
     }
 
     // Detect folder removals and commit if anything was cleaned up.
@@ -345,6 +192,223 @@ pub async fn pull_mail(
         summary.commit_sha = Some(sha);
     }
     Ok(summary)
+}
+
+/// Pull state for only the specified folders.
+///
+/// Used by the write path (`write::mail::refresh`) so that a single
+/// `create_draft`/`move_email`/etc. MCP call only re-syncs the folders
+/// it actually affected instead of the entire mailbox. The background
+/// puller still uses [`pull_mail`] for its full-mailbox passes.
+///
+/// Calls `source.list_folders()` once to get fresh metadata for the
+/// requested folders (for `_folder.json` special_use / created_at /
+/// updated_at fields). Unknown folder names are silently skipped — the
+/// caller always passes names derived from its own tool arguments, so
+/// a missing folder means the user passed a bad path, which is a
+/// different error surface that the write itself will have already
+/// reported.
+///
+/// Intentionally does NOT call [`cleanup_removed_folders`] — that's a
+/// whole-mailbox-scope operation and would be unsafe to run against a
+/// filtered folder list.
+pub async fn sync_folders(
+    source: &dyn MailSource,
+    repo: &Repo,
+    _alias: &str,
+    author_name: &str,
+    author_email: &str,
+    folder_paths: &[&str],
+) -> PullResult<PullSummary> {
+    let mut summary = PullSummary {
+        resource: "mail",
+        ..Default::default()
+    };
+    if folder_paths.is_empty() {
+        return Ok(summary);
+    }
+
+    // Fetch full folder metadata once so we can populate _folder.json
+    // with special_use / created_at / updated_at fields (same shape the
+    // background puller writes).
+    let all_folders = source.list_folders().await?;
+    let wanted: HashSet<&str> = folder_paths.iter().copied().collect();
+
+    for f in all_folders.iter().filter(|f| wanted.contains(f.path.as_str())) {
+        sync_one_folder(source, repo, f, author_name, author_email, &mut summary).await?;
+    }
+
+    Ok(summary)
+}
+
+/// Sync a single folder into the repo: list messages, fetch any that
+/// changed, detect local deletions, update `_folder.json`, and commit
+/// the folder's changes under the supplied author. Shared between
+/// [`pull_mail`] (whole-mailbox passes) and [`sync_folders`] (write-
+/// path refreshes).
+async fn sync_one_folder(
+    source: &dyn MailSource,
+    repo: &Repo,
+    f: &Folder,
+    author_name: &str,
+    author_email: &str,
+    summary: &mut PullSummary,
+) -> PullResult<()> {
+    let folder_dir = format!("mail/{}", folder_safe(&f.path));
+    let local_meta = read_local_message_meta(repo, &folder_dir)?;
+    let mut folder_added = 0usize;
+    let mut folder_updated = 0usize;
+    let mut folder_deleted = 0usize;
+
+    // Build a reverse index: source-specific id → canonical filename
+    // stem. This lets us match remote summaries (keyed by source id)
+    // to local files (keyed by canonical id).
+    let source_to_canonical: HashMap<String, String> = local_meta
+        .iter()
+        .map(|(canonical, meta)| (filename_safe(&meta.id), canonical.clone()))
+        .collect();
+
+    // Read the previous _folder.json (if any) to recover the last
+    // observed uid_validity + modify_index. These drive CONDSTORE
+    // delta sync on sources that support it. If uid_validity has
+    // changed under us, the source will ignore the modseq hint.
+    let (prev_uid_validity, prev_modseq) = read_prev_folder_state(repo, &folder_dir);
+    let list_result = source
+        .list_messages(&f.path, prev_modseq, prev_uid_validity)
+        .await?;
+
+    // 3. Detect changes and re-fetch full bodies where needed.
+    for msg in &list_result.changed {
+        let source_id = filename_safe(&msg.id);
+        let prev_canonical = source_to_canonical.get(&source_id);
+        let prev = prev_canonical.and_then(|c| local_meta.get(c));
+        let needs_refetch = match prev {
+            None => true,
+            Some(p) => p.modseq != msg.modseq || p.flags != msg.flags,
+        };
+
+        if !needs_refetch {
+            continue;
+        }
+
+        // Source-agnostic fetch: REST extracts `raw` from the JSON
+        // response; IMAP uses `UID FETCH BODY[]`. Both return raw
+        // RFC822 bytes in FetchedMessage.raw.
+        let fetched = source.fetch_message(&f.path, &msg.id).await?;
+        let canonical = derive_canonical_id(&fetched);
+
+        let eml_path = format!("{folder_dir}/{canonical}.eml");
+        repo.write_file(&eml_path, &fetched.raw)?;
+
+        // Remove any legacy file using the old source-specific id as
+        // filename stem (migration from pre-canonical naming).
+        if prev_canonical.is_none() {
+            let _ = std::fs::remove_file(
+                repo.root().join(format!("{folder_dir}/{source_id}.eml")),
+            );
+            let _ = std::fs::remove_file(
+                repo.root().join(format!("{folder_dir}/{source_id}.meta.json")),
+            );
+            let _ = std::fs::remove_file(
+                repo.root().join(format!("{folder_dir}/{source_id}.json")),
+            );
+            let _ = std::fs::remove_file(
+                repo.root()
+                    .join(format!("{folder_dir}/{source_id}.attachments.json")),
+            );
+        }
+
+        let mut meta = MessageMeta::from_fetched(&fetched);
+        meta.canonical_id = Some(canonical.clone());
+        let meta_path = format!("{folder_dir}/{canonical}.meta.json");
+        repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
+
+        // Attachment index: parse nodemailer.attachments[], write each
+        // blob to _attachments/<sha256>, and write the reference list as
+        // a sidecar. REST-only — IMAP's `extra` is None.
+        let attachments_sidecar = format!("{folder_dir}/{canonical}.attachments.json");
+        let attachments_sidecar_fs = repo.root().join(&attachments_sidecar);
+        match extract_attachments(&fetched, repo)? {
+            Some(refs) if !refs.is_empty() => {
+                repo.write_file(
+                    &attachments_sidecar,
+                    serde_json::to_vec_pretty(&refs)?.as_slice(),
+                )?;
+            }
+            _ => {
+                let _ = std::fs::remove_file(attachments_sidecar_fs);
+            }
+        }
+
+        if prev.is_some() {
+            folder_updated += 1;
+        } else {
+            folder_added += 1;
+        }
+    }
+
+    // 4. Detect deletions. Build the set of source ids currently on
+    //    the remote, then find local entries whose source id is no
+    //    longer present.
+    let remote_source_ids: HashSet<String> = list_result
+        .all_ids
+        .iter()
+        .map(|id| filename_safe(id))
+        .collect();
+    for (canonical, meta) in &local_meta {
+        let source_id = filename_safe(&meta.id);
+        if !remote_source_ids.contains(&source_id) {
+            let _ = std::fs::remove_file(
+                repo.root().join(format!("{folder_dir}/{canonical}.eml")),
+            );
+            let _ = std::fs::remove_file(
+                repo.root().join(format!("{folder_dir}/{canonical}.json")),
+            );
+            let _ = std::fs::remove_file(
+                repo.root().join(format!("{folder_dir}/{canonical}.meta.json")),
+            );
+            let _ = std::fs::remove_file(
+                repo.root()
+                    .join(format!("{folder_dir}/{canonical}.attachments.json")),
+            );
+            folder_deleted += 1;
+        }
+    }
+    // 5. Write/update _folder.json with the latest CONDSTORE state so
+    //    the next pull can pass a stable since_modseq hint.
+    let mut folder_meta = f.clone();
+    if list_result.highest_modseq.is_some() {
+        folder_meta.modify_index = list_result.highest_modseq;
+    }
+    if list_result.uid_validity.is_some() {
+        folder_meta.uid_validity = list_result.uid_validity;
+    }
+    let folder_manifest_path = format!("{folder_dir}/_folder.json");
+    repo.write_file(
+        &folder_manifest_path,
+        serde_json::to_vec_pretty(&folder_meta)?.as_slice(),
+    )?;
+
+    // 6. Commit this folder's changes immediately. On a large initial
+    //    sync this means each folder is a separate git commit —
+    //    partial progress is preserved across crashes and the git
+    //    history shows per-folder snapshots.
+    summary.added += folder_added;
+    summary.updated += folder_updated;
+    summary.deleted += folder_deleted;
+    if folder_added > 0 || folder_updated > 0 || folder_deleted > 0 {
+        let folder_msg = format!(
+            "mail/{}: +{} ~{} -{}",
+            folder_safe(&f.path),
+            folder_added,
+            folder_updated,
+            folder_deleted
+        );
+        if let Some(sha) = repo.commit_all(author_name, author_email, &folder_msg)? {
+            summary.commit_sha = Some(sha);
+        }
+    }
+    Ok(())
 }
 
 /// Load the previously written `_folder.json` (if any) and extract the
@@ -960,6 +1024,181 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = Repo::open_or_init(tmp.path()).unwrap();
         cleanup_removed_folders(&repo, &[folder_for("INBOX")]).unwrap();
+    }
+
+    // ── sync_folders only touches the requested folders ────────────
+    //
+    // Regression tests for the Apr 11 2026 "writes block on full
+    // mailbox resync" bug. The old refresh() called pull_mail which
+    // iterated every folder in the mailbox, so a single create_draft
+    // call blocked for minutes during an initial-sync backlog while
+    // list_messages/fetch_message churned on Archive/2013/2015/2016.
+    // sync_folders must only call list_messages on the exact paths
+    // requested — never on unrelated folders.
+
+    use crate::source::traits::{ListResult, MailSource};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CountingSource {
+        /// Every folder path passed to list_messages, in call order.
+        list_messages_calls: Mutex<Vec<String>>,
+        /// Every folder path passed to fetch_message.
+        fetch_message_calls: Mutex<Vec<String>>,
+        /// What list_folders should return.
+        folders: Vec<Folder>,
+    }
+
+    #[async_trait::async_trait]
+    impl MailSource for CountingSource {
+        fn tag(&self) -> &'static str {
+            "counting"
+        }
+        async fn list_folders(&self) -> Result<Vec<Folder>, Error> {
+            Ok(self.folders.clone())
+        }
+        async fn list_messages(
+            &self,
+            folder: &str,
+            _since: Option<i64>,
+            _uv: Option<i64>,
+        ) -> Result<ListResult, Error> {
+            self.list_messages_calls
+                .lock()
+                .unwrap()
+                .push(folder.to_string());
+            // Return empty — no messages to refetch.
+            Ok(ListResult::default())
+        }
+        async fn fetch_message(
+            &self,
+            folder: &str,
+            _id: &str,
+        ) -> Result<FetchedMessage, Error> {
+            self.fetch_message_calls
+                .lock()
+                .unwrap()
+                .push(folder.to_string());
+            Err(Error::store("fetch_message should not be called in these tests"))
+        }
+    }
+
+    fn folder_for_sync(path: &str) -> Folder {
+        let mut f = folder_for(path);
+        f.path = path.to_string();
+        f
+    }
+
+    #[tokio::test]
+    async fn sync_folders_only_touches_requested_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+
+        let source = CountingSource {
+            folders: vec![
+                folder_for_sync("INBOX"),
+                folder_for_sync("Drafts"),
+                folder_for_sync("Junk"),
+                folder_for_sync("Archive/2013"),
+                folder_for_sync("Archive/2014"),
+                folder_for_sync("Archive/2015"),
+            ],
+            ..Default::default()
+        };
+
+        // Caller asks for Drafts only — simulating create_draft.
+        sync_folders(&source, &repo, "dan", "test", "test@example.com", &["Drafts"])
+            .await
+            .unwrap();
+
+        let calls = source.list_messages_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec!["Drafts".to_string()],
+            "sync_folders must only call list_messages on the requested \
+             folder; got {calls:?}. A regression here means writes would \
+             again block on Archive/2013+ during an initial-sync backlog."
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_folders_handles_multi_folder_move() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+
+        let source = CountingSource {
+            folders: vec![
+                folder_for_sync("INBOX"),
+                folder_for_sync("Junk"),
+                folder_for_sync("Archive/2014"),
+            ],
+            ..Default::default()
+        };
+
+        // move_message refreshes both source_folder and target_folder.
+        sync_folders(
+            &source,
+            &repo,
+            "dan",
+            "test",
+            "test@example.com",
+            &["INBOX", "Junk"],
+        )
+        .await
+        .unwrap();
+
+        let mut calls = source.list_messages_calls.lock().unwrap().clone();
+        calls.sort();
+        assert_eq!(
+            calls,
+            vec!["INBOX".to_string(), "Junk".to_string()],
+            "sync_folders should hit both INBOX and Junk for a cross-folder move"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_folders_empty_list_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        let source = CountingSource {
+            folders: vec![folder_for_sync("INBOX")],
+            ..Default::default()
+        };
+        sync_folders(&source, &repo, "dan", "test", "test@example.com", &[])
+            .await
+            .unwrap();
+        // Empty input: list_folders should not even be called, and no
+        // list_messages either.
+        let calls = source.list_messages_calls.lock().unwrap().clone();
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_folders_silently_skips_unknown_paths() {
+        // If a caller passes a folder name that doesn't exist on the
+        // server, sync_folders must not error — we just skip it. This
+        // matches the send_email case where we try ["Sent Mail",
+        // "Sent"] and expect whichever one exists to match.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        let source = CountingSource {
+            folders: vec![folder_for_sync("Sent Mail"), folder_for_sync("INBOX")],
+            ..Default::default()
+        };
+        sync_folders(
+            &source,
+            &repo,
+            "dan",
+            "test",
+            "test@example.com",
+            &["Sent Mail", "Sent", "Outbox"],
+        )
+        .await
+        .unwrap();
+        let calls = source.list_messages_calls.lock().unwrap().clone();
+        // Only "Sent Mail" exists on the server; "Sent" and "Outbox"
+        // don't — no list_messages for those.
+        assert_eq!(calls, vec!["Sent Mail".to_string()]);
     }
 
     #[test]

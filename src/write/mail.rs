@@ -6,7 +6,7 @@
 
 use crate::error::Error;
 use crate::forwardemail::Client;
-use crate::pull::mail::pull_mail;
+use crate::pull::mail::sync_folders;
 use crate::source::{MailSource, MailWriter};
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
@@ -41,7 +41,8 @@ pub async fn create_draft(
         }),
         summary: format!("mail: create draft in {} → {}", msg.folder, msg.subject),
     };
-    refresh(source, repo, alias, attribution, &audit).await?;
+    // Only refresh the folder the draft landed in (usually "Drafts").
+    refresh(source, repo, alias, attribution, &audit, &[&msg.folder]).await?;
     Ok(result)
 }
 
@@ -65,7 +66,8 @@ pub async fn update_flags(
         args: serde_json::json!({"flags": flags}),
         summary: format!("mail: update flags on {id} → {flags:?}"),
     };
-    refresh(source, repo, alias, attribution, &audit).await
+    // Only the folder holding this message changed.
+    refresh(source, repo, alias, attribution, &audit, &[folder]).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -90,7 +92,18 @@ pub async fn move_message(
         args: serde_json::json!({"folder": target_folder}),
         summary: format!("mail: move {id} → {target_folder}"),
     };
-    refresh(source, repo, alias, attribution, &audit).await
+    // Both source and target folders changed: source loses the msg,
+    // target gains it. Refresh both so the backup tree stays
+    // consistent with the live state.
+    refresh(
+        source,
+        repo,
+        alias,
+        attribution,
+        &audit,
+        &[source_folder, target_folder],
+    )
+    .await
 }
 
 /// Send an email via forwardemail's SMTP bridge (POST /v1/emails) and
@@ -149,7 +162,21 @@ pub async fn send_email(
         }),
         summary: format!("mail: SEND → {:?}: {}", msg.to, msg.subject),
     };
-    refresh(source, repo, alias, attribution, &audit).await?;
+    // A send lands in Sent (or the Sent-like folder the server uses).
+    // We don't know the exact path for every provider, but
+    // forwardemail uses "Sent Mail". Pass that so we refresh only
+    // that folder; if the provider uses a different name,
+    // sync_folders silently skips the unknown path and we still get
+    // the audit commit via the empty_commit fallback.
+    refresh(
+        source,
+        repo,
+        alias,
+        attribution,
+        &audit,
+        &["Sent Mail", "Sent"],
+    )
+    .await?;
     Ok(result)
 }
 
@@ -189,26 +216,45 @@ pub async fn delete_message(
         args: serde_json::json!({}),
         summary: format!("mail: delete {id}"),
     };
-    refresh(source, repo, alias, attribution, &audit).await
+    refresh(source, repo, alias, attribution, &audit, &[folder]).await
 }
 
+/// Refresh the local backup tree after a write, but only for the
+/// folders the write actually touched. Previously this called
+/// [`pull_mail`] which syncs every folder in the mailbox — for a
+/// mailbox with 20+ folders and an ongoing initial-sync backlog,
+/// that turned every `create_draft`/`move_email` into a 2-10 minute
+/// blocking call per Apr 11 2026 investigation. Writes now only
+/// refresh the folder(s) they operated on (e.g. `create_draft` →
+/// `["Drafts"]`, `move_email` → `[source_folder, target_folder]`)
+/// which is near-instant on a healthy folder and bounded even during
+/// a backlog.
+///
+/// An empty slice is valid — callers that can't name a specific
+/// folder (e.g. unusual send flows) still get an audit commit via
+/// the empty_commit fallback below without attempting any sync.
 pub async fn refresh(
     source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
     audit: &WriteAudit<'_>,
+    folders: &[&str],
 ) -> Result<(), Error> {
-    // Refresh the backup tree using the same source the daemon reads
-    // from, so IDs, folder layout, and metadata stay consistent.
-    let _ = pull_mail(
-        source,
-        repo,
-        alias,
-        &attribution.caller,
-        &attribution.caller_email,
-    )
-    .await?;
+    // Refresh the backup tree for only the affected folders so we
+    // stay consistent with what the daemon reads, without paying the
+    // full-mailbox resync cost on every write.
+    if !folders.is_empty() {
+        let _ = sync_folders(
+            source,
+            repo,
+            alias,
+            &attribution.caller,
+            &attribution.caller_email,
+            folders,
+        )
+        .await?;
+    }
     let msg = audit.commit_message();
     let sha = repo.commit_all(&attribution.caller, &attribution.caller_email, &msg)?;
     if sha.is_none() {
