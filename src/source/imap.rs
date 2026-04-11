@@ -88,12 +88,176 @@ impl ImapConfig {
 
 type ImapSession = Session<TlsStream<TcpStream>>;
 
+/// The IMAP "open mailbox" modes. `Examine` is read-only, `Select` is
+/// read-write. A folder that has been `Select`-ed can be read from, so
+/// a subsequent EXAMINE of the same folder is redundant. An `Examine`-d
+/// folder cannot be written to, so wanting write access forces a real
+/// SELECT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MailboxMode {
+    Examine,
+    Select,
+}
+
+/// Whether a SELECT/EXAMINE command can be skipped given the session's
+/// cached position. Pure function, tested directly — see
+/// [`mailbox_switch_decision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MailboxSwitch {
+    /// Session is already positioned on this folder with at least the
+    /// required mode; caller can skip the SELECT/EXAMINE entirely. This
+    /// is the optimization that keeps us under forwardemail's per-session
+    /// EXAMINE limit.
+    Skip,
+    /// Caller must issue the SELECT/EXAMINE before operating on the
+    /// folder — either a different folder is currently positioned, or
+    /// the current mode is too weak for what's requested.
+    Execute,
+}
+
+/// Decide whether to issue an IMAP SELECT/EXAMINE or reuse the cached
+/// mailbox state. Extracted as a pure function so it can be unit-tested
+/// without a real IMAP session.
+///
+/// The state machine:
+/// - No current mailbox → always Execute.
+/// - Different folder → always Execute.
+/// - Same folder, current mode is Select → always Skip (Select can do
+///   everything Examine can).
+/// - Same folder, current mode is Examine, want Examine → Skip.
+/// - Same folder, current mode is Examine, want Select → Execute (we
+///   must upgrade to read-write).
+pub(crate) fn mailbox_switch_decision(
+    current: Option<&(String, MailboxMode)>,
+    target_folder: &str,
+    target_mode: MailboxMode,
+) -> MailboxSwitch {
+    match current {
+        Some((f, mode)) if f == target_folder => match (mode, target_mode) {
+            (MailboxMode::Select, _) => MailboxSwitch::Skip,
+            (MailboxMode::Examine, MailboxMode::Examine) => MailboxSwitch::Skip,
+            (MailboxMode::Examine, MailboxMode::Select) => MailboxSwitch::Execute,
+        },
+        _ => MailboxSwitch::Execute,
+    }
+}
+
+/// IMAP session + position cache + command counter.
+///
+/// Bundles the raw `async-imap` Session with the bookkeeping we need to
+/// avoid hammering forwardemail with redundant EXAMINE/SELECT commands.
+/// Forwardemail (Wildduck under the hood) caps SELECT/EXAMINE per
+/// session to prevent abusive clients, and the initial-sync path for a
+/// 5000+ message folder used to issue one EXAMINE per fetched message,
+/// blowing that cap and killing the connection before any meaningful
+/// progress. See `ensure_positioned` below for the fix.
+struct CachedSession {
+    session: ImapSession,
+    /// The folder + mode the session is currently positioned on, or
+    /// `None` immediately after login. Cleared implicitly when the
+    /// whole `CachedSession` is dropped on error.
+    current: Option<(String, MailboxMode)>,
+    /// Count of commands issued since the TCP connect. Used by
+    /// `session_guard` as a belt-and-suspenders check: if we somehow
+    /// accumulate too many commands despite the position caching, drop
+    /// the session proactively rather than waiting for the server to
+    /// BYE us. See `MAX_COMMANDS_PER_SESSION`.
+    commands_since_connect: usize,
+}
+
+/// Proactively recycle the puller session after this many IMAP commands.
+/// Forwardemail's per-session SELECT/EXAMINE cap is somewhere in the
+/// few-hundreds; staying well under it keeps long-lived daemons happy.
+/// Set low enough to be safe, high enough that reconnect cost is
+/// amortized across plenty of real work.
+const MAX_COMMANDS_PER_SESSION: usize = 200;
+
+impl CachedSession {
+    fn new(session: ImapSession) -> Self {
+        Self {
+            session,
+            current: None,
+            commands_since_connect: 0,
+        }
+    }
+
+    /// Note that a command was issued on this session. Called by every
+    /// wrapper that issues any IMAP command, so the counter reflects
+    /// total activity and not just position changes.
+    fn note_command(&mut self) {
+        self.commands_since_connect = self.commands_since_connect.saturating_add(1);
+    }
+
+    /// Should the caller recycle this session before doing more work?
+    /// See [`MAX_COMMANDS_PER_SESSION`].
+    fn should_recycle(&self) -> bool {
+        self.commands_since_connect >= MAX_COMMANDS_PER_SESSION
+    }
+
+    /// Ensure the session is positioned on `folder` with at least
+    /// `mode` access. Issues EXAMINE/SELECT only when the cache says
+    /// we must. On success, updates the cached position. On error,
+    /// the caller's outer error handler drops the whole CachedSession
+    /// so the cache can't go stale.
+    ///
+    /// This is the hot path: on initial sync of a big folder, the
+    /// puller calls `fetch_message` N times in a row for the same
+    /// folder, and this method turns N EXAMINEs into 1.
+    async fn ensure_positioned(
+        &mut self,
+        folder: &str,
+        mode: MailboxMode,
+    ) -> Result<(), Error> {
+        match mailbox_switch_decision(self.current.as_ref(), folder, mode) {
+            MailboxSwitch::Skip => Ok(()),
+            MailboxSwitch::Execute => {
+                self.note_command();
+                match mode {
+                    MailboxMode::Examine => {
+                        self.session.examine(folder).await.map_err(|e| {
+                            Error::store(format!("IMAP EXAMINE {folder}: {e}"))
+                        })?;
+                    }
+                    MailboxMode::Select => {
+                        self.session.select(&folder).await.map_err(|e| {
+                            Error::store(format!("IMAP SELECT {folder}: {e}"))
+                        })?;
+                    }
+                }
+                self.current = Some((folder.to_string(), mode));
+                Ok(())
+            }
+        }
+    }
+
+    /// EXAMINE `folder` unconditionally and return the fresh mailbox
+    /// metadata. Used by `list_messages` which needs current
+    /// `uid_validity` / `highest_modseq` / `exists` every call — those
+    /// change as new mail arrives and can't be safely cached across
+    /// pull cycles. Still updates the position cache so a subsequent
+    /// `ensure_positioned(folder, Examine)` is a no-op.
+    async fn examine_for_metadata(
+        &mut self,
+        folder: &str,
+    ) -> Result<async_imap::types::Mailbox, Error> {
+        self.note_command();
+        let mailbox = self
+            .session
+            .examine(folder)
+            .await
+            .map_err(|e| Error::store(format!("IMAP EXAMINE {folder}: {e}")))?;
+        self.current = Some((folder.to_string(), MailboxMode::Examine));
+        Ok(mailbox)
+    }
+}
+
 pub struct ImapMailSource {
     config: ImapConfig,
     // Sessions are expensive to establish; cache one and re-use across
     // calls. Mutex because async-imap's Session takes &mut self for every
-    // operation.
-    session: Arc<Mutex<Option<ImapSession>>>,
+    // operation. The `CachedSession` wrapper adds position + command
+    // bookkeeping on top of the raw async-imap Session.
+    session: Arc<Mutex<Option<CachedSession>>>,
 }
 
 impl std::fmt::Debug for ImapMailSource {
@@ -152,13 +316,29 @@ impl ImapMailSource {
     /// Ensure a session is alive and return a lock guard holding it. On
     /// subsequent error, the caller should drop the session by setting
     /// `*guard = None` — IMAP errors often leave a session in an
-    /// unknown state, so reconnecting is the safe default.
+    /// unknown state, so reconnecting is the safe default. This also
+    /// clears the `CachedSession.current` position cache automatically:
+    /// the whole struct goes away on drop, so the next `session_guard`
+    /// call starts with `current = None`.
+    ///
+    /// Recycles the session proactively when its command counter
+    /// exceeds [`MAX_COMMANDS_PER_SESSION`] — belt-and-suspenders
+    /// protection against forwardemail's per-session SELECT/EXAMINE cap.
     async fn session_guard(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<ImapSession>>, Error> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<CachedSession>>, Error> {
         let mut guard = self.session.lock().await;
+        if let Some(ref cached) = *guard {
+            if cached.should_recycle() {
+                tracing::debug!(
+                    commands = cached.commands_since_connect,
+                    "recycling IMAP session after hitting command threshold"
+                );
+                *guard = None;
+            }
+        }
         if guard.is_none() {
-            *guard = Some(self.connect().await?);
+            *guard = Some(CachedSession::new(self.connect().await?));
         }
         Ok(guard)
     }
@@ -172,9 +352,11 @@ impl MailSource for ImapMailSource {
 
     async fn list_folders(&self) -> Result<Vec<Folder>, Error> {
         let mut guard = self.session_guard().await?;
-        let session = guard.as_mut().expect("session present");
+        let cached = guard.as_mut().expect("session present");
+        cached.note_command();
         let result: Result<Vec<Folder>, Error> = async {
-            let names = session
+            let names = cached
+                .session
                 .list(Some(""), Some("*"))
                 .await
                 .map_err(|e| Error::store(format!("IMAP LIST: {e}")))?;
@@ -233,12 +415,15 @@ impl MailSource for ImapMailSource {
         uid_validity_hint: Option<i64>,
     ) -> Result<ListResult, Error> {
         let mut guard = self.session_guard().await?;
-        let session = guard.as_mut().expect("session present");
+        let cached = guard.as_mut().expect("session present");
         let result: Result<ListResult, Error> = async {
-            let mailbox = session
-                .examine(folder)
-                .await
-                .map_err(|e| Error::store(format!("IMAP EXAMINE {folder}: {e}")))?;
+            // Always issue a real EXAMINE here — we need fresh mailbox
+            // metadata (exists, uid_validity, highest_modseq) every pull
+            // because new mail arrives between calls. The position cache
+            // is still updated so any immediately-following
+            // fetch_message calls on the same folder can skip their
+            // EXAMINE.
+            let mailbox = cached.examine_for_metadata(folder).await?;
 
             let server_uid_validity = mailbox.uid_validity.map(|v| v as i64);
             let server_highest = mailbox.highest_modseq.map(|v| v as i64);
@@ -264,8 +449,10 @@ impl MailSource for ImapMailSource {
             // Always enumerate the full UID set so the caller can detect
             // deletions. UID SEARCH ALL is cheap — server returns just a
             // list of numbers.
+            cached.note_command();
             let all_uids: Vec<u32> = {
-                let search = session
+                let search = cached
+                    .session
                     .uid_search("ALL")
                     .await
                     .map_err(|e| Error::store(format!("IMAP UID SEARCH ALL: {e}")))?;
@@ -285,7 +472,9 @@ impl MailSource for ImapMailSource {
                 "(UID FLAGS MODSEQ INTERNALDATE RFC822.SIZE)".to_string()
             };
 
-            let messages = session
+            cached.note_command();
+            let messages = cached
+                .session
                 .fetch("1:*", &fetch_cmd)
                 .await
                 .map_err(|e| Error::store(format!("IMAP FETCH summaries: {e}")))?;
@@ -350,14 +539,19 @@ impl MailSource for ImapMailSource {
             .map_err(|e| Error::store(format!("IMAP source: parsing uid from {id}: {e}")))?;
 
         let mut guard = self.session_guard().await?;
-        let session = guard.as_mut().expect("session present");
+        let cached = guard.as_mut().expect("session present");
         let result: Result<FetchedMessage, Error> = async {
-            session
-                .examine(folder)
-                .await
-                .map_err(|e| Error::store(format!("IMAP EXAMINE {folder}: {e}")))?;
+            // Skip EXAMINE if the session is already positioned here —
+            // this is the optimization that saves ~N commands per
+            // N-message fetch batch. Before this, pulling a 5922-message
+            // archive folder issued 5923 EXAMINEs (1 for list_messages
+            // + 1 per fetch) and blew forwardemail's per-session cap;
+            // now it issues 1.
+            cached.ensure_positioned(folder, MailboxMode::Examine).await?;
 
-            let messages = session
+            cached.note_command();
+            let messages = cached
+                .session
                 .uid_fetch(
                     uid.to_string(),
                     "(UID FLAGS MODSEQ INTERNALDATE RFC822.SIZE BODY[])",
@@ -415,16 +609,16 @@ impl crate::source::traits::MailWriter for ImapMailSource {
     async fn update_flags(&self, folder: &str, id: &str, flags: &[String]) -> Result<(), Error> {
         let uid = parse_imap_uid(id)?;
         let mut guard = self.session_guard().await?;
-        let session = guard.as_mut().expect("session present");
+        let cached = guard.as_mut().expect("session present");
         let result: Result<(), Error> = async {
-            // SELECT (not EXAMINE) so we can write.
-            session
-                .select(&folder)
-                .await
-                .map_err(|e| Error::store(format!("IMAP SELECT {folder}: {e}")))?;
+            // Must be Select (not Examine) so we can write. The cache
+            // will upgrade Examine → Select if needed.
+            cached.ensure_positioned(folder, MailboxMode::Select).await?;
             // STORE replaces the flag set entirely.
             let flag_str = flags.join(" ");
-            let _: Vec<_> = session
+            cached.note_command();
+            let _: Vec<_> = cached
+                .session
                 .uid_store(uid.to_string(), format!("FLAGS ({flag_str})"))
                 .await
                 .map_err(|e| Error::store(format!("IMAP STORE flags: {e}")))?
@@ -448,30 +642,33 @@ impl crate::source::traits::MailWriter for ImapMailSource {
     ) -> Result<(), Error> {
         let uid = parse_imap_uid(id)?;
         let mut guard = self.session_guard().await?;
-        let session = guard.as_mut().expect("session present");
+        let cached = guard.as_mut().expect("session present");
         let result: Result<(), Error> = async {
-            session
-                .select(&folder)
-                .await
-                .map_err(|e| Error::store(format!("IMAP SELECT {folder}: {e}")))?;
+            cached.ensure_positioned(folder, MailboxMode::Select).await?;
             // UID COPY + UID STORE \Deleted + UID EXPUNGE (RFC 4315).
             // RFC 6851 MOVE exists but async-imap doesn't expose it.
             // UID EXPUNGE only removes messages matching the specified
             // UID set, unlike plain EXPUNGE which removes ALL \Deleted
             // messages — critical for safety when other clients may have
             // flagged messages for deletion concurrently.
-            session
+            cached.note_command();
+            cached
+                .session
                 .uid_copy(uid.to_string(), target_folder)
                 .await
                 .map_err(|e| Error::store(format!("IMAP COPY: {e}")))?;
-            let _: Vec<_> = session
+            cached.note_command();
+            let _: Vec<_> = cached
+                .session
                 .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
                 .await
                 .map_err(|e| Error::store(format!("IMAP STORE \\Deleted: {e}")))?
                 .try_collect()
                 .await
                 .map_err(|e| Error::store(format!("IMAP STORE collect: {e}")))?;
-            session
+            cached.note_command();
+            cached
+                .session
                 .uid_expunge(uid.to_string())
                 .await
                 .map_err(|e| Error::store(format!("IMAP UID EXPUNGE: {e}")))?
@@ -490,13 +687,12 @@ impl crate::source::traits::MailWriter for ImapMailSource {
     async fn delete_message(&self, folder: &str, id: &str) -> Result<(), Error> {
         let uid = parse_imap_uid(id)?;
         let mut guard = self.session_guard().await?;
-        let session = guard.as_mut().expect("session present");
+        let cached = guard.as_mut().expect("session present");
         let result: Result<(), Error> = async {
-            session
-                .select(&folder)
-                .await
-                .map_err(|e| Error::store(format!("IMAP SELECT {folder}: {e}")))?;
-            let _: Vec<_> = session
+            cached.ensure_positioned(folder, MailboxMode::Select).await?;
+            cached.note_command();
+            let _: Vec<_> = cached
+                .session
                 .uid_store(uid.to_string(), "+FLAGS (\\Deleted)")
                 .await
                 .map_err(|e| Error::store(format!("IMAP STORE \\Deleted: {e}")))?
@@ -505,7 +701,9 @@ impl crate::source::traits::MailWriter for ImapMailSource {
                 .map_err(|e| Error::store(format!("IMAP STORE collect: {e}")))?;
             // UID EXPUNGE (RFC 4315) — only removes this specific UID,
             // not other messages that may be \Deleted concurrently.
-            session
+            cached.note_command();
+            cached
+                .session
                 .uid_expunge(uid.to_string())
                 .await
                 .map_err(|e| Error::store(format!("IMAP UID EXPUNGE: {e}")))?
@@ -670,4 +868,186 @@ async fn run_one_idle_connection(
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── mailbox_switch_decision ──────────────────────────────────────
+    //
+    // These tests nail down the state machine that keeps us under
+    // forwardemail's per-session EXAMINE cap. The bug they guard
+    // against: if `fetch_message` ever stops skipping its EXAMINE when
+    // the session is already positioned on the right folder, an
+    // initial sync of a large archive folder will issue thousands of
+    // EXAMINE commands in a row and blow the server's limit.
+
+    #[test]
+    fn switch_decision_no_current_always_executes() {
+        assert_eq!(
+            mailbox_switch_decision(None, "INBOX", MailboxMode::Examine),
+            MailboxSwitch::Execute
+        );
+        assert_eq!(
+            mailbox_switch_decision(None, "INBOX", MailboxMode::Select),
+            MailboxSwitch::Execute
+        );
+    }
+
+    #[test]
+    fn switch_decision_different_folder_always_executes() {
+        let current = Some(("Archive/2010".to_string(), MailboxMode::Examine));
+        assert_eq!(
+            mailbox_switch_decision(current.as_ref(), "INBOX", MailboxMode::Examine),
+            MailboxSwitch::Execute
+        );
+        let current = Some(("Archive/2010".to_string(), MailboxMode::Select));
+        assert_eq!(
+            mailbox_switch_decision(current.as_ref(), "INBOX", MailboxMode::Select),
+            MailboxSwitch::Execute
+        );
+    }
+
+    #[test]
+    fn switch_decision_same_folder_same_mode_skips() {
+        // This is THE optimization: N consecutive fetch_message calls
+        // on the same folder all skip the redundant EXAMINE after the
+        // first one.
+        let current = Some(("Archive/2010".to_string(), MailboxMode::Examine));
+        assert_eq!(
+            mailbox_switch_decision(current.as_ref(), "Archive/2010", MailboxMode::Examine),
+            MailboxSwitch::Skip
+        );
+    }
+
+    #[test]
+    fn switch_decision_select_satisfies_examine_request() {
+        // If we already SELECT-ed a folder for writing, we can also
+        // read from it without re-examining.
+        let current = Some(("Spam".to_string(), MailboxMode::Select));
+        assert_eq!(
+            mailbox_switch_decision(current.as_ref(), "Spam", MailboxMode::Examine),
+            MailboxSwitch::Skip
+        );
+    }
+
+    #[test]
+    fn switch_decision_examine_does_not_satisfy_select_request() {
+        // EXAMINE is read-only; writes need SELECT. This forces an
+        // upgrade even though the folder is the same. Without this, a
+        // sequence like list_messages(INBOX) → move_message(INBOX, …)
+        // would try to STORE/EXPUNGE against a read-only mailbox and
+        // error out.
+        let current = Some(("INBOX".to_string(), MailboxMode::Examine));
+        assert_eq!(
+            mailbox_switch_decision(current.as_ref(), "INBOX", MailboxMode::Select),
+            MailboxSwitch::Execute
+        );
+    }
+
+    #[test]
+    fn switch_decision_select_same_folder_skips() {
+        let current = Some(("INBOX".to_string(), MailboxMode::Select));
+        assert_eq!(
+            mailbox_switch_decision(current.as_ref(), "INBOX", MailboxMode::Select),
+            MailboxSwitch::Skip
+        );
+    }
+
+    // ── Command counter / recycle threshold ──────────────────────────
+    //
+    // The recycle path is the belt-and-suspenders guard: even if a
+    // future change accidentally defeats the position cache, we still
+    // won't exceed the server's per-session command limit because
+    // `should_recycle` will tell `session_guard` to drop the session
+    // before it gets that far. These tests bolt down the threshold
+    // semantics without needing a real IMAP session.
+
+    /// Mirror of CachedSession's counter logic without the session
+    /// field. We can't build a real `CachedSession` in a unit test
+    /// because its `session: ImapSession` requires a live TLS
+    /// connection — but the counter logic is pure and can be tested
+    /// in isolation. If you add counter fields or change the
+    /// increment/recycle semantics on `CachedSession`, mirror them
+    /// here too.
+    struct CounterOnly {
+        commands_since_connect: usize,
+    }
+
+    impl CounterOnly {
+        fn new() -> Self {
+            Self {
+                commands_since_connect: 0,
+            }
+        }
+        fn note_command(&mut self) {
+            self.commands_since_connect = self.commands_since_connect.saturating_add(1);
+        }
+        fn should_recycle(&self) -> bool {
+            self.commands_since_connect >= MAX_COMMANDS_PER_SESSION
+        }
+    }
+
+    #[test]
+    fn counter_starts_at_zero_and_does_not_recycle() {
+        let c = CounterOnly::new();
+        assert_eq!(c.commands_since_connect, 0);
+        assert!(!c.should_recycle());
+    }
+
+    #[test]
+    fn counter_increments_monotonically() {
+        let mut c = CounterOnly::new();
+        for _ in 0..5 {
+            c.note_command();
+        }
+        assert_eq!(c.commands_since_connect, 5);
+    }
+
+    #[test]
+    fn recycle_triggers_at_or_above_threshold() {
+        let mut c = CounterOnly::new();
+        for _ in 0..(MAX_COMMANDS_PER_SESSION - 1) {
+            c.note_command();
+        }
+        assert!(!c.should_recycle(), "just under threshold should not recycle");
+        c.note_command();
+        assert!(c.should_recycle(), "at threshold must recycle");
+    }
+
+    #[test]
+    fn recycle_threshold_is_comfortably_below_typical_imap_cap() {
+        // Sanity check: Wildduck (forwardemail's backend) caps
+        // SELECT/EXAMINE somewhere in the low hundreds. Keep our
+        // recycle threshold comfortably below any plausible server cap
+        // so we always recycle before the server BYE's us. If this
+        // ever fails, the threshold was raised carelessly.
+        assert!(
+            MAX_COMMANDS_PER_SESSION <= 250,
+            "MAX_COMMANDS_PER_SESSION ({}) is too close to the typical Wildduck limit",
+            MAX_COMMANDS_PER_SESSION
+        );
+        assert!(
+            MAX_COMMANDS_PER_SESSION >= 50,
+            "MAX_COMMANDS_PER_SESSION ({}) is so low the reconnect cost will dominate",
+            MAX_COMMANDS_PER_SESSION
+        );
+    }
+
+    #[test]
+    fn counter_saturates_at_usize_max_instead_of_overflowing() {
+        // Paranoia: note_command uses saturating_add so a wedged
+        // session that somehow iterates billions of times without
+        // hitting an error won't panic. Not reachable in practice but
+        // keeps the counter incrementation path branch-free of
+        // overflow checks.
+        let mut c = CounterOnly {
+            commands_since_connect: usize::MAX,
+        };
+        c.note_command();
+        assert_eq!(c.commands_since_connect, usize::MAX);
+        assert!(c.should_recycle());
+    }
+
 }
