@@ -25,11 +25,14 @@ pub struct Calendar {
     pub id: String,
     #[serde(default)]
     pub name: String,
-    #[serde(default)]
+    /// May be null for CalDAV-synced calendars.
+    #[serde(default, deserialize_with = "crate::forwardemail::calendar::deser_nullable_string")]
     pub description: String,
     #[serde(default)]
     pub color: String,
-    #[serde(default)]
+    /// May contain a full VTIMEZONE iCalendar blob for CalDAV-synced
+    /// calendars, or a simple IANA timezone string for REST-created ones.
+    #[serde(default, deserialize_with = "crate::forwardemail::calendar::deser_nullable_string")]
     pub timezone: String,
     #[serde(default)]
     pub order: Option<i64>,
@@ -37,6 +40,18 @@ pub struct Calendar {
     pub created_at: Option<String>,
     #[serde(default)]
     pub updated_at: Option<String>,
+}
+
+/// Deserialize a JSON string-or-null into a `String`, mapping `null` to `""`.
+/// Forwardemail's API returns `null` for optional text fields on calendars
+/// synced via CalDAV (e.g. description), but `#[serde(default)]` only
+/// handles *missing* keys, not explicit null values.
+fn deser_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 /// Calendar event as returned by `/v1/calendar-events`. The raw iCalendar
