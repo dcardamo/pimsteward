@@ -73,6 +73,60 @@ fn message_not_indexed_error(canonical_id: &str) -> String {
     )
 }
 
+/// Inject a `canonical_id` field on every message in a `search_email`
+/// response so callers can go straight to `get_email` without
+/// reconstructing the id themselves.
+///
+/// Why this exists: forwardemail's `/v1/messages` endpoint returns a
+/// REST `id` in its own namespace — `get_email` rejects that id with
+/// "message X not yet indexed" because pimsteward's backup tree keys
+/// files by `sha256(Message-ID)[:16]`. Every consumer that wanted to
+/// walk "search → fetch" has had to re-derive the canonical id itself:
+///
+///   - assistant-email-watcher.py reimplements the hash in Python.
+///   - spamguard used to bypass MCP entirely and scan `.eml` filenames
+///     off the filesystem via a bind mount.
+///   - Agents (rocky) couldn't figure it out at all and narrated
+///     "MCP is down" when `get_email(search_result.id)` failed.
+///
+/// Enriching the response here is the one-line fix that closes the
+/// gap for every client simultaneously. The canonical id is computed
+/// the same way `pull::mail::derive_canonical_id` computes it during
+/// IMAP/REST ingest, so round-tripping `search_email → get_email`
+/// inside a single backup tree is stable.
+///
+/// Accepts both the `[{...}, ...]` list shape and the
+/// `{"messages": [...]}` wrapper shape, because forwardemail has been
+/// observed returning both over the life of the API.
+fn enrich_search_results_with_canonical_id(v: &mut serde_json::Value) {
+    fn enrich_one(msg: &mut serde_json::Value) {
+        let Some(obj) = msg.as_object_mut() else { return };
+        // Already present (paranoid no-op, e.g. if forwardemail ever
+        // starts returning this field themselves): trust ours over theirs
+        // so behaviour stays deterministic.
+        let mid = obj
+            .get("header_message_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        if let Some(mid) = mid {
+            let cid = crate::pull::mail::hash_to_canonical(mid);
+            obj.insert("canonical_id".into(), serde_json::Value::String(cid));
+        }
+    }
+
+    if let Some(arr) = v.as_array_mut() {
+        for msg in arr.iter_mut() {
+            enrich_one(msg);
+        }
+        return;
+    }
+    if let Some(arr) = v.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        for msg in arr.iter_mut() {
+            enrich_one(msg);
+        }
+    }
+}
+
 /// Shared state held by every tool handler.
 #[derive(Clone)]
 pub struct PimstewardServer {
@@ -743,12 +797,13 @@ impl PimstewardServer {
         parts.push(format!("limit={}", p.limit.unwrap_or(10).clamp(1, 50)));
         let path = format!("/v1/messages?{}", parts.join("&"));
 
-        let v: serde_json::Value = self
+        let mut v: serde_json::Value = self
             .inner
             .client
             .raw_get_json(&path)
             .await
             .map_err(|e| self.api_error(e))?;
+        enrich_search_results_with_canonical_id(&mut v);
         serde_json::to_string_pretty(&v).map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
@@ -2696,6 +2751,89 @@ mod tests {
             msg.contains("not an MCP server failure"),
             "must explicitly distinguish from MCP-down so agents don't overreact: {msg}"
         );
+    }
+
+    // ── search_email canonical_id enrichment ────────────────────────
+    //
+    // Every historical workaround — the watcher hashing header_message_id
+    // in Python, spamguard reading .eml filenames off disk, rocky guessing
+    // — exists because search_email didn't tell callers the canonical id.
+    // These tests pin the new contract: search_email enriches every
+    // message with a canonical_id computed identically to the puller's
+    // derivation. If this invariant breaks, all three consumers regress
+    // simultaneously.
+
+    fn sample_message(message_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "69e2473cad75c10d44337093",
+            "header_message_id": message_id,
+            "subject": "probe",
+            "folder_path": "INBOX",
+        })
+    }
+
+    #[test]
+    fn enrich_adds_canonical_id_to_bare_list_response() {
+        let mut v = serde_json::json!([
+            sample_message("<abc@example.com>"),
+            sample_message("<def@example.com>"),
+        ]);
+        enrich_search_results_with_canonical_id(&mut v);
+        let arr = v.as_array().expect("list");
+        for item in arr {
+            let cid = item.get("canonical_id").and_then(|c| c.as_str()).expect("canonical_id present");
+            assert_eq!(cid.len(), 16, "canonical id is always 16 hex chars");
+            assert!(cid.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // Distinct Message-IDs must hash to distinct canonical_ids.
+        assert_ne!(arr[0]["canonical_id"], arr[1]["canonical_id"]);
+    }
+
+    #[test]
+    fn enrich_handles_wrapped_messages_shape() {
+        let mut v = serde_json::json!({
+            "total": 1,
+            "messages": [ sample_message("<wrapped@example.com>") ]
+        });
+        enrich_search_results_with_canonical_id(&mut v);
+        let cid = v["messages"][0]["canonical_id"].as_str().expect("canonical_id");
+        assert_eq!(cid.len(), 16);
+    }
+
+    #[test]
+    fn enrich_matches_puller_derivation_byte_for_byte() {
+        // The invariant that makes "search → get_email" actually work:
+        // search_email must produce the same canonical_id that the
+        // puller wrote on disk. Compute both paths and compare.
+        let mid = "<roundtrip-check@hld.ca>";
+        let mut v = serde_json::json!([ sample_message(mid) ]);
+        enrich_search_results_with_canonical_id(&mut v);
+        let from_search = v[0]["canonical_id"].as_str().unwrap().to_string();
+        let from_puller = crate::pull::mail::hash_to_canonical(mid);
+        assert_eq!(from_search, from_puller,
+            "search_email canonical_id diverged from puller's — get_email will 404 and rocky will think MCP is down");
+    }
+
+    #[test]
+    fn enrich_skips_messages_without_header_message_id() {
+        // Drafts and malformed inbound mail may have no Message-ID. We
+        // leave canonical_id off rather than inventing one — callers can
+        // decide whether to skip or fall back.
+        let mut v = serde_json::json!([{
+            "id": "no-message-id-at-all",
+            "subject": "draft"
+        }]);
+        enrich_search_results_with_canonical_id(&mut v);
+        assert!(v[0].get("canonical_id").is_none());
+    }
+
+    #[test]
+    fn enrich_is_a_no_op_on_non_list_responses() {
+        // forwardemail 404s or error JSON must pass through unchanged.
+        let mut v = serde_json::json!({"error": "boom"});
+        let before = v.clone();
+        enrich_search_results_with_canonical_id(&mut v);
+        assert_eq!(v, before);
     }
 
     #[test]

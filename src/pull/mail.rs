@@ -579,7 +579,7 @@ fn derive_canonical_id(fetched: &crate::source::FetchedMessage) -> String {
     hash_to_canonical(&fetched.summary.id)
 }
 
-fn hash_to_canonical(input: &str) -> String {
+pub(crate) fn hash_to_canonical(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let hash = hasher.finalize();
