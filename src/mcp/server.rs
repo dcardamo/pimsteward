@@ -53,6 +53,26 @@ fn is_cancelled(ev: &crate::forwardemail::calendar::CalendarEvent) -> bool {
     false
 }
 
+/// Error text for a canonical id that isn't present in pimsteward's
+/// backup tree yet.
+///
+/// This is a per-message DATA state — almost always a race between
+/// pimsteward's `/notifications` SSE signal and the next mail puller
+/// cycle writing the new message's `meta.json`. It is NOT an MCP server
+/// health issue, and the wording deliberately avoids the words "tree"
+/// and "server" (prior callers — notably the rocky@hld.ca agent — have
+/// read "not found in backup tree" as "infrastructure is down" and
+/// escalated to operator alerts). Stable text so callers can match on
+/// it if they want to.
+fn message_not_indexed_error(canonical_id: &str) -> String {
+    format!(
+        "message {canonical_id} not yet indexed by pimsteward \
+         (try again in a few seconds or wait for the next \
+         /notifications event — this is a per-message data state, \
+         not an MCP server failure)"
+    )
+}
+
 /// Shared state held by every tool handler.
 #[derive(Clone)]
 pub struct PimstewardServer {
@@ -212,10 +232,7 @@ impl PimstewardServer {
                 return Ok(meta);
             }
         }
-        Err(McpError::invalid_params(
-            format!("message {canonical_id} not found in backup tree"),
-            None,
-        ))
+        Err(McpError::invalid_params(message_not_indexed_error(canonical_id), None))
     }
 
 
@@ -2654,6 +2671,51 @@ mod tests {
         ).unwrap();
         assert!(ics.contains("DTSTART;VALUE=DATE:20260704"));
         assert!(ics.contains("DTEND;VALUE=DATE:20260705"));
+    }
+
+    // ── Error wording ───────────────────────────────────────────────
+    //
+    // The rocky@hld.ca hermes agent used to read the old
+    // "message X not found in backup tree" error as "pimsteward
+    // infrastructure is down" and escalate with Telegram alerts. The
+    // helper below is the authoritative source of that error string,
+    // and these tests pin the wording so nobody regresses it without
+    // also updating the callers that depend on the semantics.
+    #[test]
+    fn message_not_indexed_error_is_scoped_to_the_id_not_the_server() {
+        let msg = message_not_indexed_error("c8e7c5ed006edf64");
+        assert!(
+            msg.contains("c8e7c5ed006edf64"),
+            "must name the specific message so it reads as data, not infra: {msg}"
+        );
+        assert!(
+            msg.contains("not yet indexed"),
+            "should describe the state as transient/indexing: {msg}"
+        );
+        assert!(
+            msg.contains("not an MCP server failure"),
+            "must explicitly distinguish from MCP-down so agents don't overreact: {msg}"
+        );
+    }
+
+    #[test]
+    fn message_not_indexed_error_avoids_infra_trigger_words() {
+        let msg = message_not_indexed_error("deadbeefcafef00d");
+        // These are the specific words/phrases that caused the
+        // misdiagnosis. If a future refactor wants to use any of
+        // them, it must update the rocky prompt guidance in
+        // nixos/saturn/configuration.nix at the same time.
+        for bad in [
+            "backup tree",
+            "server down",
+            "unreachable",
+            "connection",
+        ] {
+            assert!(
+                !msg.to_lowercase().contains(bad),
+                "error text must not say {bad:?}: {msg}"
+            );
+        }
     }
 
     #[test]
