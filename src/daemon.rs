@@ -167,7 +167,26 @@ async fn spawn_mcp_http_listener(
                 ))
             },
             Default::default(),
-            StreamableHttpServerConfig::default().with_cancellation_token(ct_http.child_token()),
+            // Stateless mode: every HTTP request is a self-contained MCP call
+            // with no Mcp-Session-Id affinity to a specific server-side worker.
+            // Why stateless: pimsteward has no per-session server state (every
+            // tool reads/writes the git-backed repo on disk), so the session
+            // layer only added failure modes — a daily systemd restart or any
+            // brief pimsteward bounce would invalidate every client's
+            // session_id, and the Python MCP SDK then returns
+            // `{"error":{"code":32600,"message":"Session terminated"}}` on
+            // every subsequent tool call without reinitializing. Hermes reads
+            // that as "MCP is down." Stateless mode returns plain JSON (no
+            // SSE framing) and the client doesn't track a session id at all,
+            // so a pimsteward restart is invisible to consumers.
+            //
+            // Server-initiated notifications still flow through the separate
+            // `/notifications` SSE endpoint — they're independent of the MCP
+            // transport, so no functionality is lost here.
+            StreamableHttpServerConfig::default()
+                .with_stateful_mode(false)
+                .with_json_response(true)
+                .with_cancellation_token(ct_http.child_token()),
         );
 
     let mail_rx = mail_tx.clone();
