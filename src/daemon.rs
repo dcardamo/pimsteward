@@ -750,6 +750,7 @@ fn maybe_rebuild_index_on_startup(repo: &Arc<Repo>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod startup_rebuild_tests {
     use super::*;
 

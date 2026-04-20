@@ -91,9 +91,11 @@ pub struct FlagFilter {
 
 impl FlagFilter {
     fn is_empty(&self) -> bool {
-        self.any_of.as_ref().is_none_or(|v| v.is_empty())
-            && self.all_of.as_ref().is_none_or(|v| v.is_empty())
-            && self.none_of.as_ref().is_none_or(|v| v.is_empty())
+        // `Option::is_none_or` is 1.82+; stick to is_some_and for MSRV 1.80.
+        let empty = |v: &Option<Vec<String>>| -> bool {
+            !v.as_ref().is_some_and(|l| !l.is_empty())
+        };
+        empty(&self.any_of) && empty(&self.all_of) && empty(&self.none_of)
     }
 }
 
@@ -527,6 +529,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[allow(clippy::too_many_arguments)]
     fn row_for(
         id: &str,
         folder: &str,

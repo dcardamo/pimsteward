@@ -80,10 +80,7 @@ pub fn parse_eml(raw: &[u8], meta: &MetaFacts<'_>) -> Result<MessageRow, Error> 
         .headers
         .get_first_value("Date")
         .and_then(|d| dateparse(&d).ok())
-        .or_else(|| {
-            meta.internal_date
-                .and_then(|s| parse_iso8601_to_unix(s))
-        });
+        .or_else(|| meta.internal_date.and_then(parse_iso8601_to_unix));
 
     let has_attachments = walk_has_attachments(&parsed);
     let body_text = extract_body_text(&parsed);
@@ -264,11 +261,11 @@ fn html_to_text(html: &str) -> String {
             // the matching closing tag.
             let lower_tail = lower_peek(&html[i..], 16);
             if lower_tail.starts_with("<script") {
-                i = skip_until(&html, i, "</script>");
+                i = skip_until(html, i, "</script>");
                 continue;
             }
             if lower_tail.starts_with("<style") {
-                i = skip_until(&html, i, "</style>");
+                i = skip_until(html, i, "</style>");
                 continue;
             }
             // Otherwise: skip to the next '>'.  HTML parsing in the

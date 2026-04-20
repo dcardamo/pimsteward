@@ -342,7 +342,8 @@ impl SearchIndex {
                 batch = 0;
                 in_txn = false;
             }
-            if stats.scanned.is_multiple_of(opts.log_every as u64) {
+            // u64::is_multiple_of is 1.87+; stick to `%` for MSRV 1.80.
+            if stats.scanned % opts.log_every as u64 == 0 {
                 tracing::info!(
                     scanned = stats.scanned,
                     upserted = stats.upserted,
