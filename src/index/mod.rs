@@ -22,9 +22,11 @@ pub mod envelope;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Error;
+
+pub use envelope::MessageRow;
 
 /// The current schema version.  Bump this every time migrations are added
 /// and add a new arm in `migrate_up` that carries the DB forward from the
@@ -80,12 +82,139 @@ impl SearchIndex {
         Ok(n as u64)
     }
 
+    /// Upsert a single message row.  Idempotent by canonical_id.
+    /// Refreshes `indexed_at` to `now_unix` on every call so incremental
+    /// rebuild's mtime comparison works correctly.  Triggers mirror the
+    /// change into `messages_fts`.
+    pub fn upsert_message(&self, row: &MessageRow) -> Result<(), Error> {
+        let conn = self.lock();
+        upsert_message_on(&conn, row, now_unix())
+    }
+
+    /// Delete a single row by canonical_id.  Returns the number of rows
+    /// deleted (0 if not present).
+    pub fn delete_message(&self, canonical_id: &str) -> Result<u64, Error> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "DELETE FROM messages WHERE canonical_id = ?1",
+            params![canonical_id],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Delete all rows whose folder matches `folder` exactly OR is a
+    /// descendant (prefix match with a `/` separator).  Returns the
+    /// number of rows removed.  Cascades through the AD trigger into
+    /// `messages_fts`.
+    pub fn delete_folder(&self, folder: &str) -> Result<u64, Error> {
+        let conn = self.lock();
+        let like = format!("{folder}/%");
+        let n = conn.execute(
+            "DELETE FROM messages WHERE folder = ?1 OR folder LIKE ?2",
+            params![folder, like],
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Return the `indexed_at` timestamp for a given canonical_id, or
+    /// None if the row is not present.  Used by rebuild to short-circuit
+    /// re-parsing .eml files that are already current.
+    pub fn indexed_at(&self, canonical_id: &str) -> Result<Option<i64>, Error> {
+        let conn = self.lock();
+        let t = conn
+            .query_row(
+                "SELECT indexed_at FROM messages WHERE canonical_id = ?1",
+                params![canonical_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(t)
+    }
+
+    /// Load every (canonical_id, indexed_at) pair into memory.  Cheap at
+    /// mailbox scale (10k–100k messages, tens of MB) and lets rebuild do
+    /// per-file "is this already indexed?" checks with zero SQL.
+    pub fn all_indexed_at(&self) -> Result<std::collections::HashMap<String, i64>, Error> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT canonical_id, indexed_at FROM messages")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            out.insert(k, v);
+        }
+        Ok(out)
+    }
+
     pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // PoisonError here would mean a previous writer panicked mid-txn.
         // The DB is transactionally safe, so we just unpoison and carry
         // on — no silent corruption risk.
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+// ── write helpers ─────────────────────────────────────────────────────────
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// INSERT ... ON CONFLICT DO UPDATE for a single row.  Takes an
+/// explicit `indexed_at` so callers that want deterministic timestamps
+/// (rebuild tests, synthetic corpora) can supply one.
+fn upsert_message_on(conn: &Connection, row: &MessageRow, indexed_at: i64) -> Result<(), Error> {
+    let flags_json = serde_json::to_string(&row.flags)
+        .map_err(|e| Error::index(format!("flags serialize: {e}")))?;
+    conn.execute(
+        r#"
+        INSERT INTO messages (
+            canonical_id, folder, source_id, message_id,
+            from_addr, from_name, to_addrs, cc_addrs,
+            subject, body, date_unix, size, flags, has_attach, indexed_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+        )
+        ON CONFLICT(canonical_id) DO UPDATE SET
+            folder      = excluded.folder,
+            source_id   = excluded.source_id,
+            message_id  = excluded.message_id,
+            from_addr   = excluded.from_addr,
+            from_name   = excluded.from_name,
+            to_addrs    = excluded.to_addrs,
+            cc_addrs    = excluded.cc_addrs,
+            subject     = excluded.subject,
+            body        = excluded.body,
+            date_unix   = excluded.date_unix,
+            size        = excluded.size,
+            flags       = excluded.flags,
+            has_attach  = excluded.has_attach,
+            indexed_at  = excluded.indexed_at
+        "#,
+        params![
+            row.canonical_id,
+            row.folder,
+            row.source_id,
+            row.message_id,
+            row.from_addr,
+            row.from_name,
+            row.to_addrs,
+            row.cc_addrs,
+            row.subject,
+            row.body_text,
+            row.date_unix,
+            row.size,
+            flags_json,
+            row.has_attachments as i64,
+            indexed_at,
+        ],
+    )?;
+    Ok(())
 }
 
 // ── migrations ────────────────────────────────────────────────────────────
@@ -140,9 +269,12 @@ fn migrate(conn: &Connection) -> Result<(), Error> {
 }
 
 fn migrate_v0_to_v1(conn: &Connection) -> Result<(), Error> {
-    // Must be one batch: the triggers reference messages_fts which
-    // depends on messages; all DDL in the same transaction keeps the
-    // file atomically either "v1 complete" or "empty".
+    // One batch so the file atomically ends up either "v1 complete" or
+    // "empty".  Body lives inline in `messages` (capped at BODY_CAP_BYTES
+    // by envelope.rs) so there's a single source of truth per row and
+    // upserts don't need to sequence two writes.  FTS5 uses external
+    // content against `messages` so INSERT/UPDATE/DELETE on the row
+    // drives the index via triggers; pure column-to-index mirroring.
     conn.execute_batch(
         r#"
         BEGIN;
@@ -157,6 +289,7 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), Error> {
             to_addrs      TEXT,
             cc_addrs      TEXT,
             subject       TEXT,
+            body          TEXT,
             date_unix     INTEGER,
             size          INTEGER,
             flags         TEXT NOT NULL DEFAULT '[]',
@@ -168,11 +301,6 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), Error> {
         CREATE INDEX idx_messages_date_unix  ON messages(date_unix);
         CREATE INDEX idx_messages_message_id ON messages(message_id);
 
-        CREATE TABLE messages_body (
-            rowid INTEGER PRIMARY KEY,
-            body  TEXT NOT NULL
-        );
-
         CREATE VIRTUAL TABLE messages_fts USING fts5(
             subject, from_name, to_addrs, body,
             content='messages',
@@ -182,24 +310,19 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), Error> {
 
         CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
             INSERT INTO messages_fts(rowid, subject, from_name, to_addrs, body)
-            VALUES (new.rowid, new.subject, new.from_name, new.to_addrs,
-                    COALESCE((SELECT body FROM messages_body WHERE rowid = new.rowid), ''));
+            VALUES (new.rowid, new.subject, new.from_name, new.to_addrs, new.body);
         END;
 
         CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, subject, from_name, to_addrs, body)
-            VALUES ('delete', old.rowid, old.subject, old.from_name, old.to_addrs,
-                    COALESCE((SELECT body FROM messages_body WHERE rowid = old.rowid), ''));
-            DELETE FROM messages_body WHERE rowid = old.rowid;
+            VALUES ('delete', old.rowid, old.subject, old.from_name, old.to_addrs, old.body);
         END;
 
         CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
             INSERT INTO messages_fts(messages_fts, rowid, subject, from_name, to_addrs, body)
-            VALUES ('delete', old.rowid, old.subject, old.from_name, old.to_addrs,
-                    COALESCE((SELECT body FROM messages_body WHERE rowid = old.rowid), ''));
+            VALUES ('delete', old.rowid, old.subject, old.from_name, old.to_addrs, old.body);
             INSERT INTO messages_fts(rowid, subject, from_name, to_addrs, body)
-            VALUES (new.rowid, new.subject, new.from_name, new.to_addrs,
-                    COALESCE((SELECT body FROM messages_body WHERE rowid = new.rowid), ''));
+            VALUES (new.rowid, new.subject, new.from_name, new.to_addrs, new.body);
         END;
 
         COMMIT;
@@ -250,7 +373,7 @@ mod tests {
 
         let conn = idx.lock();
         // All expected objects exist.
-        for obj in ["messages", "messages_body", "messages_fts", "schema_version"] {
+        for obj in ["messages", "messages_fts", "schema_version"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
@@ -307,5 +430,188 @@ mod tests {
         // Should not double-add: the existing entry is a valid match.
         let n = contents.lines().filter(|l| l.contains("pimsteward")).count();
         assert_eq!(n, 1);
+    }
+
+    fn row(canonical_id: &str, folder: &str, from: &str, subject: &str) -> MessageRow {
+        MessageRow {
+            canonical_id: canonical_id.to_string(),
+            folder: folder.to_string(),
+            source_id: "src-1".to_string(),
+            message_id: Some(format!("<{canonical_id}@test>")),
+            from_addr: Some(from.to_string()),
+            from_name: Some("Sender".to_string()),
+            to_addrs: Some("dan@hld.ca".to_string()),
+            cc_addrs: None,
+            subject: Some(subject.to_string()),
+            date_unix: Some(1700000000),
+            size: Some(1234),
+            flags: vec!["\\Seen".to_string()],
+            has_attachments: false,
+            body_text: Some(format!("body of {subject}")),
+        }
+    }
+
+    #[test]
+    fn upsert_inserts_then_replaces() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        idx.upsert_message(&row("a1", "INBOX", "x@y", "hello")).unwrap();
+        assert_eq!(idx.message_count().unwrap(), 1);
+        // Second upsert with changed fields updates in place, doesn't
+        // duplicate.
+        idx.upsert_message(&row("a1", "Archive", "x@y", "hello updated"))
+            .unwrap();
+        assert_eq!(idx.message_count().unwrap(), 1);
+        let conn = idx.lock();
+        let (folder, subj): (String, String) = conn
+            .query_row(
+                "SELECT folder, subject FROM messages WHERE canonical_id = 'a1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(folder, "Archive");
+        assert_eq!(subj, "hello updated");
+    }
+
+    #[test]
+    fn upsert_keeps_fts_in_sync() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        idx.upsert_message(&row("a1", "INBOX", "x@y", "apple invoice"))
+            .unwrap();
+        idx.upsert_message(&row("a2", "INBOX", "x@y", "banana receipt"))
+            .unwrap();
+        let conn = idx.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'apple'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'banana'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(conn);
+        // After an upsert that CHANGES the body, the old FTS tokens are
+        // gone and the new ones are present.  FTS5 tokenizes on word
+        // boundaries (unicode61), so "apple" as a token is cleanly
+        // removed — it does not substring-match "pineapple".
+        let mut r = row("a1", "INBOX", "x@y", "apple invoice");
+        r.body_text = Some("rewritten body with watermelon instead".into());
+        r.subject = Some("watermelon now".into());
+        idx.upsert_message(&r).unwrap();
+        let conn = idx.lock();
+        let n_apple: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'apple'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_invoice: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'invoice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let n_watermelon: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'watermelon'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_apple, 0, "old subject token should be gone");
+        assert_eq!(n_invoice, 0, "old body token should be gone");
+        assert_eq!(n_watermelon, 1, "new tokens should be indexed");
+    }
+
+    #[test]
+    fn delete_removes_from_messages_and_fts() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        idx.upsert_message(&row("a1", "INBOX", "x@y", "apple invoice"))
+            .unwrap();
+        idx.upsert_message(&row("a2", "INBOX", "x@y", "banana receipt"))
+            .unwrap();
+        let deleted = idx.delete_message("a1").unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(idx.message_count().unwrap(), 1);
+        let conn = idx.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'apple'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "deleted row's FTS entry must be gone");
+    }
+
+    #[test]
+    fn delete_message_missing_is_zero_not_error() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        assert_eq!(idx.delete_message("nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_folder_exact_and_prefix() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        idx.upsert_message(&row("a1", "INBOX", "x@y", "inbox-msg"))
+            .unwrap();
+        idx.upsert_message(&row("a2", "Archive", "x@y", "archive-msg"))
+            .unwrap();
+        idx.upsert_message(&row("a3", "Archive/2026", "x@y", "archive-2026"))
+            .unwrap();
+        idx.upsert_message(&row("a4", "Archive/2025", "x@y", "archive-2025"))
+            .unwrap();
+        let n = idx.delete_folder("Archive").unwrap();
+        assert_eq!(n, 3, "Archive + Archive/* should sweep three rows");
+        assert_eq!(idx.message_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn delete_folder_does_not_match_unrelated_prefix() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        idx.upsert_message(&row("a1", "Archive", "x@y", "arch"))
+            .unwrap();
+        idx.upsert_message(&row("a2", "ArchiveSiblings", "x@y", "sib"))
+            .unwrap();
+        let n = idx.delete_folder("Archive").unwrap();
+        assert_eq!(n, 1, "ArchiveSiblings must not match Archive prefix");
+        assert_eq!(idx.message_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn indexed_at_present_and_absent() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        assert!(idx.indexed_at("missing").unwrap().is_none());
+        idx.upsert_message(&row("a1", "INBOX", "x@y", "hi")).unwrap();
+        assert!(idx.indexed_at("a1").unwrap().is_some());
+    }
+
+    #[test]
+    fn all_indexed_at_round_trip() {
+        let td = tempdir().unwrap();
+        let idx = SearchIndex::open(td.path()).unwrap();
+        idx.upsert_message(&row("a1", "INBOX", "x@y", "one")).unwrap();
+        idx.upsert_message(&row("a2", "INBOX", "x@y", "two")).unwrap();
+        let map = idx.all_indexed_at().unwrap();
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("a1"));
+        assert!(map.contains_key("a2"));
     }
 }
