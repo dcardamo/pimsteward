@@ -29,6 +29,7 @@
 
 use crate::error::Error;
 use crate::forwardemail::mail::Folder;
+use crate::index::{SearchIndex, envelope};
 use crate::pull::{filename_safe, PullResult, PullSummary};
 use crate::source::MailSource;
 use crate::store::Repo;
@@ -254,6 +255,18 @@ async fn sync_one_folder(
     author_email: &str,
     summary: &mut PullSummary,
 ) -> PullResult<()> {
+    // Search index updates are best-effort: open it once per folder
+    // sync.  A failure here (disk full, corrupt file) logs and skips
+    // index updates for this folder — the .eml + meta.json on disk
+    // remain the source of truth and `pimsteward index rebuild` can
+    // always recover.  See design doc §"Error policy".
+    let index = match SearchIndex::open(repo.root()) {
+        Ok(i) => Some(i),
+        Err(e) => {
+            tracing::warn!(error = %e, "search index open failed during pull; index will not be updated this cycle");
+            None
+        }
+    };
     let folder_dir = format!("mail/{}", folder_safe(&f.path));
     let local_meta = read_local_message_meta(repo, &folder_dir)?;
     let mut folder_added = 0usize;
@@ -340,6 +353,31 @@ async fn sync_one_folder(
             }
         }
 
+        // Update the search index alongside the on-disk write.  Best-
+        // effort: a failed upsert logs and does not fail the pull.  The
+        // .eml on disk is the source of truth; `pimsteward index
+        // rebuild` can always reconstruct the index.
+        if let Some(idx) = index.as_ref() {
+            let facts = envelope::MetaFacts {
+                canonical_id: &canonical,
+                folder: &f.path,
+                source_id: &meta.id,
+                flags: &meta.flags,
+                internal_date: meta.internal_date.as_deref(),
+                size: meta.size,
+            };
+            match envelope::parse_eml(&fetched.raw, &facts) {
+                Ok(row) => {
+                    if let Err(e) = idx.upsert_message(&row) {
+                        tracing::warn!(canonical = %canonical, error = %e, "index upsert failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(canonical = %canonical, error = %e, "index envelope parse failed");
+                }
+            }
+        }
+
         if prev.is_some() {
             folder_updated += 1;
         } else {
@@ -358,6 +396,11 @@ async fn sync_one_folder(
     for (canonical, meta) in &local_meta {
         let source_id = filename_safe(&meta.id);
         if !remote_source_ids.contains(&source_id) {
+            if let Some(idx) = index.as_ref() {
+                if let Err(e) = idx.delete_message(canonical) {
+                    tracing::warn!(canonical = %canonical, error = %e, "index delete failed");
+                }
+            }
             let _ = std::fs::remove_file(
                 repo.root().join(format!("{folder_dir}/{canonical}.eml")),
             );
@@ -545,10 +588,56 @@ fn cleanup_removed_folders(repo: &Repo, folders: &[Folder]) -> Result<(), Error>
         }
     }
 
+    // Best-effort index sweep for each folder about to be deleted.
+    // We do this BEFORE remove_dir_all so `_folder.json` is still
+    // readable for the real folder_path → index.delete_folder mapping.
+    // Failure here is logged and non-fatal; rebuild --force recovers.
+    let index = SearchIndex::open(repo.root()).ok();
+    for path in &candidates_for_removal {
+        if let Some(idx) = index.as_ref() {
+            sweep_index_for_removed_folder(idx, path);
+        }
+    }
     for path in candidates_for_removal {
         let _ = std::fs::remove_dir_all(&path);
     }
     Ok(())
+}
+
+/// Read `_folder.json` inside the condemned folder for the real
+/// `folder_path`, then ask the index to delete every row with that
+/// folder.  If `_folder.json` is missing or unparseable, fall back to
+/// walking `<canonical>.meta.json` files and deleting rows by
+/// canonical_id — slower but equally correct.
+fn sweep_index_for_removed_folder(index: &SearchIndex, folder_dir: &PathBuf) {
+    let manifest = folder_dir.join("_folder.json");
+    if let Ok(bytes) = std::fs::read(&manifest) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(real_path) = v.get("path").and_then(|p| p.as_str()) {
+                match index.delete_folder(real_path) {
+                    Ok(n) => tracing::info!(folder = real_path, removed = n, "index folder sweep"),
+                    Err(e) => tracing::warn!(folder = real_path, error = %e, "index delete_folder failed"),
+                }
+                return;
+            }
+        }
+    }
+    let entries = match std::fs::read_dir(folder_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if let Some(stem) = name.strip_suffix(".meta.json") {
+            if stem == "_folder" {
+                continue;
+            }
+            if let Err(e) = index.delete_message(stem) {
+                tracing::warn!(canonical = stem, error = %e, "index delete_message failed during folder sweep");
+            }
+        }
+    }
 }
 
 /// Derive a canonical message identifier from the RFC822 Message-ID
