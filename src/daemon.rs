@@ -323,6 +323,23 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     let (mail_tx, _) = broadcast::channel::<MailNotification>(64);
 
     if cfg.permissions.check_read(Resource::Email).is_ok() {
+        // Startup self-heal for the search index.  Compares the row
+        // count to the .eml count on disk and kicks off an incremental
+        // rebuild when they diverge, so a freshly-deployed pimsteward
+        // (empty DB, populated mail tree) or a long-offline alias
+        // (many moves/deletes missed) wakes up with a current index
+        // even if nobody has run `pimsteward index rebuild` manually.
+        //
+        // Driven by three knobs, each override-able via env:
+        //   PIMSTEWARD_INDEX_DRIFT_THRESHOLD_PCT   (default 2.0)
+        //   PIMSTEWARD_INDEX_DRIFT_THRESHOLD_ROWS  (default 100)
+        //   PIMSTEWARD_INDEX_SKIP_STARTUP_REBUILD  (set non-empty to skip)
+        //   PIMSTEWARD_INDEX_FORCE_STARTUP_REBUILD (set non-empty to force)
+        // The drift check uses AND: both percentage and row thresholds
+        // must trip before a rebuild fires, so a small mailbox doesn't
+        // thrash the index every time one message moves.
+        maybe_rebuild_index_on_startup(&repo);
+
         // Mail has a dedicated puller because it dispatches on a
         // MailSource trait object, not a concrete Client.
         let mail_source: Arc<dyn MailSource> = match cfg.forwardemail.mail_source {
@@ -597,6 +614,174 @@ fn spawn_calendar_puller(
         }
         .instrument(span),
     )
+}
+
+/// Count the `.eml` files under `<repo>/mail/**`.  Used for drift detection
+/// against the index row count.  Best-effort: a read error on a single
+/// folder is logged and the walk continues, so the counter can be slightly
+/// low but never wildly wrong.
+fn count_eml_files(repo_root: &std::path::Path) -> u64 {
+    let mail_root = repo_root.join("mail");
+    if !mail_root.is_dir() {
+        return 0;
+    }
+    let mut n = 0u64;
+    let folder_entries = match std::fs::read_dir(&mail_root) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "count_eml_files: read_dir mail/");
+            return 0;
+        }
+    };
+    for entry in folder_entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if name.starts_with('_') || name.starts_with('.') {
+                continue;
+            }
+        }
+        let inner = match std::fs::read_dir(&p) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(folder = ?p, error = %e, "count_eml_files: read_dir folder");
+                continue;
+            }
+        };
+        for entry in inner.flatten() {
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|e| e == "eml")
+            {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Return true iff both drift thresholds trip simultaneously.
+fn drift_triggers_rebuild(idx: u64, disk: u64, pct_threshold: f64, rows_threshold: u64) -> bool {
+    if disk == 0 {
+        return false;
+    }
+    let diff = idx.abs_diff(disk);
+    let pct = (diff as f64) * 100.0 / (disk as f64);
+    diff > rows_threshold && pct > pct_threshold
+}
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+
+fn env_bool(name: &str) -> bool {
+    std::env::var(name).map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+fn maybe_rebuild_index_on_startup(repo: &Arc<Repo>) {
+    if env_bool("PIMSTEWARD_INDEX_SKIP_STARTUP_REBUILD") {
+        tracing::info!("PIMSTEWARD_INDEX_SKIP_STARTUP_REBUILD set; skipping index startup rebuild");
+        return;
+    }
+    let index = match crate::index::SearchIndex::open(repo.root()) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, "search index open failed during startup; continuing without rebuild check");
+            return;
+        }
+    };
+    let disk = count_eml_files(repo.root());
+    let idx = match index.message_count() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "search index count failed; skipping rebuild check");
+            return;
+        }
+    };
+    let force = env_bool("PIMSTEWARD_INDEX_FORCE_STARTUP_REBUILD");
+    let empty = idx == 0 && disk > 0;
+    let pct = env_f64("PIMSTEWARD_INDEX_DRIFT_THRESHOLD_PCT", 2.0);
+    let rows = env_u64("PIMSTEWARD_INDEX_DRIFT_THRESHOLD_ROWS", 100);
+    let drift = drift_triggers_rebuild(idx, disk, pct, rows);
+
+    if !(force || empty || drift) {
+        tracing::info!(idx, disk, "index startup check: in sync");
+        return;
+    }
+    tracing::warn!(
+        idx,
+        disk,
+        force,
+        empty,
+        drift,
+        pct_threshold = pct,
+        rows_threshold = rows,
+        "search index requires rebuild; running incremental scan"
+    );
+    let opts = if force {
+        crate::index::RebuildOpts::force()
+    } else {
+        crate::index::RebuildOpts::incremental()
+    };
+    match index.rebuild_from_disk(repo.root(), opts) {
+        Ok(stats) => tracing::info!(
+            scanned = stats.scanned,
+            upserted = stats.upserted,
+            skipped = stats.skipped,
+            orphaned_deleted = stats.orphaned_deleted,
+            errors = stats.errors,
+            elapsed_ms = stats.elapsed_ms,
+            "index startup rebuild complete"
+        ),
+        Err(e) => tracing::warn!(error = %e, "index startup rebuild failed; daemon will continue"),
+    }
+}
+
+#[cfg(test)]
+mod startup_rebuild_tests {
+    use super::*;
+
+    #[test]
+    fn drift_requires_both_thresholds() {
+        // 1 row drift on a 10-row disk is 10% — exceeds pct but below rows.
+        assert!(!drift_triggers_rebuild(9, 10, 2.0, 100));
+        // 1000-row drift on 100k disk is 1% — below pct, above rows.
+        assert!(!drift_triggers_rebuild(99_000, 100_000, 2.0, 100));
+        // 500-row drift on 10k disk is 5% — above both.
+        assert!(drift_triggers_rebuild(9_500, 10_000, 2.0, 100));
+        // Index vs disk symmetry: index larger than disk also triggers
+        // when the drift is above thresholds.
+        assert!(drift_triggers_rebuild(10_500, 10_000, 2.0, 100));
+    }
+
+    #[test]
+    fn drift_empty_disk_is_never_triggering() {
+        // A totally fresh deploy has disk=0 and idx=0; don't churn.
+        assert!(!drift_triggers_rebuild(0, 0, 2.0, 100));
+    }
+
+    #[test]
+    fn count_eml_files_walks_folders() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join("mail/INBOX")).unwrap();
+        std::fs::create_dir_all(root.join("mail/Archive_2026")).unwrap();
+        std::fs::write(root.join("mail/INBOX/a.eml"), b"").unwrap();
+        std::fs::write(root.join("mail/INBOX/a.meta.json"), b"{}").unwrap();
+        std::fs::write(root.join("mail/Archive_2026/b.eml"), b"").unwrap();
+        std::fs::write(root.join("mail/Archive_2026/c.eml"), b"").unwrap();
+        // _attachments must be ignored (content-addressed store, not mail).
+        std::fs::create_dir_all(root.join("mail/_attachments")).unwrap();
+        std::fs::write(root.join("mail/_attachments/xxx"), b"blob").unwrap();
+        assert_eq!(count_eml_files(root), 3);
+    }
 }
 
 fn spawn_mail_puller(
