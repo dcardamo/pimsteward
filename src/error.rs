@@ -43,6 +43,9 @@ pub enum Error {
     #[error("git store: {0}")]
     Store(String),
 
+    #[error("search index: {0}")]
+    Index(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 }
@@ -53,5 +56,14 @@ impl Error {
     }
     pub fn store(msg: impl Into<String>) -> Self {
         Self::Store(msg.into())
+    }
+    pub fn index(msg: impl Into<String>) -> Self {
+        Self::Index(msg.into())
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Index(e.to_string())
     }
 }
