@@ -18,8 +18,10 @@
 //!   and MCP readers. WAL mode keeps contention low.
 
 pub mod envelope;
+pub mod rebuild;
 pub mod search;
 
+pub use rebuild::{IndexStats, RebuildOpts, RebuildStats, VerifyReport};
 pub use search::{
     Address, FlagFilter, FolderFilter, MessageHit, SearchQuery, SearchResult, Sort,
 };

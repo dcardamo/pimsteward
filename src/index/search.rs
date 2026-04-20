@@ -559,7 +559,7 @@ mod tests {
         let td = tempdir().unwrap();
         // Leak the tempdir for test lifetime — we only need the DB, and
         // rusqlite keeps the file open until the SearchIndex is dropped.
-        let path = td.into_path();
+        let path = td.keep();
         let idx = SearchIndex::open(&path).unwrap();
         idx.upsert_message(&row_for(
             "a1",
