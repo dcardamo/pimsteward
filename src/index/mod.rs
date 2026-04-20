@@ -18,6 +18,11 @@
 //!   and MCP readers. WAL mode keeps contention low.
 
 pub mod envelope;
+pub mod search;
+
+pub use search::{
+    Address, FlagFilter, FolderFilter, MessageHit, SearchQuery, SearchResult, Sort,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
