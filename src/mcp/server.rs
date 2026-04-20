@@ -2413,30 +2413,39 @@ fn parse_headers(text: &str) -> (serde_json::Map<String, serde_json::Value>, Opt
     (headers, content_type)
 }
 
-/// Pull the best text preview we can out of an RFC822 body. Handles
-/// multipart/alternative by selecting the first text/plain part; if none
-/// exists, falls back to stripping tags out of the first text/html part.
-/// Single-part bodies are returned verbatim (after the header/body split).
+/// Pull the best text preview we can out of an RFC822 body. For
+/// multipart/alternative (the common HTML-first layout) we pick the
+/// first text/plain part; if absent, fall back to stripping tags from
+/// the first text/html part. Single-part bodies are decoded using the
+/// top-level Content-Transfer-Encoding.
 ///
-/// This is a deliberately minimal MIME parser — it doesn't decode
-/// quoted-printable or base64 transfer encodings, and it doesn't recurse
-/// into nested multiparts. Callers who need full fidelity pass
-/// `include_raw: true` and parse the .eml themselves.
+/// Per-part Content-Transfer-Encoding is honored: `quoted-printable`
+/// and `base64` are decoded before the body is returned, so LLM callers
+/// see real text (e.g. `€` instead of `=E2=82=AC`) and `<br>` turns
+/// into newlines. Charsets other than UTF-8 are treated as UTF-8 lossy
+/// — good enough for preview purposes. Callers who need full fidelity
+/// pass `include_raw: true` and parse the .eml themselves.
 fn extract_body_preview(text: &str, content_type: Option<&str>) -> String {
     let body_start = match text.find("\r\n\r\n").map(|i| i + 4).or_else(|| text.find("\n\n").map(|i| i + 2)) {
         Some(i) => i,
         None => return String::new(),
     };
+    let header_block = &text[..body_start];
     let body = &text[body_start..];
 
-    // Only handle multipart/* here; everything else is treated as a
-    // single-part text body.
+    // Top-level Content-Transfer-Encoding applies to single-part bodies.
+    let top_cte = find_header_value(header_block, "content-transfer-encoding");
+
     let ct = match content_type {
         Some(s) => s.to_ascii_lowercase(),
-        None => return body.to_string(),
+        None => return decode_transfer(body, top_cte.as_deref()),
     };
     if !ct.starts_with("multipart/") {
-        return body.to_string();
+        let decoded = decode_transfer(body, top_cte.as_deref());
+        if ct.starts_with("text/html") {
+            return strip_tags(&decoded);
+        }
+        return decoded;
     }
 
     // Extract boundary="..." (or boundary=... with no quotes).
@@ -2449,9 +2458,9 @@ fn extract_body_preview(text: &str, content_type: Option<&str>) -> String {
     };
     let delim = format!("--{boundary}");
 
-    // Walk the parts. For each one, read its own Content-Type and body.
-    // Prefer the first text/plain; remember the first text/html as a
-    // fallback.
+    // Walk the parts. For each one, read its own Content-Type and
+    // Content-Transfer-Encoding and decode the body. Prefer the first
+    // text/plain; remember the first text/html as a fallback.
     let mut plain: Option<String> = None;
     let mut html: Option<String> = None;
     for part in body.split(&delim).skip(1) {
@@ -2472,19 +2481,14 @@ fn extract_body_preview(text: &str, content_type: Option<&str>) -> String {
         let part_headers = &part[..part_headers_end];
         let part_body = part[part_headers_end + offset..]
             .trim_end_matches(['\r', '\n', '-']);
-        let part_ct = part_headers
-            .lines()
-            .find_map(|l| {
-                let lower = l.to_ascii_lowercase();
-                lower
-                    .strip_prefix("content-type:")
-                    .map(|v| v.trim().to_string())
-            })
-            .unwrap_or_default();
+        let part_ct = find_header_value(part_headers, "content-type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let part_cte = find_header_value(part_headers, "content-transfer-encoding");
         if part_ct.starts_with("text/plain") && plain.is_none() {
-            plain = Some(part_body.to_string());
+            plain = Some(decode_transfer(part_body, part_cte.as_deref()));
         } else if part_ct.starts_with("text/html") && html.is_none() {
-            html = Some(part_body.to_string());
+            html = Some(decode_transfer(part_body, part_cte.as_deref()));
         }
         if plain.is_some() {
             break;
@@ -2499,21 +2503,286 @@ fn extract_body_preview(text: &str, content_type: Option<&str>) -> String {
     body.to_string()
 }
 
-/// Crude HTML-tag stripper used as a last-resort fallback when a message
-/// is html-only. Good enough for preview purposes; anything more serious
-/// should use include_raw and a real HTML parser.
-fn strip_tags(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for c in html.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+/// Look up a header's value (case-insensitive) in a raw header block,
+/// unfolding RFC 5322 continuation lines.
+fn find_header_value(headers: &str, name: &str) -> Option<String> {
+    let name_lc = name.to_ascii_lowercase();
+    let mut found: Option<String> = None;
+    for line in headers.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(v) = found.as_mut() {
+                v.push(' ');
+                v.push_str(line.trim());
+            }
+            continue;
+        }
+        if found.is_some() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().to_ascii_lowercase() == name_lc {
+                found = Some(v.trim().to_string());
+            }
         }
     }
+    found
+}
+
+/// Apply Content-Transfer-Encoding to a part body: decode
+/// `quoted-printable` or `base64`, leaving `7bit`/`8bit`/`binary`/unset
+/// untouched. Output is always UTF-8 (invalid bytes replaced).
+fn decode_transfer(body: &str, cte: Option<&str>) -> String {
+    let cte_lc = cte
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match cte_lc.as_str() {
+        "quoted-printable" => decode_quoted_printable(body),
+        "base64" => {
+            use base64::Engine;
+            // base64 bodies often have internal CRLFs — strip all whitespace.
+            let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+            match base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes()) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(_) => body.to_string(),
+            }
+        }
+        _ => body.to_string(),
+    }
+}
+
+/// Decode RFC 2045 quoted-printable: `=HH` hex escapes and soft line
+/// breaks (`=\r\n` / `=\n`). Malformed escapes pass through literally
+/// rather than raising errors — preview quality over strictness.
+fn decode_quoted_printable(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'=' && i + 1 < bytes.len() {
+            let n1 = bytes[i + 1];
+            // Soft line break: =\n or =\r\n
+            if n1 == b'\n' {
+                i += 2;
+                continue;
+            }
+            if n1 == b'\r' && i + 2 < bytes.len() && bytes[i + 2] == b'\n' {
+                i += 3;
+                continue;
+            }
+            if i + 2 < bytes.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(n1), hex_val(bytes[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(10 + b - b'a'),
+        b'A'..=b'F' => Some(10 + b - b'A'),
+        _ => None,
+    }
+}
+
+/// Render HTML as plaintext. Drops `<script>`/`<style>` blocks
+/// wholesale, turns block-level closers and `<br>` into newlines,
+/// decodes common HTML entities, and collapses excess whitespace.
+/// Good enough that an LLM can extract order details, prices, and
+/// structure from a marketing email without re-parsing the HTML.
+fn strip_tags(html: &str) -> String {
+    let html = remove_block(html, "script");
+    let html = remove_block(&html, "style");
+
+    let mut out = String::with_capacity(html.len());
+    let mut chars = html.chars();
+    while let Some(c) = chars.next() {
+        if c != '<' {
+            out.push(c);
+            continue;
+        }
+        // Collect the tag contents up to '>'. Unterminated tags get
+        // dropped together with the remainder of the input — mirrors
+        // what a browser would do with broken markup.
+        let mut tag = String::new();
+        let mut closed = false;
+        for tc in chars.by_ref() {
+            if tc == '>' {
+                closed = true;
+                break;
+            }
+            tag.push(tc);
+        }
+        if !closed {
+            break;
+        }
+        // Bare tag name (without a leading '/') for block-level check.
+        let name: String = tag
+            .trim_start_matches('/')
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '/')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "br" | "p"
+                | "div"
+                | "tr"
+                | "li"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "hr"
+        ) {
+            out.push('\n');
+        }
+    }
+
+    let decoded = decode_entities(&out);
+    collapse_whitespace(&decoded)
+}
+
+/// Strip `<tag>…</tag>` blocks in their entirety (tag name is
+/// ASCII-case-insensitive). Used to drop `<script>` and `<style>`
+/// whose contents are useless noise in a text preview.
+fn remove_block(s: &str, tag: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0;
+    while let Some(rel) = lower[cursor..].find(&open) {
+        let start = cursor + rel;
+        out.push_str(&s[cursor..start]);
+        // After the opening tag name, find the end of the opening tag
+        // ('>'), then the matching close tag.
+        if let Some(end_of_open) = lower[start..].find('>').map(|n| start + n + 1) {
+            if let Some(close_rel) = lower[end_of_open..].find(&close) {
+                cursor = end_of_open + close_rel + close.len();
+                continue;
+            }
+        }
+        return out;
+    }
+    out.push_str(&s[cursor..]);
     out
+}
+
+/// Decode common HTML entities: named (`&amp;` `&nbsp;` `&mdash;` …)
+/// and numeric (`&#233;` / `&#xE9;`). Unrecognised entities pass
+/// through as literal `&name;` so nothing is silently lost.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '&' {
+            out.push(c);
+            continue;
+        }
+        let mut ent = String::new();
+        let mut found_semi = false;
+        for _ in 0..10 {
+            match chars.peek().copied() {
+                Some(';') => {
+                    chars.next();
+                    found_semi = true;
+                    break;
+                }
+                Some(nc) if nc.is_ascii_alphanumeric() || nc == '#' => {
+                    ent.push(nc);
+                    chars.next();
+                }
+                _ => break,
+            }
+        }
+        if !found_semi {
+            out.push('&');
+            out.push_str(&ent);
+            continue;
+        }
+        let named = match ent.as_str() {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            "copy" => Some('©'),
+            "reg" => Some('®'),
+            "trade" => Some('™'),
+            "hellip" => Some('…'),
+            "mdash" => Some('—'),
+            "ndash" => Some('–'),
+            "lsquo" | "rsquo" | "sbquo" => Some('\''),
+            "ldquo" | "rdquo" | "bdquo" => Some('"'),
+            _ => None,
+        };
+        if let Some(ch) = named {
+            out.push(ch);
+            continue;
+        }
+        if let Some(rest) = ent.strip_prefix('#') {
+            let n = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                rest.parse::<u32>().ok()
+            };
+            if let Some(cp) = n.and_then(char::from_u32) {
+                out.push(cp);
+                continue;
+            }
+        }
+        out.push('&');
+        out.push_str(&ent);
+        out.push(';');
+    }
+    out
+}
+
+/// Collapse runs of horizontal whitespace to a single space and runs
+/// of blank lines to at most one. Preserves single newlines so the
+/// block-level structure surfaced by `strip_tags` survives.
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut blank_streak = 0usize;
+    for line in s.lines() {
+        let mut trimmed = String::with_capacity(line.len());
+        let mut prev_space = false;
+        for c in line.chars() {
+            if c == ' ' || c == '\t' {
+                if !prev_space && !trimmed.is_empty() {
+                    trimmed.push(' ');
+                }
+                prev_space = true;
+            } else {
+                trimmed.push(c);
+                prev_space = false;
+            }
+        }
+        let trimmed = trimmed.trim_end();
+        if trimmed.is_empty() {
+            blank_streak += 1;
+            if blank_streak == 1 {
+                out.push('\n');
+            }
+        } else {
+            blank_streak = 0;
+            out.push_str(trimmed);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Minimal URL component encoder for query string values. We intentionally
@@ -2931,6 +3200,128 @@ mod tests {
         assert!(out.contains("hello"));
         assert!(out.contains("world"));
         assert!(!out.contains("<b>"));
+    }
+
+    #[test]
+    fn extract_body_preview_decodes_quoted_printable_html_part() {
+        // Real-world shape: Apple/Amazon-style emails send only a
+        // text/html part with Content-Transfer-Encoding:
+        // quoted-printable. Previously the agent saw =3D/=20/soft-break
+        // garbage and had to reimplement a QP decoder in Python.
+        let msg = concat!(
+            "Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n",
+            "--b\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\n",
+            "<p>Order total: =E2=82=AC1,=\r\n429.00</p><br><p>Thanks!</p>\r\n",
+            "--b--\r\n",
+        );
+        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"b\""));
+        assert!(
+            out.contains("Order total: €1,429.00"),
+            "QP decode + soft-break handling failed: {out:?}"
+        );
+        assert!(out.contains("Thanks!"));
+        assert!(!out.contains("=E2=82=AC"), "should have decoded =XX escapes");
+        assert!(!out.contains("<p>"), "should have stripped tags");
+    }
+
+    #[test]
+    fn extract_body_preview_decodes_base64_plain_part() {
+        use base64::Engine;
+        let payload = "hello base64 world";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let msg = format!(
+            "Content-Type: multipart/alternative; boundary=\"b\"\r\n\r\n\
+             --b\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n\
+             {encoded}\r\n\
+             --b--\r\n"
+        );
+        let out = extract_body_preview(&msg, Some("multipart/alternative; boundary=\"b\""));
+        assert_eq!(out.trim(), payload);
+    }
+
+    #[test]
+    fn extract_body_preview_html_turns_br_and_p_into_newlines() {
+        let msg = concat!(
+            "Content-Type: multipart/alternative; boundary=\"z\"\r\n\r\n",
+            "--z\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<p>Line one</p><p>Line two</p>Line<br>three\r\n",
+            "--z--\r\n",
+        );
+        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"z\""));
+        let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert!(lines.iter().any(|l| *l == "Line one"), "got: {out:?}");
+        assert!(lines.iter().any(|l| *l == "Line two"));
+        // <br> also produces a newline, so "Line" and "three" land on
+        // separate lines — just verify both survived.
+        assert!(lines.iter().any(|l| *l == "Line"), "got: {out:?}");
+        assert!(lines.iter().any(|l| *l == "three"), "got: {out:?}");
+        assert!(
+            !out.contains("Line oneLine two"),
+            "block tags should insert newlines: {out:?}"
+        );
+    }
+
+    #[test]
+    fn extract_body_preview_html_decodes_entities() {
+        let msg = concat!(
+            "Content-Type: multipart/alternative; boundary=\"e\"\r\n\r\n",
+            "--e\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<p>Caf&eacute;&nbsp;&amp;&nbsp;bar &mdash; 5&#8217;ish, price &#x20AC;3.50</p>\r\n",
+            "--e--\r\n",
+        );
+        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"e\""));
+        assert!(out.contains("&") && out.contains("bar"), "got: {out:?}");
+        assert!(out.contains("—"), "&mdash; should decode: {out:?}");
+        // &#8217; is U+2019 RIGHT SINGLE QUOTATION MARK, not ASCII '.
+        assert!(out.contains("\u{2019}ish"), "&#8217; should decode: {out:?}");
+        assert!(out.contains("€3.50"), "&#x20AC; should decode: {out:?}");
+    }
+
+    #[test]
+    fn extract_body_preview_html_drops_script_and_style_blocks() {
+        let msg = concat!(
+            "Content-Type: multipart/alternative; boundary=\"s\"\r\n\r\n",
+            "--s\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<style>.x{color:red}</style><p>Visible</p><script>var x=1;</script>Tail\r\n",
+            "--s--\r\n",
+        );
+        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"s\""));
+        assert!(out.contains("Visible"));
+        assert!(out.contains("Tail"));
+        assert!(!out.contains("color:red"), "style block should be dropped: {out:?}");
+        assert!(!out.contains("var x=1"), "script block should be dropped: {out:?}");
+    }
+
+    #[test]
+    fn extract_body_preview_single_part_html_with_qp_decodes_top_level_cte() {
+        let msg = concat!(
+            "Content-Type: text/html; charset=utf-8\r\n",
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\n",
+            "<p>Total =E2=82=AC42</p>\r\n",
+        );
+        let out = extract_body_preview(msg, Some("text/html; charset=utf-8"));
+        assert!(out.contains("Total €42"), "got: {out:?}");
+        assert!(!out.contains("<p>"));
+    }
+
+    #[test]
+    fn extract_body_preview_collapses_excess_whitespace() {
+        let msg = concat!(
+            "Content-Type: multipart/alternative; boundary=\"w\"\r\n\r\n",
+            "--w\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<p>a</p>    \n\n\n\n<p>b</p>\r\n",
+            "--w--\r\n",
+        );
+        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"w\""));
+        assert!(!out.contains("\n\n\n"), "got: {out:?}");
     }
 
     #[test]
