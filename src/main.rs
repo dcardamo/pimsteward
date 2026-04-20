@@ -147,6 +147,35 @@ enum Command {
         #[arg(long)]
         bearer_token_file: Option<PathBuf>,
     },
+
+    /// Manage the local search index (mail) backing search_email.
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IndexAction {
+    /// Rebuild the index from disk. Incremental by default (resumable;
+    /// safe to re-run as often as you like). Orphan rows are swept at
+    /// the end of each run.
+    Rebuild {
+        /// Drop all rows first and reindex from scratch. Use for schema
+        /// migrations or suspected index corruption.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print JSON stats about the index (row count, size, date range).
+    Stat,
+    /// Compare index to disk; report orphan rows and unindexed `.eml`
+    /// files.  Exits 0 when both sides match, 1 otherwise (cron-friendly).
+    Verify {
+        /// After the dry-run report, delete orphan rows and upsert
+        /// unindexed .eml files.
+        #[arg(long)]
+        clean: bool,
+    },
 }
 
 #[tokio::main]
@@ -350,6 +379,66 @@ async fn main() -> Result<()> {
                 bearer_token_file,
             });
             pimsteward::run(cfg, http).await?;
+        }
+        Command::Index { action } => {
+            // Email is the only indexed resource today, so gate on the
+            // email read permission.  Rebuild and verify both touch the
+            // on-disk mail tree; stat is derivable from the DB alone
+            // but keeping them gated consistently is simpler.
+            cfg.permissions.check_read(pimsteward::Resource::Email)?;
+            let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let index = pimsteward::index::SearchIndex::open(repo.root())?;
+            match action {
+                IndexAction::Rebuild { force } => {
+                    let opts = if force {
+                        pimsteward::index::RebuildOpts::force()
+                    } else {
+                        pimsteward::index::RebuildOpts::incremental()
+                    };
+                    let stats = index.rebuild_from_disk(repo.root(), opts)?;
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "scanned": stats.scanned,
+                        "upserted": stats.upserted,
+                        "skipped": stats.skipped,
+                        "orphaned_deleted": stats.orphaned_deleted,
+                        "errors": stats.errors,
+                        "elapsed_ms": stats.elapsed_ms,
+                        "force": force,
+                    }))?);
+                }
+                IndexAction::Stat => {
+                    let s = index.stats()?;
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "db_path": s.db_path,
+                        "db_size_bytes": s.db_size_bytes,
+                        "schema_version": s.schema_version,
+                        "messages": s.messages,
+                        "folders": s.folders,
+                        "oldest_date_unix": s.oldest_date_unix,
+                        "newest_date_unix": s.newest_date_unix,
+                        "last_indexed_at": s.last_indexed_at,
+                    }))?);
+                }
+                IndexAction::Verify { clean } => {
+                    let report = index.verify(repo.root(), clean)?;
+                    let is_clean = report.is_clean();
+                    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                        "orphan_rows": report.orphan_rows,
+                        "unindexed_emls": report.unindexed_emls
+                            .iter()
+                            .map(|(id, folder)| serde_json::json!({
+                                "canonical_id": id,
+                                "folder_safe": folder,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "cleaned": report.cleaned,
+                        "clean": is_clean,
+                    }))?);
+                    if !is_clean && !clean {
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
     }
     Ok(())
