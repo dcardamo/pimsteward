@@ -155,6 +155,10 @@ async fn spawn_mcp_http_listener(
                     user: user.clone(),
                     password: pass.clone(),
                 };
+                let search_index = Arc::new(
+                    crate::index::SearchIndex::open(repo.root())
+                        .map_err(std::io::Error::other)?,
+                );
                 Ok(PimstewardServer::new(
                     client,
                     repo,
@@ -164,6 +168,7 @@ async fn spawn_mcp_http_listener(
                     mail_source,
                     mail_writer,
                     managesieve,
+                    search_index,
                 ))
             },
             Default::default(),

@@ -3,6 +3,7 @@
 //! check on the front and a JSON-ready return value on the back.
 
 use crate::forwardemail::Client;
+use crate::index::{FlagFilter, FolderFilter, SearchQuery, SearchResult, Sort};
 use crate::source::{MailSource, MailWriter};
 use crate::permission::{Permissions, Resource, Scope};
 use crate::store::Repo;
@@ -98,6 +99,7 @@ fn message_not_indexed_error(canonical_id: &str) -> String {
 /// Accepts both the `[{...}, ...]` list shape and the
 /// `{"messages": [...]}` wrapper shape, because forwardemail has been
 /// observed returning both over the life of the API.
+#[allow(dead_code)] // Retained for existing unit tests; superseded by search_email's local-index path.
 fn enrich_search_results_with_canonical_id(v: &mut serde_json::Value) {
     fn enrich_one(msg: &mut serde_json::Value) {
         let Some(obj) = msg.as_object_mut() else { return };
@@ -152,6 +154,10 @@ struct Inner {
     /// ManageSieve connection info for sieve script activation.
     /// Forwardemail's REST API treats is_active as read-only.
     managesieve: ManageSieveConfig,
+    /// Local search index (SQLite + FTS5) backing `search_email`.  See
+    /// `crate::index` and `docs/specs/2026-04-20-local-search-index-
+    /// design.md` for layout and invariants.
+    search_index: Arc<crate::index::SearchIndex>,
 }
 
 /// ManageSieve connection parameters, passed through from Config.
@@ -182,6 +188,7 @@ impl PimstewardServer {
         mail_source: Arc<dyn MailSource>,
         mail_writer: Arc<dyn MailWriter>,
         managesieve: ManageSieveConfig,
+        search_index: Arc<crate::index::SearchIndex>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -193,6 +200,7 @@ impl PimstewardServer {
                 mail_source,
                 mail_writer,
                 managesieve,
+                search_index,
             }),
             tool_router: Self::tool_router(),
         }
@@ -307,30 +315,70 @@ impl PimstewardServer {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct SearchEmailParams {
-    /// Free-text search across all fields. Forwardemail's `?q=` parameter.
+    /// FTS5 match expression over subject, body, and sender/recipient
+    /// names.  Supports booleans (`apple NOT receipt`), phrases
+    /// (`"your order"`), and column prefixes (`subject:invoice`).
     #[serde(default)]
-    pub q: Option<String>,
-    /// Restrict to a folder path (e.g. "INBOX", "Sent Mail").
-    #[serde(default)]
-    pub folder: Option<String>,
-    /// Only messages with header_date >= this ISO-8601 timestamp.
-    #[serde(default)]
-    pub since: Option<String>,
-    /// Only messages with header_date <= this ISO-8601 timestamp.
-    #[serde(default)]
-    pub before: Option<String>,
-    /// Substring match on subject.
-    #[serde(default)]
-    pub subject: Option<String>,
-    /// Substring match on From address.
+    pub query: Option<String>,
+    /// Substring match on the From address OR display name, case-insensitive.
     #[serde(default)]
     pub from: Option<String>,
-    /// Page of results (default 1).
+    /// Substring match on any To or Cc address, case-insensitive.
     #[serde(default)]
-    pub page: Option<u32>,
-    /// Results per page, 1-50 (default 10).
+    pub to: Option<String>,
+    /// Substring match on Subject, case-insensitive.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// Folder filter.  `"INBOX"` for exact match, `"Archive/*"` for
+    /// the folder and all descendants, `"*"` (or omitted) to search
+    /// every folder.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Inclusive lower bound on message date (RFC3339, e.g.
+    /// `2026-04-20T00:00:00Z`).
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Exclusive upper bound on message date (RFC3339).
+    #[serde(default)]
+    pub before: Option<String>,
+    /// Flag filters.  Supply any combination of `any_of`, `all_of`,
+    /// `none_of`.  Flag values are IMAP-style: `\\Seen`, `\\Flagged`,
+    /// `\\Answered`, `\\Draft`, etc.
+    #[serde(default)]
+    pub flags: Option<FlagFilterParam>,
+    /// Shortcut for `flags: { none_of: ["\\Seen"] }`.
+    #[serde(default)]
+    pub unread: Option<bool>,
+    /// `true` to return only messages with attachments, `false` for
+    /// only those without.
+    #[serde(default)]
+    pub has_attachments: Option<bool>,
+    /// 0-indexed page offset.  Default 0.
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// Page size.  Default 25, max 200.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Result ordering: `"date_desc"` (default), `"date_asc"`, or
+    /// `"relevance"` (requires `query`).
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// When true, skip fetching hits and return only `total_matches`.
+    #[serde(default)]
+    pub count_only: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FlagFilterParam {
+    /// Match messages that carry at least one of these flags.
+    #[serde(default)]
+    pub any_of: Option<Vec<String>>,
+    /// Match messages that carry all of these flags.
+    #[serde(default)]
+    pub all_of: Option<Vec<String>>,
+    /// Exclude messages that carry any of these flags.
+    #[serde(default)]
+    pub none_of: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -760,51 +808,31 @@ pub struct RestorePathApplyParams {
 impl PimstewardServer {
     #[tool(
         name = "search_email",
-        description = "Search email messages via forwardemail's native search. Filter by folder, date range, subject, from, or free-text. Returns message summaries without bodies — use get_email for full content."
+        description = "Search mail in the local SQLite + FTS5 index.  Cross-folder by default (folder=\"*\").  Supports full-text query, substring from/to/subject, folder globs, date ranges, flag filters, unread shortcut, has_attachments, pagination, and sort (date_desc | date_asc | relevance).  Returns {total_matches, returned, offset, hits[]}.  Each hit is compact — use get_email with include_raw=true for the full RFC822 body."
     )]
     async fn search_email(
         &self,
         Parameters(p): Parameters<SearchEmailParams>,
     ) -> Result<String, McpError> {
-        // If folder is specified, honor per-folder scoped permission.
-        // If not, fall back to email resource-level default.
+        // If folder is specified exactly (not a glob), honor per-folder
+        // permission.  Otherwise fall back to the email resource-level
+        // default — glob queries span folders so per-folder scoping
+        // doesn't apply.
+        let perm_folder = p.folder.as_deref().filter(|f| !f.contains('*'));
         self.check_scoped(Scope::Email {
-            folder: p.folder.as_deref(),
+            folder: perm_folder,
         })?;
 
-        // Build a query string from the optional params. The pass-through is
-        // intentionally simple so the AI can learn the parameter set.
-        let mut parts = Vec::new();
-        if let Some(q) = p.q {
-            parts.push(format!("q={}", urlenc(&q)));
-        }
-        if let Some(f) = p.folder {
-            parts.push(format!("folder={}", urlenc(&f)));
-        }
-        if let Some(s) = p.since {
-            parts.push(format!("since={}", urlenc(&s)));
-        }
-        if let Some(b) = p.before {
-            parts.push(format!("before={}", urlenc(&b)));
-        }
-        if let Some(s) = p.subject {
-            parts.push(format!("subject={}", urlenc(&s)));
-        }
-        if let Some(f) = p.from {
-            parts.push(format!("from={}", urlenc(&f)));
-        }
-        parts.push(format!("page={}", p.page.unwrap_or(1)));
-        parts.push(format!("limit={}", p.limit.unwrap_or(10).clamp(1, 50)));
-        let path = format!("/v1/messages?{}", parts.join("&"));
-
-        let mut v: serde_json::Value = self
+        let query = build_search_query(&p)?;
+        let result = self
             .inner
-            .client
-            .raw_get_json(&path)
-            .await
-            .map_err(|e| self.api_error(e))?;
-        enrich_search_results_with_canonical_id(&mut v);
-        serde_json::to_string_pretty(&v).map_err(|e| McpError::internal_error(e.to_string(), None))
+            .search_index
+            .search(&query)
+            .map_err(|e| McpError::internal_error(format!("search_index: {e}"), None))?;
+
+        let body = search_result_to_json(&result);
+        serde_json::to_string_pretty(&body)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
     #[tool(
@@ -2787,6 +2815,7 @@ fn collapse_whitespace(s: &str) -> String {
 
 /// Minimal URL component encoder for query string values. We intentionally
 /// avoid pulling in a full urlencoding crate for three call sites.
+#[allow(dead_code)]
 fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -2801,6 +2830,106 @@ fn urlenc(s: &str) -> String {
         }
     }
     out
+}
+
+// ── search_email helpers ─────────────────────────────────────────────────
+
+fn build_search_query(p: &SearchEmailParams) -> Result<SearchQuery, McpError> {
+    let sort = match p.sort.as_deref() {
+        None => None,
+        Some("date_desc") => Some(Sort::DateDesc),
+        Some("date_asc") => Some(Sort::DateAsc),
+        Some("relevance") => Some(Sort::Relevance),
+        Some(other) => {
+            return Err(McpError::invalid_params(
+                format!("unknown sort value: {other:?} (expected date_desc | date_asc | relevance)"),
+                None,
+            ));
+        }
+    };
+
+    let since_unix = match p.since.as_deref() {
+        Some(s) => Some(parse_rfc3339(s, "since")?),
+        None => None,
+    };
+    let before_unix = match p.before.as_deref() {
+        Some(s) => Some(parse_rfc3339(s, "before")?),
+        None => None,
+    };
+
+    let folder = p.folder.as_deref().map(FolderFilter::parse);
+
+    let flags = p.flags.as_ref().map(|f| FlagFilter {
+        any_of: f.any_of.clone(),
+        all_of: f.all_of.clone(),
+        none_of: f.none_of.clone(),
+    });
+
+    Ok(SearchQuery {
+        query: p.query.clone(),
+        from: p.from.clone(),
+        to: p.to.clone(),
+        subject: p.subject.clone(),
+        folder,
+        since_unix,
+        before_unix,
+        flags,
+        unread: p.unread,
+        has_attachments: p.has_attachments,
+        offset: p.offset,
+        limit: p.limit,
+        sort,
+        count_only: p.count_only,
+    })
+}
+
+fn parse_rfc3339(s: &str, field: &str) -> Result<i64, McpError> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp())
+        .map_err(|e| {
+            McpError::invalid_params(
+                format!("{field} is not valid RFC3339: {e}"),
+                None,
+            )
+        })
+}
+
+fn search_result_to_json(r: &SearchResult) -> serde_json::Value {
+    let hits: Vec<serde_json::Value> = r
+        .hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "canonical_id": h.canonical_id,
+                "folder": h.folder,
+                "date": h.date_unix.and_then(|t| {
+                    chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339())
+                }),
+                "message_id": h.message_id,
+                "from": {
+                    "address": h.from.address,
+                    "name": h.from.name,
+                },
+                "to": h.to.iter().map(|a| {
+                    serde_json::json!({"address": a.address, "name": a.name})
+                }).collect::<Vec<_>>(),
+                "cc": h.cc.iter().map(|a| {
+                    serde_json::json!({"address": a.address, "name": a.name})
+                }).collect::<Vec<_>>(),
+                "subject": h.subject,
+                "flags": h.flags,
+                "size": h.size,
+                "has_attachments": h.has_attachments,
+                "preview": h.preview,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "total_matches": r.total_matches,
+        "returned": r.returned,
+        "offset": r.offset,
+        "hits": hits,
+    })
 }
 
 #[cfg(test)]
