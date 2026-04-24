@@ -2406,7 +2406,24 @@ fn parse_headers(text: &str) -> (serde_json::Map<String, serde_json::Value>, Opt
             if k == "content-type" {
                 *content_type = Some(v.clone());
             }
+            // Authentication-Results / ARC-Authentication-Results legitimately
+            // appear multiple times on a single message — one per handling
+            // hop and one per ARC seal. If we dedupe down to the last value
+            // the watcher's sender gate becomes a roll of the dice (pass/fail
+            // depending on which hop landed last), so accumulate every
+            // occurrence into a JSON array. Callers that only care about
+            // one get to pick; the gate grep matches across all of them.
             if matches!(
+                k.as_str(),
+                "authentication-results" | "arc-authentication-results"
+            ) {
+                let entry = headers
+                    .entry(k)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let serde_json::Value::Array(arr) = entry {
+                    arr.push(serde_json::Value::String(v));
+                }
+            } else if matches!(
                 k.as_str(),
                 "from"
                     | "to"
@@ -3466,5 +3483,72 @@ mod tests {
         let msg = "Content-Type: multipart/alternative; boundary=\"foo\"\r\n\r\n";
         let (_, ct) = parse_headers(msg);
         assert_eq!(ct.unwrap(), "multipart/alternative; boundary=\"foo\"");
+    }
+
+    // ── Authentication-Results surfacing ──────────────────────────────
+    //
+    // The watcher's instruction gate (hermes email watcher, data-mode
+    // rocky) needs to verify SPF/DKIM/DMARC verdicts on inbound mail
+    // before handing it to the LLM. If we drop or clobber AR headers
+    // here, an attacker-controlled body can coast past a non-existent
+    // gate and the LLM becomes the security boundary — which it isn't.
+    // These tests pin every AR value through.
+
+    #[test]
+    fn parse_headers_retains_authentication_results() {
+        let msg = concat!(
+            "From: dan@hld.ca\r\n",
+            "Authentication-Results: forwardemail.net;\r\n",
+            "  spf=pass smtp.mailfrom=hld.ca;\r\n",
+            "  dkim=pass header.i=@hld.ca;\r\n",
+            "  dmarc=pass header.from=hld.ca\r\n",
+            "\r\nbody",
+        );
+        let (hs, _) = parse_headers(msg);
+        let ar = hs
+            .get("authentication-results")
+            .expect("AR header retained");
+        let arr = ar.as_array().expect("AR stored as array");
+        assert_eq!(arr.len(), 1);
+        let v = arr[0].as_str().unwrap();
+        assert!(v.contains("spf=pass"), "got {v:?}");
+        assert!(v.contains("dkim=pass"), "got {v:?}");
+        assert!(v.contains("dmarc=pass"), "got {v:?}");
+    }
+
+    #[test]
+    fn parse_headers_accumulates_multiple_ar_hops() {
+        // Real messages often carry several Authentication-Results
+        // values — one per handling hop. Dropping the trailing ones
+        // makes gate behavior depend on hop ordering, which is outside
+        // the sender's control, so both must land in the output.
+        let msg = concat!(
+            "From: dan@hld.ca\r\n",
+            "Authentication-Results: hop1; spf=pass\r\n",
+            "Authentication-Results: hop2; dkim=pass\r\n",
+            "ARC-Authentication-Results: i=1; arc.saturn; dmarc=pass\r\n",
+            "\r\nbody",
+        );
+        let (hs, _) = parse_headers(msg);
+        let ar = hs.get("authentication-results").unwrap().as_array().unwrap();
+        assert_eq!(ar.len(), 2);
+        assert!(ar[0].as_str().unwrap().contains("hop1"));
+        assert!(ar[1].as_str().unwrap().contains("hop2"));
+
+        let arc = hs
+            .get("arc-authentication-results")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(arc.len(), 1);
+        assert!(arc[0].as_str().unwrap().contains("dmarc=pass"));
+    }
+
+    #[test]
+    fn parse_headers_absent_ar_means_no_key() {
+        let msg = "From: spoofer@elsewhere\r\nSubject: x\r\n\r\nbody";
+        let (hs, _) = parse_headers(msg);
+        assert!(hs.get("authentication-results").is_none());
+        assert!(hs.get("arc-authentication-results").is_none());
     }
 }
