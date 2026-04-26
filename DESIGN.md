@@ -382,7 +382,7 @@ since been built. Listed here so the delta is traceable.
 | Calendar event If-Match via CalDAV etags | **V2.5** — `CalendarEvent.etag` populated from CalDAV getetag; `EventMeta` persists it; `update_calendar_event` accepts `if_match` parameter; MCP `update_event` tool exposes it |
 | IMAP write path                        | **V2.5** — `MailWriter` trait with REST + IMAP impls; IMAP uses UID STORE/COPY+EXPUNGE for flags/moves/deletes; MCP server holds `Arc<dyn MailWriter>` |
 | Canonical cross-source message id      | **V2.5** — `sha256(Message-ID header)[..16]` as filename stem; source-specific id preserved in `meta.json`; safe to switch `mail_source` between REST and IMAP without wiping |
-| `get_email` MCP tool                   | **V2.5** — reads .eml + meta.json from backup tree by canonical id; returns parsed headers, metadata, body preview, and optional raw base64. No extra API call needed. `list_*` for contacts/events/sieve already return full content so `get_*` is only needed for mail. |
+| `get_email` MCP tool                   | **V2.5** — reads .eml + meta.json from backup tree by canonical id; returns parsed headers, metadata, the full extracted plain-text `body`, and optional raw base64. Refuses messages >25 MiB on disk (corruption guard). No extra API call needed. `list_*` for contacts/events/sieve already return full content so `get_*` is only needed for mail. |
 
 ## Deferred (and why)
 

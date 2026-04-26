@@ -506,8 +506,9 @@ pub struct GetEmailParams {
     /// e.g. as returned in search_email results or history).
     pub id: String,
     /// If true, include the raw RFC822 .eml bytes in the response
-    /// (base64-encoded). Default false — returns parsed headers + meta
-    /// only, which is usually enough for an AI agent.
+    /// (base64-encoded). Default false — the response always carries
+    /// parsed headers, metadata, and the full extracted plain-text
+    /// `body`, which is usually enough for an AI agent.
     #[serde(default)]
     pub include_raw: bool,
 }
@@ -808,7 +809,7 @@ pub struct RestorePathApplyParams {
 impl PimstewardServer {
     #[tool(
         name = "search_email",
-        description = "Search mail in the local SQLite + FTS5 index.  Cross-folder by default (folder=\"*\").  Supports full-text query, substring from/to/subject, folder globs, date ranges, flag filters, unread shortcut, has_attachments, pagination, and sort (date_desc | date_asc | relevance).  Returns {total_matches, returned, offset, hits[]}.  Each hit is compact — use get_email with include_raw=true for the full RFC822 body."
+        description = "Search mail in the local SQLite + FTS5 index.  Cross-folder by default (folder=\"*\").  Supports full-text query, substring from/to/subject, folder globs, date ranges, flag filters, unread shortcut, has_attachments, pagination, and sort (date_desc | date_asc | relevance).  Returns {total_matches, returned, offset, hits[]}.  Each hit carries a 200-char preview — use get_email for the full plain-text body, or get_email with include_raw=true for the raw RFC822."
     )]
     async fn search_email(
         &self,
@@ -837,7 +838,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "get_email",
-        description = "Get a single email message by canonical id. Returns parsed headers, metadata (flags, folder, modseq), and optionally the raw RFC822 bytes. The canonical id is the filename stem from the backup tree (16 hex chars)."
+        description = "Get a single email message by canonical id. Returns parsed headers, metadata (flags, folder, modseq), and the extracted plain-text body in full (no truncation). Set include_raw=true to also receive the raw RFC822 bytes (base64). Refuses messages larger than 25 MiB on disk; use the .eml file path on the daemon host for those. The canonical id is the filename stem from the backup tree (16 hex chars)."
     )]
     async fn get_email(
         &self,
@@ -868,30 +869,41 @@ impl PimstewardServer {
         });
         let obj = result.as_object_mut().expect("just created");
 
-        // Parse key headers from the .eml for the AI without needing
-        // the full raw bytes.
+        // Refuse to read absurdly large .eml files. forwardemail caps
+        // inbound mail well under 25 MiB, so this only fires on
+        // corrupted-on-disk cases — guards against an OOM if the file
+        // somehow grew, without ever firing on real mail.
+        const MAX_EML_BYTES: u64 = 25 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(&eml_path) {
+            if meta.len() > MAX_EML_BYTES {
+                obj.insert(
+                    "error".into(),
+                    serde_json::Value::String(format!(
+                        "eml file is {} bytes, exceeds 25 MiB cap; read {} directly on the daemon host",
+                        meta.len(),
+                        eml_path.display()
+                    )),
+                );
+                return serde_json::to_string_pretty(&result)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None));
+            }
+        }
+
+        // Parse key headers and extract the body from the .eml.
         if let Ok(raw) = std::fs::read(&eml_path) {
             if let Ok(text) = std::str::from_utf8(&raw) {
                 let (headers_map, content_type) = parse_headers(text);
                 obj.insert("headers".into(), serde_json::Value::Object(headers_map));
 
-                // Extract the best plain-text preview we can. For
-                // multipart/alternative (the common HTML-first layout) we
-                // pick the first text/plain part; if absent, fall back to
-                // stripping tags from the first text/html part. For
+                // Extract the best plain-text view we can from the MIME
+                // tree. For multipart/alternative (HTML-first layout) we
+                // pick the first text/plain part; if absent, fall back
+                // to stripping tags from the first text/html part. For
                 // single-part bodies we return the body verbatim. Full
-                // MIME parsing is deferred to the caller via include_raw.
-                let body_text = extract_body_preview(text, content_type.as_deref());
-                let truncated = if body_text.len() > 4096 {
-                    format!(
-                        "{}…[truncated, {} bytes total]",
-                        &body_text[..4096.min(body_text.len())],
-                        body_text.len()
-                    )
-                } else {
-                    body_text
-                };
-                obj.insert("body_preview".into(), serde_json::Value::String(truncated));
+                // MIME fidelity (nested multipart/related, attachments)
+                // is available via include_raw.
+                let body_text = extract_body_text(text, content_type.as_deref());
+                obj.insert("body".into(), serde_json::Value::String(body_text));
 
                 if p.include_raw {
                     use base64::Engine;
@@ -2458,19 +2470,21 @@ fn parse_headers(text: &str) -> (serde_json::Map<String, serde_json::Value>, Opt
     (headers, content_type)
 }
 
-/// Pull the best text preview we can out of an RFC822 body. For
+/// Pull the best plain-text view out of an RFC822 body. For
 /// multipart/alternative (the common HTML-first layout) we pick the
 /// first text/plain part; if absent, fall back to stripping tags from
 /// the first text/html part. Single-part bodies are decoded using the
-/// top-level Content-Transfer-Encoding.
+/// top-level Content-Transfer-Encoding. No truncation — caller gets
+/// the full extracted text.
 ///
 /// Per-part Content-Transfer-Encoding is honored: `quoted-printable`
 /// and `base64` are decoded before the body is returned, so LLM callers
 /// see real text (e.g. `€` instead of `=E2=82=AC`) and `<br>` turns
 /// into newlines. Charsets other than UTF-8 are treated as UTF-8 lossy
-/// — good enough for preview purposes. Callers who need full fidelity
+/// — good enough for LLM consumption. Callers who need full fidelity
+/// (nested multipart/related, attachments, exact byte preservation)
 /// pass `include_raw: true` and parse the .eml themselves.
-fn extract_body_preview(text: &str, content_type: Option<&str>) -> String {
+fn extract_body_text(text: &str, content_type: Option<&str>) -> String {
     let body_start = match text.find("\r\n\r\n").map(|i| i + 4).or_else(|| text.find("\n\n").map(|i| i + 2)) {
         Some(i) => i,
         None => return String::new(),
@@ -3310,14 +3324,14 @@ mod tests {
     // ── MIME preview ───────────────────────────────────────────────
 
     #[test]
-    fn extract_body_preview_single_part_plain_returns_body_verbatim() {
+    fn extract_body_text_single_part_plain_returns_body_verbatim() {
         let msg = "Subject: hi\r\n\r\nhello there";
-        let out = extract_body_preview(msg, Some("text/plain"));
+        let out = extract_body_text(msg, Some("text/plain"));
         assert_eq!(out, "hello there");
     }
 
     #[test]
-    fn extract_body_preview_multipart_alternative_prefers_text_plain() {
+    fn extract_body_text_multipart_alternative_prefers_text_plain() {
         let msg = concat!(
             "Content-Type: multipart/alternative; boundary=\"abc\"\r\n\r\n",
             "--abc\r\n",
@@ -3328,13 +3342,13 @@ mod tests {
             "plain version\r\n",
             "--abc--\r\n",
         );
-        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"abc\""));
+        let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"abc\""));
         assert!(out.contains("plain version"), "got: {out:?}");
         assert!(!out.contains("<p>"), "should not contain html tags");
     }
 
     #[test]
-    fn extract_body_preview_html_only_strips_tags() {
+    fn extract_body_text_html_only_strips_tags() {
         let msg = concat!(
             "Content-Type: multipart/alternative; boundary=\"xyz\"\r\n\r\n",
             "--xyz\r\n",
@@ -3342,14 +3356,14 @@ mod tests {
             "<html><body><p>hello <b>world</b></p></body></html>\r\n",
             "--xyz--\r\n",
         );
-        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"xyz\""));
+        let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"xyz\""));
         assert!(out.contains("hello"));
         assert!(out.contains("world"));
         assert!(!out.contains("<b>"));
     }
 
     #[test]
-    fn extract_body_preview_decodes_quoted_printable_html_part() {
+    fn extract_body_text_decodes_quoted_printable_html_part() {
         // Real-world shape: Apple/Amazon-style emails send only a
         // text/html part with Content-Transfer-Encoding:
         // quoted-printable. Previously the agent saw =3D/=20/soft-break
@@ -3362,7 +3376,7 @@ mod tests {
             "<p>Order total: =E2=82=AC1,=\r\n429.00</p><br><p>Thanks!</p>\r\n",
             "--b--\r\n",
         );
-        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"b\""));
+        let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"b\""));
         assert!(
             out.contains("Order total: €1,429.00"),
             "QP decode + soft-break handling failed: {out:?}"
@@ -3373,7 +3387,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_body_preview_decodes_base64_plain_part() {
+    fn extract_body_text_decodes_base64_plain_part() {
         use base64::Engine;
         let payload = "hello base64 world";
         let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
@@ -3385,12 +3399,12 @@ mod tests {
              {encoded}\r\n\
              --b--\r\n"
         );
-        let out = extract_body_preview(&msg, Some("multipart/alternative; boundary=\"b\""));
+        let out = extract_body_text(&msg, Some("multipart/alternative; boundary=\"b\""));
         assert_eq!(out.trim(), payload);
     }
 
     #[test]
-    fn extract_body_preview_html_turns_br_and_p_into_newlines() {
+    fn extract_body_text_html_turns_br_and_p_into_newlines() {
         let msg = concat!(
             "Content-Type: multipart/alternative; boundary=\"z\"\r\n\r\n",
             "--z\r\n",
@@ -3398,7 +3412,7 @@ mod tests {
             "<p>Line one</p><p>Line two</p>Line<br>three\r\n",
             "--z--\r\n",
         );
-        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"z\""));
+        let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"z\""));
         let lines: Vec<&str> = out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
         assert!(lines.iter().any(|l| *l == "Line one"), "got: {out:?}");
         assert!(lines.iter().any(|l| *l == "Line two"));
@@ -3413,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_body_preview_html_decodes_entities() {
+    fn extract_body_text_html_decodes_entities() {
         let msg = concat!(
             "Content-Type: multipart/alternative; boundary=\"e\"\r\n\r\n",
             "--e\r\n",
@@ -3421,7 +3435,7 @@ mod tests {
             "<p>Caf&eacute;&nbsp;&amp;&nbsp;bar &mdash; 5&#8217;ish, price &#x20AC;3.50</p>\r\n",
             "--e--\r\n",
         );
-        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"e\""));
+        let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"e\""));
         assert!(out.contains("&") && out.contains("bar"), "got: {out:?}");
         assert!(out.contains("—"), "&mdash; should decode: {out:?}");
         // &#8217; is U+2019 RIGHT SINGLE QUOTATION MARK, not ASCII '.
@@ -3430,7 +3444,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_body_preview_html_drops_script_and_style_blocks() {
+    fn extract_body_text_html_drops_script_and_style_blocks() {
         let msg = concat!(
             "Content-Type: multipart/alternative; boundary=\"s\"\r\n\r\n",
             "--s\r\n",
@@ -3438,7 +3452,7 @@ mod tests {
             "<style>.x{color:red}</style><p>Visible</p><script>var x=1;</script>Tail\r\n",
             "--s--\r\n",
         );
-        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"s\""));
+        let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"s\""));
         assert!(out.contains("Visible"));
         assert!(out.contains("Tail"));
         assert!(!out.contains("color:red"), "style block should be dropped: {out:?}");
@@ -3446,19 +3460,19 @@ mod tests {
     }
 
     #[test]
-    fn extract_body_preview_single_part_html_with_qp_decodes_top_level_cte() {
+    fn extract_body_text_single_part_html_with_qp_decodes_top_level_cte() {
         let msg = concat!(
             "Content-Type: text/html; charset=utf-8\r\n",
             "Content-Transfer-Encoding: quoted-printable\r\n\r\n",
             "<p>Total =E2=82=AC42</p>\r\n",
         );
-        let out = extract_body_preview(msg, Some("text/html; charset=utf-8"));
+        let out = extract_body_text(msg, Some("text/html; charset=utf-8"));
         assert!(out.contains("Total €42"), "got: {out:?}");
         assert!(!out.contains("<p>"));
     }
 
     #[test]
-    fn extract_body_preview_collapses_excess_whitespace() {
+    fn extract_body_text_collapses_excess_whitespace() {
         let msg = concat!(
             "Content-Type: multipart/alternative; boundary=\"w\"\r\n\r\n",
             "--w\r\n",
@@ -3466,7 +3480,7 @@ mod tests {
             "<p>a</p>    \n\n\n\n<p>b</p>\r\n",
             "--w--\r\n",
         );
-        let out = extract_body_preview(msg, Some("multipart/alternative; boundary=\"w\""));
+        let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"w\""));
         assert!(!out.contains("\n\n\n"), "got: {out:?}");
     }
 
