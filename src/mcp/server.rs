@@ -501,6 +501,26 @@ pub struct ActivateSieveParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetSieveParams {
+    pub id: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AddSieveRuleParams {
+    /// Sieve text for the new rule. May include its own
+    /// `require [...]` declarations — they will be merged into the
+    /// active script's existing requires. The rule body itself is
+    /// appended after the existing rules.
+    pub rule: String,
+    /// Optional human-readable comment placed above the new rule. One
+    /// `# ` prefix is added per line.
+    #[serde(default)]
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct GetEmailParams {
     /// Canonical message id (the filename stem from the backup tree,
     /// e.g. as returned in search_email results or history).
@@ -1064,6 +1084,25 @@ impl PimstewardServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
+    #[tool(
+        name = "get_sieve_script",
+        description = "Fetch a single sieve script by id, including its full content (the list endpoint omits content). Use this to read the active script before composing a new version."
+    )]
+    async fn get_sieve_script(
+        &self,
+        Parameters(p): Parameters<GetSieveParams>,
+    ) -> Result<String, McpError> {
+        self.check(Resource::Sieve)?;
+        let script = self
+            .inner
+            .client
+            .get_sieve_script(&p.id)
+            .await
+            .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&script)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
     // ── Write tools (require readwrite permission) ───────────────────
 
     #[tool(
@@ -1164,7 +1203,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "install_sieve_script",
-        description = "Install a new sieve filter script. Forwardemail parses the script server-side and rejects invalid syntax, giving dry-run validation for free."
+        description = "Create a brand-new named sieve script. Forwardemail allows exactly ONE active script at a time, so installing a new script and activating it deactivates the previous one and silently disables every rule it contained. Do NOT use this tool to add a rule — use `add_sieve_rule` instead, which appends to the currently active script. Reach for `install_sieve_script` only when you genuinely need a separate, named script (e.g. to stage an alternate ruleset for later activation). Forwardemail parses the script server-side and rejects invalid syntax."
     )]
     async fn install_sieve_script(
         &self,
@@ -1187,8 +1226,33 @@ impl PimstewardServer {
     }
 
     #[tool(
+        name = "add_sieve_rule",
+        description = "Append a rule to the currently active sieve script. This is the right tool for the common request 'add a filter rule' — it fetches the active script, merges any `require [...]` capabilities the new rule needs, appends the rule body, and updates the script in place. Errors with HTTP 409 if no script is currently active (call `install_sieve_script` + `activate_sieve_script` first to bootstrap). The `rule` field may include its own require declarations; they are merged automatically. Optional `comment` is rendered as `# <line>` per line above the new rule."
+    )]
+    async fn add_sieve_rule(
+        &self,
+        Parameters(p): Parameters<AddSieveRuleParams>,
+    ) -> Result<String, McpError> {
+        self.check_write(Resource::Sieve)?;
+        let attr = self.attribution(None, p.reason);
+        let updated = crate::write::sieve::add_sieve_rule(
+            &self.inner.client,
+            &self.inner.repo,
+            &self.inner.alias,
+            &attr,
+            &self.inner.managesieve,
+            &p.rule,
+            p.comment.as_deref(),
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        serde_json::to_string_pretty(&updated)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
         name = "update_sieve_script",
-        description = "Update an existing sieve script's content. Note: is_active cannot be changed via the forwardemail REST API — scripts must be activated through the forwardemail dashboard or ManageSieve protocol."
+        description = "Replace an existing sieve script's full content (low-level; for adding a single rule, prefer `add_sieve_rule`). Note: is_active cannot be changed via the forwardemail REST API — scripts must be activated through `activate_sieve_script` (ManageSieve)."
     )]
     async fn update_sieve_script(
         &self,

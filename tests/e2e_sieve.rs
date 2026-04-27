@@ -168,15 +168,9 @@ async fn sieve_restore_recreate_after_delete() {
     let good_sha = current_head(&ctx.repo);
 
     // Delete
-    write::sieve::delete_sieve_script(
-        &ctx.client,
-        &ctx.repo,
-        &ctx.alias_slug(),
-        &attr,
-        &script_id,
-    )
-    .await
-    .expect("delete");
+    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script_id)
+        .await
+        .expect("delete");
 
     // Plan restore — should be Recreate
     let (plan, token) =
@@ -227,15 +221,141 @@ async fn sieve_restore_recreate_after_delete() {
 
     // Cleanup
     let new_id = &found.unwrap().id;
-    write::sieve::delete_sieve_script(
+    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, new_id)
+        .await
+        .expect("cleanup");
+}
+
+/// add_sieve_rule: install → activate → append rule → verify merged
+/// content has both rules and unioned require capabilities → cleanup.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn sieve_add_rule_appends_to_active_script() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e add_sieve_rule");
+    let name = format!("e2e_addrule_{}", std::process::id());
+
+    let initial = r#"require ["fileinto"];
+
+if header :contains "subject" "first" { fileinto "Folder1"; stop; }
+"#;
+    let script = write::sieve::install_sieve_script(
         &ctx.client,
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        new_id,
+        &name,
+        initial,
     )
     .await
-    .expect("cleanup");
+    .expect("install");
+    let script_id = script.id.clone();
+
+    // Activate so add_sieve_rule has something to find.
+    let ms = ctx.managesieve();
+    pimsteward::forwardemail::managesieve::activate_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+        &name,
+    )
+    .await
+    .expect("activate");
+
+    // Append a second rule that needs an extra capability.
+    let new_rule = r#"require ["discard"];
+
+if header :contains "subject" "second" { discard; stop; }
+"#;
+    let updated = write::sieve::add_sieve_rule(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &ms,
+        new_rule,
+        Some("appended in test"),
+    )
+    .await
+    .expect("add_sieve_rule");
+    assert!(updated.is_valid, "merged content should be server-valid");
+
+    // Verify live content
+    let live = ctx
+        .client
+        .get_sieve_script(&script_id)
+        .await
+        .expect("fetch live");
+    let body = live.content.as_deref().expect("content present");
+    assert!(
+        body.starts_with("require [\"fileinto\", \"discard\"];"),
+        "merged require line should union both caps: {body}"
+    );
+    assert!(body.contains("\"first\""), "first rule preserved: {body}");
+    assert!(body.contains("\"second\""), "second rule appended: {body}");
+    assert!(
+        body.contains("# appended in test"),
+        "comment header rendered: {body}"
+    );
+    // Only one require statement total.
+    assert_eq!(
+        body.matches("require [").count(),
+        1,
+        "single require: {body}"
+    );
+
+    // Deactivate + cleanup
+    pimsteward::forwardemail::managesieve::activate_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+        "",
+    )
+    .await
+    .expect("deactivate");
+    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script_id)
+        .await
+        .expect("cleanup");
+}
+
+/// add_sieve_rule with no active script returns a clear 409 error
+/// instead of silently creating a new script.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn sieve_add_rule_errors_when_no_active_script() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e add_sieve_rule no-active");
+    let ms = ctx.managesieve();
+
+    // Make sure nothing is active.
+    pimsteward::forwardemail::managesieve::activate_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+        "",
+    )
+    .await
+    .expect("deactivate-all");
+
+    let err = write::sieve::add_sieve_rule(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &ms,
+        r#"if true { keep; }"#,
+        None,
+    )
+    .await
+    .expect_err("should fail with no active script");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("no active sieve script"),
+        "expected helpful error, got: {msg}"
+    );
 }
 
 fn current_head(repo: &pimsteward::store::Repo) -> String {

@@ -48,6 +48,7 @@ async-trait = "0.1.89"
 quick-xml = { version = "0.39.2", features = ["serialize"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mailparse = "0.15"
+regex = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

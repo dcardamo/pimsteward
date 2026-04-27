@@ -84,6 +84,26 @@ impl E2eContext {
     pub fn attribution(&self, reason: &str) -> pimsteward::write::audit::Attribution {
         pimsteward::write::audit::Attribution::new("e2e-test", Some(reason.to_string()))
     }
+
+    /// ManageSieve config for the test alias. Reads the same credentials
+    /// as the REST client and uses forwardemail's standard ManageSieve
+    /// host/port (imap.forwardemail.net:4190).
+    pub fn managesieve(&self) -> pimsteward::mcp::ManageSieveConfig {
+        let pass_file = env_path(
+            "PIMSTEWARD_TEST_ALIAS_PASSWORD_FILE",
+            "/home/dan/.config/secrets/pimsteward-test-alias-password",
+        );
+        let password = std::fs::read_to_string(&pass_file)
+            .unwrap_or_else(|e| panic!("reading {pass_file:?}: {e}"))
+            .trim()
+            .to_string();
+        pimsteward::mcp::ManageSieveConfig {
+            host: "imap.forwardemail.net".to_string(),
+            port: 4190,
+            user: self.alias.clone(),
+            password,
+        }
+    }
 }
 
 fn env_path(key: &str, default: &str) -> PathBuf {
