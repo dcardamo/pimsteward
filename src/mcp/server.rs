@@ -2246,7 +2246,9 @@ const TOOL_REQS: &[(&str, ToolReq)] = &[
     ("delete_contact", ToolReq::Write(Resource::Contacts)),
     // Sieve
     ("list_sieve", ToolReq::Read(Resource::Sieve)),
+    ("get_sieve_script", ToolReq::Read(Resource::Sieve)),
     ("install_sieve_script", ToolReq::Write(Resource::Sieve)),
+    ("add_sieve_rule", ToolReq::Write(Resource::Sieve)),
     ("update_sieve_script", ToolReq::Write(Resource::Sieve)),
     ("delete_sieve_script", ToolReq::Write(Resource::Sieve)),
     ("activate_sieve_script", ToolReq::Write(Resource::Sieve)),
@@ -3069,7 +3071,7 @@ mod tests {
             "list_calendars", "list_events",
             "create_event", "update_event", "delete_event",
             "list_contacts", "create_contact", "update_contact", "delete_contact",
-            "list_sieve", "install_sieve_script", "update_sieve_script", "delete_sieve_script", "activate_sieve_script",
+            "list_sieve", "get_sieve_script", "install_sieve_script", "add_sieve_rule", "update_sieve_script", "delete_sieve_script", "activate_sieve_script",
             "restore_contact_dry_run", "restore_contact_apply",
             "restore_sieve_dry_run", "restore_sieve_apply",
             "restore_calendar_event_dry_run", "restore_calendar_event_apply",
