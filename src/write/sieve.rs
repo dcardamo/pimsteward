@@ -81,11 +81,22 @@ pub async fn delete_sieve_script(
     Ok(())
 }
 
-/// Append a rule to the currently active sieve script. High-level
-/// alternative to `install_sieve_script` for the common case of "add one
-/// more rule to my filters". Atomic: fetches the active script, merges
-/// `require [...]` capabilities, appends the rule body, and updates in
-/// place. Errors if no script is currently active.
+/// Name pimsteward uses for the canonical sieve script when bootstrapping
+/// from nothing. The rule-centric tool surface treats this script as the
+/// only one — every rule lives here.
+pub const CANONICAL_SCRIPT_NAME: &str = "main";
+
+/// Append a rule to the canonical sieve script.
+///
+/// If no script is currently active, bootstraps `main` with this rule as
+/// its only content and activates it. If a script is active but not named
+/// `main`, the active script is used as-is (callers should consolidate
+/// manually before relying on the rule-centric tools — see
+/// `CANONICAL_SCRIPT_NAME`).
+///
+/// Atomic from the caller's perspective: fetches the active script,
+/// merges `require [...]` capabilities, appends the rule body, and
+/// updates in place.
 pub async fn add_sieve_rule(
     client: &Client,
     repo: &Repo,
@@ -95,31 +106,36 @@ pub async fn add_sieve_rule(
     rule_text: &str,
     comment: Option<&str>,
 ) -> Result<SieveScript, Error> {
-    let active_name = managesieve::get_active_script(&ms.host, ms.port, &ms.user, &ms.password)
-        .await?
-        .ok_or_else(|| Error::Api {
-            status: 409,
-            message: "no active sieve script — call install_sieve_script + activate_sieve_script first to create one".to_string(),
-        })?;
+    let active = resolve_or_bootstrap_active(client, ms, rule_text).await?;
 
-    // Find the active script's id via REST list.
-    let scripts = client.list_sieve_scripts().await?;
-    let active = scripts
-        .into_iter()
-        .find(|s| s.name == active_name)
-        .ok_or_else(|| Error::Api {
-            status: 500,
-            message: format!(
-                "ManageSieve reports active script '{active_name}' but it is not in the REST list"
-            ),
-        })?;
+    // If we just bootstrapped, the script's content already contains the
+    // rule — nothing to append. Audit + commit and return.
+    if active.bootstrapped {
+        let audit = WriteAudit {
+            attribution,
+            tool: "add_sieve_rule",
+            resource: "sieve",
+            resource_id: active.script.id.clone(),
+            args: serde_json::json!({
+                "rule_bytes": rule_text.len(),
+                "merged_bytes": rule_text.len(),
+                "comment": comment,
+                "active_script": active.script.name,
+                "bootstrapped": true,
+            }),
+            summary: format!("sieve: bootstrap {} with first rule", active.script.name),
+        };
+        refresh(client, repo, alias, attribution, &audit).await?;
+        return Ok(active.script);
+    }
 
-    // Fetch full content (list response omits `content`).
-    let full = client.get_sieve_script(&active.id).await?;
+    // Existing active script — fetch content, append, update.
+    let full = client.get_sieve_script(&active.script.id).await?;
     let existing = full.content.unwrap_or_default();
-
     let merged = merge_sieve_with_rule(&existing, rule_text, comment);
-    let updated = client.update_sieve_script(&active.id, &merged).await?;
+    let updated = client
+        .update_sieve_script(&active.script.id, &merged)
+        .await?;
     if !updated.is_valid {
         return Err(Error::Api {
             status: 422,
@@ -133,17 +149,246 @@ pub async fn add_sieve_rule(
         attribution,
         tool: "add_sieve_rule",
         resource: "sieve",
-        resource_id: active.id.clone(),
+        resource_id: active.script.id.clone(),
         args: serde_json::json!({
             "rule_bytes": rule_text.len(),
             "merged_bytes": merged.len(),
             "comment": comment,
-            "active_script": active_name,
+            "active_script": active.script.name,
         }),
-        summary: format!("sieve: add rule to {active_name}"),
+        summary: format!("sieve: add rule to {}", active.script.name),
     };
     refresh(client, repo, alias, attribution, &audit).await?;
     Ok(updated)
+}
+
+/// Remove a rule from the active sieve script by its name (the first
+/// comment line above the rule body, e.g. "RASCals mailing list ..." for
+/// a rule prefixed with `# RASCals mailing list ...`). Errors with HTTP
+/// 404 if no rule with that name is found.
+pub async fn remove_sieve_rule(
+    client: &Client,
+    repo: &Repo,
+    alias: &str,
+    attribution: &Attribution,
+    ms: &crate::mcp::ManageSieveConfig,
+    rule_name: &str,
+) -> Result<SieveScript, Error> {
+    let active_name = managesieve::get_active_script(&ms.host, ms.port, &ms.user, &ms.password)
+        .await?
+        .ok_or_else(|| Error::Api {
+            status: 404,
+            message: "no active sieve script — nothing to remove".to_string(),
+        })?;
+
+    let scripts = client.list_sieve_scripts().await?;
+    let active = scripts
+        .into_iter()
+        .find(|s| s.name == active_name)
+        .ok_or_else(|| Error::Api {
+            status: 500,
+            message: format!(
+                "ManageSieve reports active script '{active_name}' but it is not in the REST list"
+            ),
+        })?;
+    let full = client.get_sieve_script(&active.id).await?;
+    let existing = full.content.unwrap_or_default();
+
+    let new_content = remove_rule_from_content(&existing, rule_name).ok_or_else(|| Error::Api {
+        status: 404,
+        message: format!("no rule named '{rule_name}' in active sieve script '{active_name}'"),
+    })?;
+
+    let updated = client.update_sieve_script(&active.id, &new_content).await?;
+    if !updated.is_valid {
+        return Err(Error::Api {
+            status: 422,
+            message: format!(
+                "sieve script after rule removal accepted by forwardemail but flagged as invalid: {:?}",
+                updated.validation_errors
+            ),
+        });
+    }
+    let audit = WriteAudit {
+        attribution,
+        tool: "remove_sieve_rule",
+        resource: "sieve",
+        resource_id: active.id.clone(),
+        args: serde_json::json!({
+            "rule_name": rule_name,
+            "active_script": active_name,
+            "merged_bytes": new_content.len(),
+        }),
+        summary: format!("sieve: remove rule '{rule_name}' from {active_name}"),
+    };
+    refresh(client, repo, alias, attribution, &audit).await?;
+    Ok(updated)
+}
+
+struct ResolvedActive {
+    script: SieveScript,
+    /// True if we just created + activated this script in this call.
+    bootstrapped: bool,
+}
+
+/// Find the alias's active sieve script, or create the canonical `main`
+/// script + activate it if no script is currently active.
+///
+/// On the bootstrap path we install `main` with `bootstrap_content` as
+/// its body — the caller's rule text — and activate it via ManageSieve.
+async fn resolve_or_bootstrap_active(
+    client: &Client,
+    ms: &crate::mcp::ManageSieveConfig,
+    bootstrap_content: &str,
+) -> Result<ResolvedActive, Error> {
+    if let Some(active_name) =
+        managesieve::get_active_script(&ms.host, ms.port, &ms.user, &ms.password).await?
+    {
+        let scripts = client.list_sieve_scripts().await?;
+        let active = scripts
+            .into_iter()
+            .find(|s| s.name == active_name)
+            .ok_or_else(|| Error::Api {
+                status: 500,
+                message: format!(
+                "ManageSieve reports active script '{active_name}' but it is not in the REST list"
+            ),
+            })?;
+        return Ok(ResolvedActive {
+            script: active,
+            bootstrapped: false,
+        });
+    }
+
+    // No active script. Create or replace `main` and activate it.
+    let normalized = if bootstrap_content.trim().is_empty() {
+        String::new()
+    } else {
+        // Re-emit through the merge function so the bootstrap content
+        // gets the same require-line normalization as appended rules.
+        merge_sieve_with_rule("", bootstrap_content, None)
+    };
+
+    // If a `main` script already exists (perhaps deactivated), update
+    // it; otherwise create. This avoids the "Sieve script with that name
+    // already exists" 422 from forwardemail.
+    let scripts = client.list_sieve_scripts().await?;
+    let script = if let Some(existing) = scripts
+        .into_iter()
+        .find(|s| s.name == CANONICAL_SCRIPT_NAME)
+    {
+        client
+            .update_sieve_script(&existing.id, &normalized)
+            .await?
+    } else {
+        client
+            .create_sieve_script(CANONICAL_SCRIPT_NAME, &normalized)
+            .await?
+    };
+    if !script.is_valid {
+        return Err(Error::Api {
+            status: 422,
+            message: format!(
+                "bootstrap sieve script accepted by forwardemail but flagged as invalid: {:?}",
+                script.validation_errors
+            ),
+        });
+    }
+    managesieve::activate_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+        CANONICAL_SCRIPT_NAME,
+    )
+    .await?;
+    Ok(ResolvedActive {
+        script,
+        bootstrapped: true,
+    })
+}
+
+/// Parsed view of one rule inside a sieve script.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SieveRule {
+    /// 1-based position within the script (excluding the require block).
+    pub index: usize,
+    /// First comment line above the rule, with the leading `# ` stripped.
+    /// Empty if the rule has no comment header.
+    pub name: String,
+    /// All lines of the rule (comment header + body), exactly as they
+    /// appear in the script.
+    pub text: String,
+}
+
+/// Parse the rules out of a sieve script body. The require declaration
+/// (if any) is dropped; everything else is split on blank-line
+/// boundaries into rule blocks. Blocks that contain no executable
+/// statement (e.g. orphan comments) are skipped.
+pub fn parse_sieve_rules(content: &str) -> Vec<SieveRule> {
+    let (_, body) = extract_requires(content);
+    let mut rules = Vec::new();
+    for block in body.split("\n\n") {
+        let trimmed = block.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let has_action = trimmed.lines().any(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        });
+        if !has_action {
+            continue;
+        }
+        let name = trimmed
+            .lines()
+            .find_map(|l| {
+                let t = l.trim_start();
+                t.strip_prefix('#').map(|rest| rest.trim().to_string())
+            })
+            .unwrap_or_default();
+        rules.push(SieveRule {
+            index: rules.len() + 1,
+            name,
+            text: trimmed.to_string(),
+        });
+    }
+    rules
+}
+
+/// Remove the rule named `rule_name` from `content` and return the new
+/// content. Returns `None` if no rule with that name exists.
+///
+/// Preserves the require declaration and the surviving rules' order.
+fn remove_rule_from_content(content: &str, rule_name: &str) -> Option<String> {
+    let rules = parse_sieve_rules(content);
+    let target_idx = rules.iter().position(|r| r.name == rule_name)?;
+    let (caps, _) = extract_requires(content);
+
+    let mut out = String::new();
+    if !caps.is_empty() {
+        let joined = caps
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("require [{joined}];\n\n"));
+    }
+    for (i, rule) in rules.iter().enumerate() {
+        if i == target_idx {
+            continue;
+        }
+        out.push_str(&rule.text);
+        out.push_str("\n\n");
+    }
+    // Strip the trailing extra blank.
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// Merge a new sieve rule into an existing sieve script body.
@@ -316,5 +561,79 @@ if header :contains "subject" "spam" { discard; }
         assert!(merged.starts_with("require [\"discard\"];"));
         assert!(merged.contains("keep"));
         assert!(merged.contains("discard"));
+    }
+
+    #[test]
+    fn parse_rules_splits_blocks_and_extracts_names() {
+        let script = r#"require ["fileinto", "discard"];
+
+# rule alpha
+if header :contains "subject" "alpha" { fileinto "Trash"; stop; }
+
+# rule beta
+# (continuation of beta's comment)
+if header :contains "subject" "beta" { discard; stop; }
+"#;
+        let rules = parse_sieve_rules(script);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].name, "rule alpha");
+        assert_eq!(rules[0].index, 1);
+        assert!(rules[0].text.contains("\"alpha\""));
+        assert_eq!(rules[1].name, "rule beta");
+        assert_eq!(rules[1].index, 2);
+        assert!(rules[1].text.contains("\"beta\""));
+    }
+
+    #[test]
+    fn parse_rules_skips_orphan_comments() {
+        let script = r#"require ["fileinto"];
+
+# this is a header comment with no rule
+
+# rule one
+if true { fileinto "X"; }
+"#;
+        let rules = parse_sieve_rules(script);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "rule one");
+    }
+
+    #[test]
+    fn parse_rules_handles_unnamed_rules() {
+        let script = "require [\"fileinto\"];\n\nif true { fileinto \"X\"; }\n";
+        let rules = parse_sieve_rules(script);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "");
+    }
+
+    #[test]
+    fn remove_rule_drops_named_block_and_preserves_others() {
+        let script = r#"require ["fileinto", "discard"];
+
+# rule alpha
+if header :contains "subject" "alpha" { fileinto "Trash"; stop; }
+
+# rule beta
+if header :contains "subject" "beta" { discard; stop; }
+"#;
+        let after = remove_rule_from_content(script, "rule alpha").expect("alpha removed");
+        assert!(
+            !after.contains("\"alpha\""),
+            "alpha rule should be gone: {after}"
+        );
+        assert!(
+            after.contains("\"beta\""),
+            "beta rule should remain: {after}"
+        );
+        assert!(
+            after.starts_with("require [\"fileinto\", \"discard\"];"),
+            "require declaration preserved: {after}"
+        );
+    }
+
+    #[test]
+    fn remove_rule_returns_none_when_name_missing() {
+        let script = "require [\"fileinto\"];\n\n# only rule\nif true { fileinto \"X\"; }\n";
+        assert!(remove_rule_from_content(script, "nonexistent").is_none());
     }
 }

@@ -320,16 +320,18 @@ if header :contains "subject" "second" { discard; stop; }
         .expect("cleanup");
 }
 
-/// add_sieve_rule with no active script returns a clear 409 error
-/// instead of silently creating a new script.
+/// add_sieve_rule auto-bootstraps a `main` script when nothing is
+/// active, instead of failing. The new script is created, populated,
+/// and activated atomically.
 #[tokio::test]
 #[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
-async fn sieve_add_rule_errors_when_no_active_script() {
+async fn sieve_add_rule_auto_bootstraps_when_no_active_script() {
     let ctx = E2eContext::from_env();
-    let attr = ctx.attribution("e2e add_sieve_rule no-active");
+    let attr = ctx.attribution("e2e add_sieve_rule bootstrap");
     let ms = ctx.managesieve();
 
-    // Make sure nothing is active.
+    // Make sure nothing is active and there is no leftover `main` from
+    // a previous run.
     pimsteward::forwardemail::managesieve::activate_script(
         &ms.host,
         ms.port,
@@ -339,23 +341,150 @@ async fn sieve_add_rule_errors_when_no_active_script() {
     )
     .await
     .expect("deactivate-all");
+    if let Some(stale) = ctx
+        .client
+        .list_sieve_scripts()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|s| s.name == pimsteward::write::sieve::CANONICAL_SCRIPT_NAME)
+    {
+        ctx.client
+            .delete_sieve_script(&stale.id)
+            .await
+            .expect("cleanup stale main");
+    }
 
-    let err = write::sieve::add_sieve_rule(
+    let bootstrapped = write::sieve::add_sieve_rule(
         &ctx.client,
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
         &ms,
-        r#"if true { keep; }"#,
-        None,
+        r#"require ["fileinto"]; if true { fileinto "X"; }"#,
+        Some("first ever rule"),
     )
     .await
-    .expect_err("should fail with no active script");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("no active sieve script"),
-        "expected helpful error, got: {msg}"
+    .expect("bootstrap should succeed");
+    assert_eq!(
+        bootstrapped.name,
+        pimsteward::write::sieve::CANONICAL_SCRIPT_NAME
     );
+
+    // Active script via ManageSieve should now be `main`.
+    let active = pimsteward::forwardemail::managesieve::get_active_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+    )
+    .await
+    .expect("listscripts");
+    assert_eq!(
+        active.as_deref(),
+        Some(pimsteward::write::sieve::CANONICAL_SCRIPT_NAME)
+    );
+
+    // Cleanup
+    pimsteward::forwardemail::managesieve::activate_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+        "",
+    )
+    .await
+    .expect("deactivate");
+    ctx.client
+        .delete_sieve_script(&bootstrapped.id)
+        .await
+        .expect("cleanup");
+}
+
+/// remove_sieve_rule deletes a named rule from the active script and
+/// preserves the others.
+#[tokio::test]
+#[ignore = "e2e: requires PIMSTEWARD_RUN_E2E=1"]
+async fn sieve_remove_rule_drops_named_rule() {
+    let ctx = E2eContext::from_env();
+    let attr = ctx.attribution("e2e remove_sieve_rule");
+    let ms = ctx.managesieve();
+    let name = format!("e2e_remove_{}", std::process::id());
+
+    let initial = r#"require ["fileinto"];
+
+# alpha rule
+if header :contains "subject" "alpha" { fileinto "A"; stop; }
+
+# beta rule
+if header :contains "subject" "beta" { fileinto "B"; stop; }
+"#;
+    let script = write::sieve::install_sieve_script(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &name,
+        initial,
+    )
+    .await
+    .expect("install");
+    pimsteward::forwardemail::managesieve::activate_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+        &name,
+    )
+    .await
+    .expect("activate");
+
+    write::sieve::remove_sieve_rule(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &ms,
+        "alpha rule",
+    )
+    .await
+    .expect("remove alpha");
+
+    let live = ctx
+        .client
+        .get_sieve_script(&script.id)
+        .await
+        .expect("fetch");
+    let body = live.content.as_deref().expect("content");
+    assert!(!body.contains("\"alpha\""), "alpha gone: {body}");
+    assert!(body.contains("\"beta\""), "beta preserved: {body}");
+
+    // Removing a missing rule returns 404.
+    let err = write::sieve::remove_sieve_rule(
+        &ctx.client,
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &ms,
+        "ghost rule",
+    )
+    .await
+    .expect_err("ghost rule should not match");
+    assert!(format!("{err}").contains("no rule named"));
+
+    // Cleanup
+    pimsteward::forwardemail::managesieve::activate_script(
+        &ms.host,
+        ms.port,
+        &ms.user,
+        &ms.password,
+        "",
+    )
+    .await
+    .expect("deactivate");
+    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script.id)
+        .await
+        .expect("cleanup");
 }
 
 fn current_head(repo: &pimsteward::store::Repo) -> String {

@@ -466,46 +466,6 @@ pub struct DeleteContactParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct InstallSieveParams {
-    pub name: String,
-    /// Sieve script source. Must be valid RFC 5228 sieve; forwardemail
-    /// will parse and reject invalid scripts server-side.
-    pub content: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct UpdateSieveParams {
-    pub id: String,
-    pub content: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct DeleteSieveParams {
-    pub id: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct ActivateSieveParams {
-    /// Name of the script to activate. ManageSieve allows exactly one
-    /// active script at a time — activating a script deactivates any
-    /// previously active one. Pass an empty string to deactivate all.
-    pub name: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-pub struct GetSieveParams {
-    pub id: String,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct AddSieveRuleParams {
     /// Sieve text for the new rule. May include its own
     /// `require [...]` declarations — they will be merged into the
@@ -513,9 +473,20 @@ pub struct AddSieveRuleParams {
     /// appended after the existing rules.
     pub rule: String,
     /// Optional human-readable comment placed above the new rule. One
-    /// `# ` prefix is added per line.
+    /// `# ` prefix is added per line. The first line becomes the rule's
+    /// name, used by `remove_sieve_rule` for matching.
     #[serde(default)]
     pub comment: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RemoveSieveRuleParams {
+    /// Name of the rule to remove. Must match the first comment line
+    /// above a rule (the line just below the `# `). Use
+    /// `list_sieve_rules` to see available names.
+    pub name: String,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -1048,58 +1019,40 @@ impl PimstewardServer {
     }
 
     #[tool(
-        name = "list_sieve",
-        description = "List server-side sieve filter scripts for the alias with their activation state and validation status. Note: forwardemail allows exactly ONE active script at a time. The is_active field is sourced from ManageSieve (the REST API reports it incorrectly)."
+        name = "list_sieve_rules",
+        description = "List the filter rules in the active sieve script as a structured array. Each entry has `index` (1-based position), `name` (the first comment line above the rule, e.g. \"RASCals mailing list\" for a `# RASCals mailing list` header), and `text` (the full rule including comment header and body). Returns an empty array if no script is active."
     )]
-    async fn list_sieve(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
+    async fn list_sieve_rules(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
         self.check(Resource::Sieve)?;
-        let mut scripts = self
+        let ms = &self.inner.managesieve;
+        let active_name = crate::forwardemail::managesieve::get_active_script(
+            &ms.host, ms.port, &ms.user, &ms.password,
+        )
+        .await
+        .map_err(|e| self.api_error(e))?;
+        let Some(active_name) = active_name else {
+            return Ok("[]".to_string());
+        };
+
+        let scripts = self
             .inner
             .client
             .list_sieve_scripts()
             .await
             .map_err(|e| self.api_error(e))?;
+        let Some(active) = scripts.into_iter().find(|s| s.name == active_name) else {
+            return Ok("[]".to_string());
+        };
 
-        // Forwardemail's REST API reports is_active incorrectly (always
-        // false). Get the real active state from ManageSieve LISTSCRIPTS.
-        let ms = &self.inner.managesieve;
-        match crate::forwardemail::managesieve::get_active_script(
-            &ms.host, ms.port, &ms.user, &ms.password,
-        )
-        .await
-        {
-            Ok(active_name) => {
-                for s in &mut scripts {
-                    s.is_active = active_name.as_deref() == Some(&s.name);
-                }
-            }
-            Err(e) => {
-                // Non-fatal: return REST data with a warning rather than
-                // failing the entire list.
-                tracing::warn!(error = %e, "ManageSieve LISTSCRIPTS failed, is_active may be inaccurate");
-            }
-        }
-
-        serde_json::to_string_pretty(&scripts)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
-    }
-
-    #[tool(
-        name = "get_sieve_script",
-        description = "Fetch a single sieve script by id, including its full content (the list endpoint omits content). Use this to read the active script before composing a new version."
-    )]
-    async fn get_sieve_script(
-        &self,
-        Parameters(p): Parameters<GetSieveParams>,
-    ) -> Result<String, McpError> {
-        self.check(Resource::Sieve)?;
-        let script = self
+        let full = self
             .inner
             .client
-            .get_sieve_script(&p.id)
+            .get_sieve_script(&active.id)
             .await
             .map_err(|e| self.api_error(e))?;
-        serde_json::to_string_pretty(&script)
+        let content = full.content.unwrap_or_default();
+        let rules = crate::write::sieve::parse_sieve_rules(&content);
+        serde_json::to_string_pretty(&rules)
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
@@ -1202,32 +1155,8 @@ impl PimstewardServer {
     }
 
     #[tool(
-        name = "install_sieve_script",
-        description = "Create a brand-new named sieve script. Forwardemail allows exactly ONE active script at a time, so installing a new script and activating it deactivates the previous one and silently disables every rule it contained. Do NOT use this tool to add a rule — use `add_sieve_rule` instead, which appends to the currently active script. Reach for `install_sieve_script` only when you genuinely need a separate, named script (e.g. to stage an alternate ruleset for later activation). Forwardemail parses the script server-side and rejects invalid syntax."
-    )]
-    async fn install_sieve_script(
-        &self,
-        Parameters(p): Parameters<InstallSieveParams>,
-    ) -> Result<String, McpError> {
-        self.check_write(Resource::Sieve)?;
-        let attr = self.attribution(None, p.reason);
-        let created = crate::write::sieve::install_sieve_script(
-            &self.inner.client,
-            &self.inner.repo,
-            &self.inner.alias,
-            &attr,
-            &p.name,
-            &p.content,
-        )
-        .await
-        .map_err(|e| self.api_error(e))?;
-        serde_json::to_string_pretty(&created)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
-    }
-
-    #[tool(
         name = "add_sieve_rule",
-        description = "Append a rule to the currently active sieve script. This is the right tool for the common request 'add a filter rule' — it fetches the active script, merges any `require [...]` capabilities the new rule needs, appends the rule body, and updates the script in place. Errors with HTTP 409 if no script is currently active (call `install_sieve_script` + `activate_sieve_script` first to bootstrap). The `rule` field may include its own require declarations; they are merged automatically. Optional `comment` is rendered as `# <line>` per line above the new rule."
+        description = "Add a filter rule to the user's sieve script. This is the right tool for any 'add a filter rule' / 'auto-file these emails' request — it appends the rule to the active script, merging in any new `require [...]` capabilities. If no script is currently active for the alias, pimsteward auto-bootstraps a script named `main` containing this rule and activates it. The `rule` field is RFC 5228 sieve text; it may include its own require declarations and they will be merged automatically. Optional `comment` becomes the rule's name (rendered as `# <line>` per line above the body) and is what `remove_sieve_rule` matches on."
     )]
     async fn add_sieve_rule(
         &self,
@@ -1251,84 +1180,27 @@ impl PimstewardServer {
     }
 
     #[tool(
-        name = "update_sieve_script",
-        description = "Replace an existing sieve script's full content (low-level; for adding a single rule, prefer `add_sieve_rule`). Note: is_active cannot be changed via the forwardemail REST API — scripts must be activated through `activate_sieve_script` (ManageSieve)."
+        name = "remove_sieve_rule",
+        description = "Remove a rule from the active sieve script by name. The `name` matches against the first comment line above each rule (e.g. \"RASCals mailing list\" matches a rule prefixed with `# RASCals mailing list`). Errors with HTTP 404 if no rule with that name exists. Use `list_sieve_rules` first to see available names. The `require [...]` declaration is preserved unchanged — if the removed rule used a capability no other rule needs, the unused require entry stays harmless."
     )]
-    async fn update_sieve_script(
+    async fn remove_sieve_rule(
         &self,
-        Parameters(p): Parameters<UpdateSieveParams>,
+        Parameters(p): Parameters<RemoveSieveRuleParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Sieve)?;
         let attr = self.attribution(None, p.reason);
-        let updated = crate::write::sieve::update_sieve_script(
+        let updated = crate::write::sieve::remove_sieve_rule(
             &self.inner.client,
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            &p.id,
-            &p.content,
+            &self.inner.managesieve,
+            &p.name,
         )
         .await
         .map_err(|e| self.api_error(e))?;
         serde_json::to_string_pretty(&updated)
             .map_err(|e| McpError::internal_error(e.to_string(), None))
-    }
-
-    #[tool(
-        name = "delete_sieve_script",
-        description = "Delete a sieve script by id."
-    )]
-    async fn delete_sieve_script(
-        &self,
-        Parameters(p): Parameters<DeleteSieveParams>,
-    ) -> Result<String, McpError> {
-        self.check_write(Resource::Sieve)?;
-        let attr = self.attribution(None, p.reason);
-        crate::write::sieve::delete_sieve_script(
-            &self.inner.client,
-            &self.inner.repo,
-            &self.inner.alias,
-            &attr,
-            &p.id,
-        )
-        .await
-        .map_err(|e| self.api_error(e))?;
-        Ok(format!("deleted sieve script {}", p.id))
-    }
-
-    #[tool(
-        name = "activate_sieve_script",
-        description = "Activate a sieve script by name via ManageSieve. Forwardemail allows exactly ONE active script at a time — activating a script deactivates any previously active one. To have multiple filter rules active simultaneously, combine them into a single script. Pass an empty name to deactivate all scripts."
-    )]
-    async fn activate_sieve_script(
-        &self,
-        Parameters(p): Parameters<ActivateSieveParams>,
-    ) -> Result<String, McpError> {
-        self.check_write(Resource::Sieve)?;
-        let ms = &self.inner.managesieve;
-        crate::forwardemail::managesieve::activate_script(
-            &ms.host, ms.port, &ms.user, &ms.password, &p.name,
-        )
-        .await
-        .map_err(|e| self.api_error(e))?;
-
-        // Audit the activation in git.
-        let attr = self.attribution(None, p.reason);
-        let msg = format!(
-            "sieve: activate \"{}\"\n\nCaller: {}\nEmail: {}",
-            p.name, attr.caller, attr.caller_email
-        );
-        let _ = self.inner.repo.commit_all(
-            &attr.caller,
-            &attr.caller_email,
-            &msg,
-        );
-
-        if p.name.is_empty() {
-            Ok("all sieve scripts deactivated".to_string())
-        } else {
-            Ok(format!("activated sieve script \"{}\"", p.name))
-        }
     }
 
     #[tool(
@@ -2244,14 +2116,14 @@ const TOOL_REQS: &[(&str, ToolReq)] = &[
     ("create_contact", ToolReq::Write(Resource::Contacts)),
     ("update_contact", ToolReq::Write(Resource::Contacts)),
     ("delete_contact", ToolReq::Write(Resource::Contacts)),
-    // Sieve
-    ("list_sieve", ToolReq::Read(Resource::Sieve)),
-    ("get_sieve_script", ToolReq::Read(Resource::Sieve)),
-    ("install_sieve_script", ToolReq::Write(Resource::Sieve)),
+    // Sieve — rule-centric surface; the script-level operations
+    // (install/update/delete/activate) are intentionally not exposed as
+    // tools so the LLM only ever sees rules, not the underlying scripts.
+    // restore_sieve_* still uses the script-level write helpers under
+    // the hood for undo flows.
+    ("list_sieve_rules", ToolReq::Read(Resource::Sieve)),
     ("add_sieve_rule", ToolReq::Write(Resource::Sieve)),
-    ("update_sieve_script", ToolReq::Write(Resource::Sieve)),
-    ("delete_sieve_script", ToolReq::Write(Resource::Sieve)),
-    ("activate_sieve_script", ToolReq::Write(Resource::Sieve)),
+    ("remove_sieve_rule", ToolReq::Write(Resource::Sieve)),
     // Restore — dry-runs require READ, applies require WRITE. Bulk
     // restore touches three resources, so we expose it whenever any of
     // them is writable; the handler re-checks each resource per-op.
@@ -3071,7 +2943,7 @@ mod tests {
             "list_calendars", "list_events",
             "create_event", "update_event", "delete_event",
             "list_contacts", "create_contact", "update_contact", "delete_contact",
-            "list_sieve", "get_sieve_script", "install_sieve_script", "add_sieve_rule", "update_sieve_script", "delete_sieve_script", "activate_sieve_script",
+            "list_sieve_rules", "add_sieve_rule", "remove_sieve_rule",
             "restore_contact_dry_run", "restore_contact_apply",
             "restore_sieve_dry_run", "restore_sieve_apply",
             "restore_calendar_event_dry_run", "restore_calendar_event_apply",
@@ -3096,7 +2968,7 @@ mod tests {
         // Unrelated resources stay visible.
         assert!(req_for("list_calendars").is_satisfied(&p));
         assert!(req_for("list_contacts").is_satisfied(&p));
-        assert!(req_for("list_sieve").is_satisfied(&p));
+        assert!(req_for("list_sieve_rules").is_satisfied(&p));
     }
 
     #[test]
