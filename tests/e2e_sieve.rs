@@ -361,7 +361,10 @@ async fn sieve_add_rule_auto_bootstraps_when_no_active_script() {
         &ctx.alias_slug(),
         &attr,
         &ms,
-        r#"require ["fileinto"]; if true { fileinto "X"; }"#,
+        // INBOX is the one folder every alias has — keeps this test
+        // independent of the alias's folder layout while still passing
+        // the fileinto folder-validation check in add_sieve_rule.
+        r#"require ["fileinto"]; if true { fileinto "INBOX"; }"#,
         Some("first ever rule"),
     )
     .await

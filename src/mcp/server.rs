@@ -1156,7 +1156,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "add_sieve_rule",
-        description = "Add a filter rule to the user's sieve script. This is the right tool for any 'add a filter rule' / 'auto-file these emails' request — it appends the rule to the active script, merging in any new `require [...]` capabilities. If no script is currently active for the alias, pimsteward auto-bootstraps a script named `main` containing this rule and activates it. The `rule` field is RFC 5228 sieve text; it may include its own require declarations and they will be merged automatically. Optional `comment` becomes the rule's name (rendered as `# <line>` per line above the body) and is what `remove_sieve_rule` matches on."
+        description = "Add a filter rule to the user's sieve script. This is the right tool for any 'add a filter rule' / 'auto-file these emails' request — it appends the rule to the active script, merging in any new `require [...]` capabilities. If no script is currently active for the alias, pimsteward auto-bootstraps a script named `main` containing this rule and activates it. The `rule` field is RFC 5228 sieve text; it may include its own require declarations and they will be merged automatically. Optional `comment` becomes the rule's name (rendered as `# <line>` per line above the body) and is what `remove_sieve_rule` matches on. Every `fileinto \"X\"` target in the rule is validated against the alias's actual folder list: case-only differences are auto-corrected silently; anything else returns HTTP 422 with the offending target and similar folders — ask the user a clarifying question instead of retrying."
     )]
     async fn add_sieve_rule(
         &self,

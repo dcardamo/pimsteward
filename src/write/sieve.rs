@@ -106,6 +106,23 @@ pub async fn add_sieve_rule(
     rule_text: &str,
     comment: Option<&str>,
 ) -> Result<SieveScript, Error> {
+    // Validate every fileinto target in the new rule against the alias's
+    // real folder list. Auto-correct case-only mismatches; reject anything
+    // else with a helpful error so the caller can ask a clarifying
+    // question instead of silently filing mail into a non-existent folder.
+    let folders = client.list_folders().await?;
+    let folder_paths: Vec<String> = folders.into_iter().map(|f| f.path).collect();
+    let rule_text_owned = match validate_fileinto_targets(rule_text, &folder_paths) {
+        Ok(t) => t,
+        Err(mismatch) => {
+            return Err(Error::Api {
+                status: 422,
+                message: mismatch.message(&folder_paths),
+            });
+        }
+    };
+    let rule_text = rule_text_owned.as_str();
+
     let active = resolve_or_bootstrap_active(client, ms, rule_text).await?;
 
     // If we just bootstrapped, the script's content already contains the
@@ -391,6 +408,109 @@ fn remove_rule_from_content(content: &str, rule_name: &str) -> Option<String> {
     Some(out)
 }
 
+/// Reported when a `fileinto` target in a new rule doesn't match any
+/// folder on the alias (and isn't a case-only difference from one).
+#[derive(Debug, Clone)]
+pub struct FolderMismatch {
+    /// The mailbox literal as written in the rule (e.g. `"Archve/2024"`).
+    pub target: String,
+    /// Folder paths that share a case-insensitive substring with the
+    /// target — best effort hint for the caller.
+    pub suggestions: Vec<String>,
+}
+
+impl FolderMismatch {
+    pub fn message(&self, folder_paths: &[String]) -> String {
+        let suggestion_str = if self.suggestions.is_empty() {
+            String::new()
+        } else {
+            format!(" Did you mean one of: {:?}?", self.suggestions)
+        };
+        format!(
+            "fileinto target {:?} does not match any existing folder.{} \
+             Available folders: {:?}. Either correct the target (case-only \
+             differences are auto-corrected) or create the folder first.",
+            self.target, suggestion_str, folder_paths
+        )
+    }
+}
+
+/// Extract the mailbox argument of every `fileinto "..."` action in
+/// `rule_text`. Skips fileinto inside `# ` comment lines and handles
+/// optional tag arguments (`:copy`, `:create`, `:flags [...]`) by
+/// taking the last quoted string before the statement-terminating `;`.
+pub fn extract_fileinto_targets(rule_text: &str) -> Vec<String> {
+    let stripped: String = rule_text
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with('#') {
+                ""
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stmt_re = Regex::new(r"(?s)\bfileinto\b([^;]*);").unwrap();
+    let str_re = Regex::new(r#""([^"]*)""#).unwrap();
+    let mut out = Vec::new();
+    for cap in stmt_re.captures_iter(&stripped) {
+        let segment = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        if let Some(last) = str_re.captures_iter(segment).last() {
+            out.push(last[1].to_string());
+        }
+    }
+    out
+}
+
+/// Validate every `fileinto` mailbox in `rule_text` against
+/// `folder_paths` (canonical paths from the server).
+///
+/// - Exact match → kept as-is.
+/// - Case-insensitive exact match → the rule text is rewritten to use
+///   the canonical case, transparently.
+/// - No match → returns `Err(FolderMismatch)` with the offending target
+///   and a list of similar folder paths.
+///
+/// Returns the (possibly corrected) rule text on success.
+pub fn validate_fileinto_targets(
+    rule_text: &str,
+    folder_paths: &[String],
+) -> Result<String, FolderMismatch> {
+    let targets = extract_fileinto_targets(rule_text);
+    let mut corrected = rule_text.to_string();
+    for target in targets {
+        if folder_paths.iter().any(|f| f == &target) {
+            continue;
+        }
+        if let Some(canonical) = folder_paths
+            .iter()
+            .find(|f| f.eq_ignore_ascii_case(&target))
+        {
+            let from = format!("\"{target}\"");
+            let to = format!("\"{canonical}\"");
+            corrected = corrected.replace(&from, &to);
+            continue;
+        }
+        let lower_target = target.to_ascii_lowercase();
+        let mut suggestions: Vec<String> = folder_paths
+            .iter()
+            .filter(|f| {
+                let l = f.to_ascii_lowercase();
+                l.contains(&lower_target) || lower_target.contains(&l)
+            })
+            .cloned()
+            .collect();
+        suggestions.sort();
+        suggestions.dedup();
+        return Err(FolderMismatch {
+            target,
+            suggestions,
+        });
+    }
+    Ok(corrected)
+}
+
 /// Merge a new sieve rule into an existing sieve script body.
 ///
 /// Combines all `require [...]` capability lists from both inputs into a
@@ -635,5 +755,111 @@ if header :contains "subject" "beta" { discard; stop; }
     fn remove_rule_returns_none_when_name_missing() {
         let script = "require [\"fileinto\"];\n\n# only rule\nif true { fileinto \"X\"; }\n";
         assert!(remove_rule_from_content(script, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn extract_fileinto_targets_simple_rule() {
+        let rule = r#"if header :contains "subject" "x" { fileinto "Trash"; stop; }"#;
+        assert_eq!(extract_fileinto_targets(rule), vec!["Trash"]);
+    }
+
+    #[test]
+    fn extract_fileinto_targets_skips_comments() {
+        let rule = r#"# previously: fileinto "Old";
+if true { fileinto "New"; }"#;
+        assert_eq!(extract_fileinto_targets(rule), vec!["New"]);
+    }
+
+    #[test]
+    fn extract_fileinto_targets_handles_tag_arguments() {
+        // :flags has its own quoted strings — the mailbox is the last one.
+        let rule = r#"if true { fileinto :copy :flags ["\\Seen"] "Archive/2024"; }"#;
+        assert_eq!(extract_fileinto_targets(rule), vec!["Archive/2024"]);
+    }
+
+    #[test]
+    fn extract_fileinto_targets_multiple_actions() {
+        let rule = r#"if header :is "from" "a" { fileinto "A"; }
+if header :is "from" "b" { fileinto "B/Sub"; }"#;
+        assert_eq!(extract_fileinto_targets(rule), vec!["A", "B/Sub"]);
+    }
+
+    #[test]
+    fn validate_passes_through_exact_match() {
+        let folders = vec!["Trash".to_string(), "Groups/RASC".to_string()];
+        let rule = r#"if true { fileinto "Groups/RASC"; }"#;
+        let corrected = validate_fileinto_targets(rule, &folders).unwrap();
+        assert_eq!(corrected, rule);
+    }
+
+    #[test]
+    fn validate_auto_corrects_case_only_difference() {
+        let folders = vec!["Trash".to_string(), "Groups/RASC".to_string()];
+        let rule = r#"# files into groups folder
+if true { fileinto "groups/rasc"; }"#;
+        let corrected = validate_fileinto_targets(rule, &folders).unwrap();
+        assert!(
+            corrected.contains("\"Groups/RASC\""),
+            "case-only mismatch should be rewritten to canonical: {corrected}"
+        );
+        assert!(
+            !corrected.contains("\"groups/rasc\""),
+            "old casing should be gone from rule body: {corrected}"
+        );
+        // Comments are descriptive prose — leave them alone.
+        assert!(corrected.contains("# files into groups folder"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_folder_with_suggestions() {
+        let folders = vec![
+            "Trash".to_string(),
+            "Archive".to_string(),
+            "Archive/2024".to_string(),
+        ];
+        let rule = r#"if true { fileinto "Archve"; }"#; // typo, no case fix
+        let err = validate_fileinto_targets(rule, &folders).unwrap_err();
+        assert_eq!(err.target, "Archve");
+        // No suggestion expected for "Archve" → "Archive" with substring match,
+        // but it should at least not panic and message() should be helpful.
+        let msg = err.message(&folders);
+        assert!(msg.contains("Archve"));
+        assert!(msg.contains("Available folders"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_folder_with_substring_suggestions() {
+        let folders = vec![
+            "Trash".to_string(),
+            "Groups".to_string(),
+            "Groups/RASC".to_string(),
+        ];
+        let rule = r#"if true { fileinto "groups"; }"#;
+        // case-insensitive exact for "groups" → "Groups" should auto-correct,
+        // not error.
+        let corrected = validate_fileinto_targets(rule, &folders).unwrap();
+        assert!(corrected.contains("\"Groups\""));
+    }
+
+    #[test]
+    fn validate_suggests_substring_neighbours() {
+        let folders = vec!["Trash".to_string(), "Groups/RASC".to_string()];
+        let rule = r#"if true { fileinto "rasc"; }"#;
+        let err = validate_fileinto_targets(rule, &folders).unwrap_err();
+        assert_eq!(err.target, "rasc");
+        assert!(
+            err.suggestions.iter().any(|s| s == "Groups/RASC"),
+            "expected Groups/RASC in suggestions, got {:?}",
+            err.suggestions
+        );
+    }
+
+    #[test]
+    fn validate_handles_multiple_targets_one_bad() {
+        let folders = vec!["Trash".to_string(), "Archive".to_string()];
+        let rule = r#"if header :is "from" "a" { fileinto "Trash"; }
+if header :is "from" "b" { fileinto "Bogus"; }"#;
+        let err = validate_fileinto_targets(rule, &folders).unwrap_err();
+        assert_eq!(err.target, "Bogus");
     }
 }
