@@ -54,6 +54,46 @@ fn is_cancelled(ev: &crate::forwardemail::calendar::CalendarEvent) -> bool {
     false
 }
 
+/// Parse an ISO-8601 / RFC-3339 datetime, accepting both `Z` and
+/// `±HH:MM` offsets. Returns `None` on any parse failure.
+fn parse_iso_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// True if the event's `[start_date, end_date)` interval overlaps the
+/// requested `[window_start, window_end)`. If both bounds are `None`
+/// the filter is a no-op and every event passes. When any bound is
+/// set, events without parseable dates are excluded — better to drop
+/// undated junk than to leak everything past a window filter.
+fn event_in_window(
+    ev: &crate::forwardemail::calendar::CalendarEvent,
+    window_start: Option<chrono::DateTime<chrono::Utc>>,
+    window_end: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    if window_start.is_none() && window_end.is_none() {
+        return true;
+    }
+    let ev_start = ev.start_date.as_deref().and_then(parse_iso_dt);
+    // Treat a missing end_date as a point-in-time event at start_date.
+    let ev_end = ev.end_date.as_deref().and_then(parse_iso_dt).or(ev_start);
+    let (Some(es), Some(ee)) = (ev_start, ev_end) else {
+        return false;
+    };
+    if let Some(ws) = window_start {
+        if ee <= ws {
+            return false;
+        }
+    }
+    if let Some(we) = window_end {
+        if es >= we {
+            return false;
+        }
+    }
+    true
+}
+
 /// Error text for a canonical id that isn't present in pimsteward's
 /// backup tree yet.
 ///
@@ -396,6 +436,26 @@ pub struct ListEventsParams {
     /// events with STATUS:CANCELLED are excluded by default.
     #[serde(default)]
     pub include_cancelled: Option<bool>,
+    /// Optional ISO-8601 lower bound (inclusive) for the event window,
+    /// e.g. `2026-04-29T00:00:00-04:00` or `2026-04-29T04:00:00Z`.
+    /// Events whose `[start_date, end_date)` interval overlaps
+    /// `[start, end)` are returned. Either bound may be set
+    /// independently. Events with unparseable dates are excluded when
+    /// any window bound is set.
+    #[serde(default)]
+    pub start: Option<String>,
+    /// Optional ISO-8601 upper bound (exclusive) for the event window.
+    /// See `start` for semantics.
+    #[serde(default)]
+    pub end: Option<String>,
+    /// Include the raw iCalendar text in each returned event. Defaults
+    /// to false — the `ical` field (typically several KB per event,
+    /// including a multi-decade VTIMEZONE block) is stripped to keep
+    /// responses compact for tool-using LLMs. Set to true when you
+    /// actually need the iCalendar payload (e.g. before calling
+    /// `delete_event` round-trips that need the original text).
+    #[serde(default)]
+    pub include_ical: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -942,13 +1002,34 @@ impl PimstewardServer {
 
     #[tool(
         name = "list_events",
-        description = "List calendar events. Pass `calendar_id` to restrict to one calendar (checked against scoped per-calendar permissions). With no `calendar_id`, events are returned for every calendar the caller has read access to — events in calendars you can't read are filtered out silently rather than failing the call. Cancelled events (STATUS:CANCELLED) are excluded by default; pass `include_cancelled: true` to include them. Returns event JSON including the raw iCalendar text."
+        description = "List calendar events. Pass `calendar_id` to restrict to one calendar (checked against scoped per-calendar permissions). With no `calendar_id`, events are returned for every calendar the caller has read access to — events in calendars you can't read are filtered out silently rather than failing the call. Cancelled events (STATUS:CANCELLED) are excluded by default; pass `include_cancelled: true` to include them. Pass ISO-8601 `start` and/or `end` to restrict to events whose interval overlaps `[start, end)` — strongly recommended for narrow questions like \"what's on my calendar today?\" since the response otherwise includes every event on the calendar. The raw iCalendar text is stripped by default to keep responses compact (tens of KB instead of hundreds); pass `include_ical: true` if you actually need it."
     )]
     async fn list_events(
         &self,
         Parameters(p): Parameters<ListEventsParams>,
     ) -> Result<String, McpError> {
         let include_cancelled = p.include_cancelled.unwrap_or(false);
+        let include_ical = p.include_ical.unwrap_or(false);
+        // Parse window bounds up front so a malformed value fails fast
+        // rather than silently filtering out every event.
+        let window_start = match p.start.as_deref() {
+            Some(s) => Some(parse_iso_dt(s).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("invalid `start`: not RFC-3339 / ISO-8601: {s:?}"),
+                    None,
+                )
+            })?),
+            None => None,
+        };
+        let window_end = match p.end.as_deref() {
+            Some(s) => Some(parse_iso_dt(s).ok_or_else(|| {
+                McpError::invalid_params(
+                    format!("invalid `end`: not RFC-3339 / ISO-8601: {s:?}"),
+                    None,
+                )
+            })?),
+            None => None,
+        };
 
         // Scoped path: caller asked for one calendar. Gate that specific
         // calendar id and pass it through to forwardemail as a filter.
@@ -962,11 +1043,18 @@ impl PimstewardServer {
                 .list_calendar_events(Some(cal_id))
                 .await
                 .map_err(|e| self.api_error(e))?;
-            let filtered: Vec<_> = if include_cancelled {
-                events
-            } else {
-                events.into_iter().filter(|ev| !is_cancelled(ev)).collect()
-            };
+            let mut filtered: Vec<_> = events
+                .into_iter()
+                .filter(|ev| {
+                    (include_cancelled || !is_cancelled(ev))
+                        && event_in_window(ev, window_start, window_end)
+                })
+                .collect();
+            if !include_ical {
+                for ev in &mut filtered {
+                    ev.ical = None;
+                }
+            }
             return serde_json::to_string_pretty(&filtered)
                 .map_err(|e| McpError::internal_error(e.to_string(), None));
         }
@@ -986,7 +1074,7 @@ impl PimstewardServer {
             .list_calendar_events(None)
             .await
             .map_err(|e| self.api_error(e))?;
-        let filtered: Vec<_> = events
+        let mut filtered: Vec<_> = events
             .into_iter()
             .filter(|ev| {
                 self.inner
@@ -996,8 +1084,14 @@ impl PimstewardServer {
                     })
                     .is_ok()
                     && (include_cancelled || !is_cancelled(ev))
+                    && event_in_window(ev, window_start, window_end)
             })
             .collect();
+        if !include_ical {
+            for ev in &mut filtered {
+                ev.ical = None;
+            }
+        }
         serde_json::to_string_pretty(&filtered)
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
@@ -2925,6 +3019,126 @@ mod tests {
             contacts,
             sieve,
         }
+    }
+
+    // ── list_events window filtering ────────────────────────────────
+    //
+    // Pimsteward's REST upstream returns every event on a calendar in
+    // one paginated dump (no time-range filter), so list_events trims
+    // the wire payload server-side. These tests pin the overlap and
+    // edge-case semantics we promise to MCP callers.
+
+    fn ev(start: Option<&str>, end: Option<&str>) -> crate::forwardemail::calendar::CalendarEvent {
+        crate::forwardemail::calendar::CalendarEvent {
+            id: "x".into(),
+            uid: None,
+            calendar_id: None,
+            ical: None,
+            etag: None,
+            summary: None,
+            description: None,
+            location: None,
+            start_date: start.map(str::to_owned),
+            end_date: end.map(str::to_owned),
+            status: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    fn dt(s: &str) -> chrono::DateTime<chrono::Utc> {
+        parse_iso_dt(s).expect("test datetime must parse")
+    }
+
+    #[test]
+    fn parse_iso_dt_accepts_z_and_offset() {
+        assert!(parse_iso_dt("2026-04-29T18:00:00Z").is_some());
+        assert!(parse_iso_dt("2026-04-29T14:00:00-04:00").is_some());
+        assert!(parse_iso_dt("2026-04-29T14:00:00.123-04:00").is_some());
+        assert!(parse_iso_dt("not a date").is_none());
+        assert!(parse_iso_dt("2026-04-29").is_none());
+    }
+
+    #[test]
+    fn event_in_window_no_bounds_passes_everything() {
+        // No bounds = no filter, even for events with no parseable dates.
+        assert!(event_in_window(&ev(None, None), None, None));
+        assert!(event_in_window(
+            &ev(Some("2026-04-29T18:00:00Z"), Some("2026-04-29T19:00:00Z")),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn event_in_window_overlap_semantics() {
+        let ws = Some(dt("2026-04-29T00:00:00-04:00"));
+        let we = Some(dt("2026-04-30T00:00:00-04:00"));
+
+        // Wholly inside today → in
+        assert!(event_in_window(
+            &ev(Some("2026-04-29T18:00:00Z"), Some("2026-04-29T19:30:00Z")),
+            ws, we,
+        ));
+        // Ends exactly at window start → out (window end is exclusive
+        // in *both* directions: ev_end <= ws excludes it).
+        assert!(!event_in_window(
+            &ev(Some("2026-04-28T20:00:00Z"), Some("2026-04-29T04:00:00Z")),
+            ws, we,
+        ));
+        // Starts exactly at window end → out.
+        assert!(!event_in_window(
+            &ev(Some("2026-04-30T04:00:00Z"), Some("2026-04-30T05:00:00Z")),
+            ws, we,
+        ));
+        // Straddles window end → in.
+        assert!(event_in_window(
+            &ev(Some("2026-04-29T23:00:00Z"), Some("2026-04-30T05:00:00Z")),
+            ws, we,
+        ));
+        // Wholly before → out.
+        assert!(!event_in_window(
+            &ev(Some("2026-04-25T10:00:00Z"), Some("2026-04-25T11:00:00Z")),
+            ws, we,
+        ));
+    }
+
+    #[test]
+    fn event_in_window_one_sided_bounds() {
+        // Only `start` set → "from now on".
+        let ws = Some(dt("2026-04-29T00:00:00Z"));
+        assert!(event_in_window(
+            &ev(Some("2026-05-01T00:00:00Z"), Some("2026-05-01T01:00:00Z")),
+            ws, None,
+        ));
+        assert!(!event_in_window(
+            &ev(Some("2026-04-01T00:00:00Z"), Some("2026-04-01T01:00:00Z")),
+            ws, None,
+        ));
+        // Only `end` set → "everything up to that point".
+        let we = Some(dt("2026-04-29T00:00:00Z"));
+        assert!(event_in_window(
+            &ev(Some("2026-04-01T00:00:00Z"), Some("2026-04-01T01:00:00Z")),
+            None, we,
+        ));
+        assert!(!event_in_window(
+            &ev(Some("2026-05-01T00:00:00Z"), Some("2026-05-01T01:00:00Z")),
+            None, we,
+        ));
+    }
+
+    #[test]
+    fn event_in_window_missing_or_unparseable_dates_excluded() {
+        let ws = Some(dt("2026-04-29T00:00:00Z"));
+        let we = Some(dt("2026-04-30T00:00:00Z"));
+        // No dates at all → exclude when filter is active.
+        assert!(!event_in_window(&ev(None, None), ws, we));
+        // Garbage dates → exclude.
+        assert!(!event_in_window(&ev(Some("not a date"), None), ws, we));
+        // Only start_date present (point-in-time) → end_date treated as
+        // start_date for overlap.
+        assert!(event_in_window(&ev(Some("2026-04-29T12:00:00Z"), None), ws, we));
+        assert!(!event_in_window(&ev(Some("2026-04-25T12:00:00Z"), None), ws, we));
     }
 
     fn req_for(name: &str) -> ToolReq {

@@ -68,7 +68,7 @@ pub struct CalendarEvent {
     pub calendar_id: Option<String>,
     /// Raw iCalendar text — the authoritative representation. Store
     /// verbatim.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ical: Option<String>,
     /// CalDAV `getetag` value. Present when events are pulled via the
     /// CalDAV source; absent for REST pulls (forwardemail's REST API
