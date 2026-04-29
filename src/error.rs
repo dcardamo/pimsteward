@@ -13,8 +13,15 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
+    /// HTTP transport error from reqwest. The captured `String` is the
+    /// full source chain — `reqwest::Error`'s `Display` only shows the
+    /// top-level message (e.g. "error sending request for url (...)"),
+    /// dropping the underlying cause (DNS, TLS handshake, connection
+    /// refused, timeout, etc). We expand it at construction time via
+    /// `From<reqwest::Error>` so the cause chain survives into logs and
+    /// MCP error responses.
     #[error("http: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
 
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
@@ -65,5 +72,69 @@ impl Error {
 impl From<rusqlite::Error> for Error {
     fn from(e: rusqlite::Error) -> Self {
         Self::Index(e.to_string())
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(fmt_error_chain(&e))
+    }
+}
+
+/// Walk a `std::error::Error`'s source chain and join every level into
+/// a single ": "-separated string. Keeps the top-level message intact
+/// and appends each underlying cause so logs like
+/// `http: error sending request for url (...)` become
+/// `http: error sending request for url (...): connection refused
+/// (os error 111)`. Stops at the deepest source.
+pub fn fmt_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        cur = e.source();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Chained {
+        msg: &'static str,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+    impl std::fmt::Display for Chained {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.msg)
+        }
+    }
+    impl std::error::Error for Chained {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref().map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn fmt_error_chain_no_source() {
+        let e = Chained { msg: "top", source: None };
+        assert_eq!(fmt_error_chain(&e), "top");
+    }
+
+    #[test]
+    fn fmt_error_chain_walks_full_chain() {
+        let leaf = Chained { msg: "connection refused", source: None };
+        let mid = Chained { msg: "tcp connect failed", source: Some(Box::new(leaf)) };
+        let top = Chained {
+            msg: "error sending request for url (https://api.forwardemail.net/v1/folders)",
+            source: Some(Box::new(mid)),
+        };
+        assert_eq!(
+            fmt_error_chain(&top),
+            "error sending request for url (https://api.forwardemail.net/v1/folders): tcp connect failed: connection refused"
+        );
     }
 }
