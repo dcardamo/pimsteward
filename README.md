@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="pimsteward — a permission-aware MCP mediator for forwardemail.net" width="100%">
+  <img src="assets/banner.svg" alt="pimsteward — a permission-aware MCP mediator for your personal data" width="100%">
 </p>
 
 <p align="center">
@@ -10,9 +10,13 @@
   <a href="PLAN.md"><img alt="Design: PLAN.md" src="https://img.shields.io/badge/design-PLAN.md-informational.svg"></a>
 </p>
 
-> **pimsteward** is a **PIM steward for [forwardemail.net](https://forwardemail.net)** — a
-> permission-aware MCP mediator between an AI assistant and your mail, calendar,
-> contacts, and sieve rules, with time-travel backup built in.
+> **pimsteward** is a **permission-aware MCP mediator and git-backed audit log
+> for your personal data** — sitting between an AI assistant and your PIM
+> backend(s) so every read is policy-checked and every write is captured as a
+> reversible commit. [forwardemail.net](https://forwardemail.net) is the
+> primary, fully-supported provider (mail, calendar, contacts, sieve, send);
+> standards-based providers like iCloud over CalDAV are supported for the
+> subset of capabilities they actually expose.
 
 ---
 
@@ -36,12 +40,32 @@ to see what it changed today, you ask `git log`.
 
 ---
 
-## Why [forwardemail.net](https://forwardemail.net)
+## Supported providers
 
-pimsteward is a forwardemail-only tool on purpose. A mediator like this needs
-a backend with a real programmatic surface, stable resource ids, and
-credentials that can be scoped to a single mailbox — forwardemail has all
-three.
+pimsteward runs as a single daemon per provider. Each daemon owns its own
+credentials, its own git repo, and its own MCP endpoint. Add as many as
+you have accounts; they don't share state.
+
+| Provider          | Mail | Calendar | Contacts | Sieve | Send |
+| ----------------- | :--: | :------: | :------: | :---: | :--: |
+| forwardemail.net  |  ✅  |   ✅     |   ✅     |  ✅   |  ✅  |
+| iCloud (CalDAV)   |  —   |   ✅     |   —      |  —    |  —   |
+
+New providers are added when there's a real, testable account. Fastmail/JMAP,
+Gmail, generic IMAP-only providers are out of scope until then.
+
+---
+
+## Why forwardemail (the primary target)
+
+This section is about why [forwardemail.net](https://forwardemail.net) is the
+fully-supported provider — not about pimsteward as a whole. Other providers
+(e.g. iCloud over CalDAV) plug into the same MCP/git core but only for the
+capabilities their protocols expose.
+
+A mediator like this needs a backend with a real programmatic surface,
+stable resource ids, and credentials that can be scoped to a single mailbox —
+forwardemail has all three.
 
 - **A real, first-class REST API.** forwardemail ships a
   [well-documented REST API](https://forwardemail.net/en/email-api) covering
@@ -311,6 +335,24 @@ AI assistant. The AI container:
 No bind mounts, no shared volumes, no credential files. If the AI container
 is compromised, the attacker can only access what the permission matrix allows
 through MCP — they cannot exfiltrate bulk data or read credentials.
+
+### Running multiple providers
+
+Each provider is a separate daemon: its own systemd unit, its own port, its
+own bearer token, its own git repo, and its own entry in the AI client's
+`.mcp.json`. They don't share state, and the AI sees them as independent
+MCP servers — `pimsteward-forwardemail` and `pimsteward-icloud` rather than
+a single merged surface. This keeps blast radius small (a compromised
+iCloud daemon can't see forwardemail credentials) and makes capability
+gating trivial (the iCloud daemon only registers MCP tools its provider
+actually supports).
+
+A typical multi-provider setup runs the forwardemail daemon for mail +
+calendar + contacts + sieve, alongside an iCloud daemon for the calendar
+that already lives in iCloud. See
+[`examples/config-icloud-caldav.toml`](examples/config-icloud-caldav.toml)
+for the iCloud-side daemon shape (port, repo path, credential files,
+permission block scoped to `calendar` only).
 
 ---
 
@@ -786,8 +828,11 @@ writes, single writer, no merge conflicts.
 - ❌ **Not a generic backup tool.** Use restic or borg for disk-level backup.
 - ❌ **Not a PIM client.** Keep using your favourite IMAP/CalDAV app — pimsteward
   sits alongside it, not in front of it.
-- ❌ **Not a multi-provider sync tool.** v1 is forwardemail-only by design.
-  A generic PIM mediator is a bigger, different project.
+- ❌ **Not a generic any-provider client.** Providers are added when
+  contributors bring real, testable accounts. iCloud CalDAV is supported
+  because the project owner uses it. Fastmail/JMAP, Gmail, generic
+  IMAP-only providers are out of scope until someone with that backend
+  brings testable code.
 - ❌ **Not a search index.** forwardemail's own search is excellent; pimsteward
   passes queries through rather than re-indexing.
 - ❌ **Not a rate-limit bypass.** All AI reads and writes still hit

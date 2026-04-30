@@ -82,6 +82,62 @@ cargo nextest run --run-ignored all
 The alias email must contain `_test`. For example,
 `my_test@example.com` is accepted; `me@example.com` is not.
 
+### iCloud CalDAV e2e setup
+
+The iCloud provider has its own opt-in e2e suite, parallel to the
+forwardemail one above but pointed at a real iCloud account over CalDAV.
+It exercises calendar create/read/update/delete against Apple's servers
+and is gated behind a separate env var so it never runs accidentally
+alongside the forwardemail suite.
+
+The safety guard for these tests lives in
+[`src/safety.rs`](src/safety.rs) as `assert_icloud_test_calendar` and
+enforces that the target calendar's displayname contains the substring
+`_test`. Just like the forwardemail guard, it **panics** if the rule is
+violated — there is no way to silently bypass it.
+
+**One-time setup:**
+
+1. In the iCloud Calendar app (macOS or iCloud.com), create a new
+   calendar named `pimsteward_test`. The substring `_test` is what the
+   safety guard checks; the exact name is convention.
+2. At [appleid.apple.com](https://appleid.apple.com/) → *Sign-In and
+   Security → App-Specific Passwords*, generate a password labelled e.g.
+   `pimsteward-test`. Apple will only show the password once — copy it
+   immediately.
+3. Save your Apple ID email and the app-specific password into two files
+   **outside the repo**, ideally via dotvault or a similar secret store.
+   Example placeholder paths:
+
+   ```sh
+   ~/.config/secrets/icloud-username       # contains: apple.id@example.com
+   ~/.config/secrets/icloud-app-password   # contains: the 16-char app password
+   ```
+
+   Never commit either file. Never paste either value into a config
+   file checked into git.
+
+**Running the suite:**
+
+```sh
+export PIMSTEWARD_RUN_E2E_ICLOUD=1
+export PIMSTEWARD_TEST_ICLOUD_USERNAME_FILE=$HOME/.config/secrets/icloud-username
+export PIMSTEWARD_TEST_ICLOUD_PASSWORD_FILE=$HOME/.config/secrets/icloud-app-password
+cargo nextest run --run-ignored all -- icloud_e2e
+```
+
+Each test creates events with a unique per-run UID and cleans up after
+itself (including on partial failure), so collisions between parallel
+runs are not a concern. CI does not have iCloud credentials and never
+runs this suite — it's strictly a local-developer workflow.
+
+**Optional defense in depth:** set
+`PIMSTEWARD_TEST_ICLOUD_CALENDAR_URL_ALLOW` to a comma-separated list of
+calendar URLs the suite is allowed to touch. If set, the safety guard
+will refuse to operate on any calendar URL not in the list, on top of
+the displayname `_test` check. This is useful if you have several
+test calendars and want to pin the suite to one of them.
+
 ### Writing new tests
 
 - **Unit tests** for pure functions: canonicalisation helpers, permission
