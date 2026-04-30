@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{Config, IcloudCaldavConfig};
+use crate::config::Config;
 use crate::error::Error;
 use crate::icloud::caldav::{IcloudCalendarSource, IcloudCalendarWriter};
 use crate::provider::{Capabilities, Provider};
@@ -82,12 +82,6 @@ impl IcloudCaldavProvider {
         })
     }
 
-    /// Snapshot of the iCloud CalDAV config used to build this provider —
-    /// preserved on the type for callers that need to surface the
-    /// discovery URL or User-Agent (e.g. diagnostics output).
-    pub fn config_snapshot(top_cfg: &Config) -> Option<IcloudCaldavConfig> {
-        top_cfg.provider.icloud_caldav.clone()
-    }
 }
 
 /// Read a required credential file, trim trailing whitespace, and reject

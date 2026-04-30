@@ -26,6 +26,12 @@ use crate::write::audit::{Attribution, WriteAudit};
 /// forwardemail it becomes the REST API's `event_id` body field (so the
 /// returned `id` matches); for iCloud it MUST be the iCalendar UID — the
 /// writer uses it as the `.ics` filename.
+///
+/// Returns the writer's `CalendarEvent` directly so MCP callers see the
+/// derived fields (`summary`, `start_date`, `end_date`, …) populated. For
+/// forwardemail those come from the REST server's normalised response; for
+/// iCloud the writer synthesizes them from the request's iCal text (CalDAV
+/// PUT bodies are empty, so the request is the canonical text).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_event(
     writer: &dyn CalendarWriter,
@@ -48,42 +54,30 @@ pub async fn create_event(
             &uid_string
         }
     };
-    let new_id = writer.create_event(calendar_id, uid, ical).await?;
+    let created = writer.create_event(calendar_id, uid, ical).await?;
 
+    // Pull the title for the audit commit message. Prefer the server-
+    // normalised summary on the returned event; fall back to the request
+    // iCal so we never lose the title even if the writer can't supply it.
+    let title = created
+        .summary
+        .clone()
+        .or_else(|| extract_ical_field(ical, "SUMMARY"))
+        .unwrap_or_else(|| "(no title)".to_string());
     let audit = WriteAudit {
         attribution,
         tool: "create_event",
         resource: "calendar",
-        resource_id: new_id.clone(),
+        resource_id: created.id.clone(),
         args: serde_json::json!({
             "calendar_id": calendar_id,
             "event_id": event_id,
             "ical_bytes": ical.len(),
         }),
-        summary: format!("calendar: create event in {calendar_id}"),
+        summary: format!("calendar: create event {title} in {calendar_id}"),
     };
     refresh(source, repo, alias, attribution, &audit).await?;
-
-    // Return a synthetic CalendarEvent with the id from the writer so
-    // the caller sees a stable identifier they can pass back. We don't
-    // round-trip the server-normalised payload here (forwardemail used
-    // to do that via a follow-up GET inside `update_calendar_event`);
-    // callers that need the canonical body should re-read via list_events.
-    Ok(CalendarEvent {
-        id: new_id,
-        uid: extract_ical_uid(ical),
-        calendar_id: Some(calendar_id.to_string()),
-        ical: Some(ical.to_string()),
-        etag: None,
-        summary: extract_ical_field(ical, "SUMMARY"),
-        description: None,
-        location: None,
-        start_date: None,
-        end_date: None,
-        status: None,
-        created_at: None,
-        updated_at: None,
-    })
+    Ok(created)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -98,9 +92,14 @@ pub async fn update_event(
     ical: &str,
     if_match: &str,
 ) -> Result<CalendarEvent, Error> {
-    let new_id = writer
+    let updated = writer
         .update_event(calendar_id, uid, ical, if_match)
         .await?;
+    let title = updated
+        .summary
+        .clone()
+        .or_else(|| extract_ical_field(ical, "SUMMARY"))
+        .unwrap_or_else(|| "(no title)".to_string());
     let audit = WriteAudit {
         attribution,
         tool: "update_event",
@@ -111,25 +110,10 @@ pub async fn update_event(
             "ical_bytes": ical.len(),
             "if_match_present": !if_match.is_empty(),
         }),
-        summary: format!("calendar: update event {uid}"),
+        summary: format!("calendar: update event {title} ({uid})"),
     };
     refresh(source, repo, alias, attribution, &audit).await?;
-
-    Ok(CalendarEvent {
-        id: new_id,
-        uid: Some(uid.to_string()),
-        calendar_id: Some(calendar_id.to_string()),
-        ical: Some(ical.to_string()),
-        etag: None,
-        summary: extract_ical_field(ical, "SUMMARY"),
-        description: None,
-        location: None,
-        start_date: None,
-        end_date: None,
-        status: None,
-        created_at: None,
-        updated_at: None,
-    })
+    Ok(updated)
 }
 
 #[allow(clippy::too_many_arguments)]

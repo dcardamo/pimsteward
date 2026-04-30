@@ -14,9 +14,9 @@
 //!   calendar URL (404 / 410 / redirect-to-elsewhere). 5xx is treated as
 //!   a transient server hiccup and does NOT invalidate.
 //!
-//! Task 6 will wire `IcloudCalendarWriter` behind a unified
-//! `Provider::build_calendar_writer()` trait method. For now, the writer
-//! is a concrete type used directly by the iCloud provider.
+//! `IcloudCalendarWriter` is wired through `Provider::build_calendar_writer`
+//! since b4d7e07 — the MCP layer dispatches calendar mutations through the
+//! `CalendarWriter` trait without needing to know which provider is active.
 
 use crate::error::Error;
 use crate::forwardemail::calendar::{Calendar, CalendarEvent};
@@ -343,8 +343,9 @@ fn extract_ical_field(ical: &str, name: &str) -> Option<String> {
 
 // ─── Writer ─────────────────────────────────────────────────────────────
 
-/// Write-side iCloud CalDAV client. Concrete type for now; Task 6 will
-/// add a unified `Provider::build_calendar_writer()` trait method.
+/// Write-side iCloud CalDAV client. Exposed through the
+/// `CalendarWriter` trait (see impl below) so the MCP layer dispatches
+/// mutations identically across forwardemail and iCloud.
 pub struct IcloudCalendarWriter {
     creds: Creds,
     client: Client,
@@ -486,6 +487,13 @@ impl IcloudCalendarWriter {
 // without knowing which provider is active. The mapping is direct: the
 // trait's `calendar_id` parameter is the calendar's collection URL, and
 // `uid` is the iCalendar UID (also the `.ics` filename tail).
+//
+// CalDAV's PUT response body is empty — there is no server-normalised
+// event to round-trip back. Synthesize a `CalendarEvent` from the caller's
+// iCal text (which IS the canonical text for iCloud) plus the response
+// ETag so the MCP layer's serialisation still surfaces the derived fields
+// (`summary`, `start_date`, `end_date`, `location`, `status`) that the LLM
+// expects.
 #[async_trait]
 impl crate::source::traits::CalendarWriter for IcloudCalendarWriter {
     fn tag(&self) -> &'static str {
@@ -497,8 +505,9 @@ impl crate::source::traits::CalendarWriter for IcloudCalendarWriter {
         calendar_id: &str,
         uid: &str,
         ical: &str,
-    ) -> Result<String, Error> {
-        IcloudCalendarWriter::create_event(self, calendar_id, uid, ical).await
+    ) -> Result<CalendarEvent, Error> {
+        let etag = IcloudCalendarWriter::create_event(self, calendar_id, uid, ical).await?;
+        Ok(synthesize_event(calendar_id, uid, ical, etag))
     }
 
     async fn update_event(
@@ -507,8 +516,10 @@ impl crate::source::traits::CalendarWriter for IcloudCalendarWriter {
         uid: &str,
         ical: &str,
         if_match: &str,
-    ) -> Result<String, Error> {
-        IcloudCalendarWriter::update_event(self, calendar_id, uid, ical, if_match).await
+    ) -> Result<CalendarEvent, Error> {
+        let etag =
+            IcloudCalendarWriter::update_event(self, calendar_id, uid, ical, if_match).await?;
+        Ok(synthesize_event(calendar_id, uid, ical, etag))
     }
 
     async fn delete_event(
@@ -518,6 +529,39 @@ impl crate::source::traits::CalendarWriter for IcloudCalendarWriter {
         if_match: &str,
     ) -> Result<(), Error> {
         IcloudCalendarWriter::delete_event(self, calendar_id, uid, if_match).await
+    }
+}
+
+/// Build a `CalendarEvent` from a successful CalDAV PUT — caller's iCal +
+/// response etag. Parses the same derived fields (summary, location,
+/// status, start/end) the source-side `parse_report` extracts, so a freshly
+/// created event looks the same to MCP callers as one re-read via
+/// `list_events`.
+fn synthesize_event(
+    calendar_url: &str,
+    uid: &str,
+    ical: &str,
+    etag: String,
+) -> CalendarEvent {
+    // `id` mirrors the source-side convention: the .ics filename tail.
+    // For iCloud writes the URL is `<calendar_url>/<uid>.ics`, so the tail
+    // is exactly `<uid>.ics` — no need to actually parse it.
+    let id = format!("{uid}.ics");
+    CalendarEvent {
+        id,
+        uid: extract_ical_uid(ical).or_else(|| Some(uid.to_string())),
+        calendar_id: Some(calendar_url.to_string()),
+        ical: Some(ical.to_string()),
+        etag: if etag.is_empty() { None } else { Some(etag) },
+        summary: extract_ical_field(ical, "SUMMARY"),
+        description: extract_ical_field(ical, "DESCRIPTION"),
+        location: extract_ical_field(ical, "LOCATION"),
+        start_date: extract_ical_field(ical, "DTSTART"),
+        end_date: extract_ical_field(ical, "DTEND"),
+        status: extract_ical_field(ical, "STATUS"),
+        // CalDAV does not expose server-side timestamps for events.
+        created_at: None,
+        updated_at: None,
     }
 }
 

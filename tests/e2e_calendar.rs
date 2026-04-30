@@ -72,6 +72,15 @@ async fn calendar_event_create_update_delete_lifecycle() {
     .expect("create event");
     assert_eq!(created.uid.as_deref(), Some(uid.as_str()));
     assert_eq!(created.summary.as_deref(), Some("original summary"));
+    // Regression guard for Task 6 review's Critical #1: the writer must
+    // populate derived fields (start_date here) on the returned event so
+    // MCP callers see them after create. Without this we'd silently
+    // serialise null back to the LLM.
+    assert!(
+        created.start_date.is_some(),
+        "create_event must populate start_date; got {:?}",
+        created.start_date
+    );
     let event_id = created.id.clone();
 
     // .ics in repo

@@ -35,17 +35,23 @@ fn perm_denied(msg: impl Into<std::borrow::Cow<'static, str>>) -> McpError {
     McpError::new(PERMISSION_DENIED_CODE, msg, None)
 }
 
+/// Custom JSON-RPC error code for "tool registered but not serviceable by
+/// the active provider". Distinct from `METHOD_NOT_FOUND` (which means the
+/// server doesn't recognise the method at all) — pimsteward DOES register
+/// these tools so they're visible to clients, but the active provider
+/// can't service them. Server-reserved range (-32099..=-32000) per
+/// JSON-RPC 2.0 §5.1.
+pub const UNSUPPORTED_BY_PROVIDER_CODE: ErrorCode = ErrorCode(-32002);
+
 /// Structured error for tools whose backing source/writer is unavailable
 /// because the active provider doesn't support that resource. Returned at
 /// call time by `require_*` helpers — the tool stays in the registered
 /// schema (so `tools/list` lists it for diagnostic visibility), but
-/// invocations against an iCloud-only daemon fail with a clear message
-/// instead of a raw NPE-style internal_error. METHOD_NOT_FOUND is the
-/// closest semantic match in JSON-RPC 2.0 — "you asked me to do something
-/// I don't have a handler for".
+/// invocations against an iCloud-only daemon fail with a clear,
+/// distinguishable code instead of a raw NPE-style internal_error.
 fn unsupported_by_provider() -> McpError {
     McpError::new(
-        ErrorCode::METHOD_NOT_FOUND,
+        UNSUPPORTED_BY_PROVIDER_CODE,
         "this tool is not supported by the active provider",
         None,
     )
@@ -3913,7 +3919,12 @@ mod tests {
     /// constructed against a localhost discovery URL — no network is
     /// touched in these tests; the source/writer are only ever held as
     /// `Arc<dyn …>` to satisfy the type invariants.
-    fn icloud_shaped_server() -> PimstewardServer {
+    ///
+    /// Returns `(server, tempdir)` — callers must keep the `TempDir`
+    /// alive for the test's lifetime so the repo + search index files
+    /// stay on disk while the server uses them. (Previously this helper
+    /// `mem::forget`d the tempdir, which was a hard leak.)
+    fn icloud_shaped_server() -> (PimstewardServer, tempfile::TempDir) {
         use crate::icloud::caldav::{IcloudCalendarSource, IcloudCalendarWriter};
         use crate::permission::{Access, CalendarPermission, EmailPermission, SendPermission};
 
@@ -3950,11 +3961,7 @@ mod tests {
         );
         let search_index =
             Arc::new(crate::index::SearchIndex::open(dir.path()).unwrap());
-        // We deliberately leak the tempdir's path by putting the repo
-        // inside it before dropping. SearchIndex is open against the same
-        // path; since we hold an Arc the dir tempdir can drop freely.
-        std::mem::forget(dir);
-        PimstewardServer::new(
+        let server = PimstewardServer::new(
             None,
             repo,
             perms,
@@ -3967,16 +3974,18 @@ mod tests {
             calendar_writer,
             None,
             search_index,
-        )
+        );
+        (server, dir)
     }
 
     #[tokio::test]
     async fn icloud_shaped_server_rejects_list_folders() {
-        let s = icloud_shaped_server();
+        let (s, _dir) = icloud_shaped_server();
         let err = s
             .list_folders(Parameters(EmptyParams {}))
             .await
             .expect_err("must fail without mail_source");
+        assert_eq!(err.code, UNSUPPORTED_BY_PROVIDER_CODE);
         let msg = err.message.to_string();
         assert!(
             msg.contains("not supported by the active provider"),
@@ -3986,11 +3995,12 @@ mod tests {
 
     #[tokio::test]
     async fn icloud_shaped_server_rejects_list_contacts() {
-        let s = icloud_shaped_server();
+        let (s, _dir) = icloud_shaped_server();
         let err = s
             .list_contacts(Parameters(EmptyParams {}))
             .await
             .expect_err("must fail without contacts_source");
+        assert_eq!(err.code, UNSUPPORTED_BY_PROVIDER_CODE);
         let msg = err.message.to_string();
         assert!(
             msg.contains("not supported by the active provider"),
@@ -4000,11 +4010,12 @@ mod tests {
 
     #[tokio::test]
     async fn icloud_shaped_server_rejects_list_sieve_rules() {
-        let s = icloud_shaped_server();
+        let (s, _dir) = icloud_shaped_server();
         let err = s
             .list_sieve_rules(Parameters(EmptyParams {}))
             .await
             .expect_err("must fail without managesieve");
+        assert_eq!(err.code, UNSUPPORTED_BY_PROVIDER_CODE);
         let msg = err.message.to_string();
         assert!(
             msg.contains("not supported by the active provider"),

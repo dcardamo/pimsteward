@@ -202,16 +202,16 @@ impl crate::source::traits::CalendarWriter for RestCalendarWriter {
         calendar_id: &str,
         uid: &str,
         ical: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<crate::forwardemail::calendar::CalendarEvent, Error> {
         // Pass uid as event_id so callers can preserve a stable iCalendar
         // UID across recreates (matches the existing
-        // `restore::calendar::apply_calendar` Recreate semantics).
+        // `restore::calendar::apply_calendar` Recreate semantics). Forward
+        // forwardemail's full response — the REST server normalises the
+        // iCal and populates derived fields (start/end/created_at/etc.).
         let event_id = if uid.is_empty() { None } else { Some(uid) };
-        let created = self
-            .client
+        self.client
             .create_calendar_event(calendar_id, ical, event_id)
-            .await?;
-        Ok(created.id)
+            .await
     }
 
     async fn update_event(
@@ -220,7 +220,7 @@ impl crate::source::traits::CalendarWriter for RestCalendarWriter {
         uid: &str,
         ical: &str,
         _if_match: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<crate::forwardemail::calendar::CalendarEvent, Error> {
         // forwardemail's REST API addresses events by their global eventId
         // (carried here as `uid`) rather than (calendar_id, uid) — the
         // `calendar_id` argument is unused for plain ical updates. See
@@ -228,11 +228,9 @@ impl crate::source::traits::CalendarWriter for RestCalendarWriter {
         // separate "move to a different calendar" surface, which is not
         // exposed through the trait (move-to-calendar lives on the higher
         // `mcp/server.rs::update_event` tool).
-        let updated = self
-            .client
+        self.client
             .update_calendar_event(uid, Some(ical), None, None)
-            .await?;
-        Ok(updated.id)
+            .await
     }
 
     async fn delete_event(

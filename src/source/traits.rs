@@ -125,18 +125,27 @@ pub trait CalendarSource: Send + Sync {
 ///   discovered via RFC 6764, and `uid` is the iCalendar UID (also the
 ///   `.ics` filename tail). `if_match` is honored strictly — empty or
 ///   stale values produce `Error::PreconditionFailed`.
+///
+/// Returned `CalendarEvent` fields:
+/// - **forwardemail:** the server-normalised response — every derived field
+///   (`summary`, `start_date`, `end_date`, `created_at`, `updated_at`, …) is
+///   populated by forwardemail's server-side iCal parser.
+/// - **iCloud:** synthesized from the request — `id` is the `.ics` filename
+///   tail, `etag` is the response ETag header, and `summary`/`location`/
+///   `status`/`start_date`/`end_date` are parsed out of the caller's iCal.
+///   `created_at`/`updated_at` are `None` since CalDAV does not expose
+///   server-side timestamps for events.
 #[async_trait]
 pub trait CalendarWriter: Send + Sync {
     fn tag(&self) -> &'static str;
-    /// Create a new calendar event. Returns the new event's identifier
-    /// (forwardemail eventId for REST, ETag string for iCloud — both are
-    /// opaque to the caller).
+    /// Create a new calendar event and return the post-create event state
+    /// (see trait docs for which fields each backend populates).
     async fn create_event(
         &self,
         calendar_id: &str,
         uid: &str,
         ical: &str,
-    ) -> Result<String, Error>;
+    ) -> Result<CalendarEvent, Error>;
     /// Update an existing calendar event by uid. `if_match` carries an
     /// etag for optimistic concurrency on backends that support it; pass
     /// `""` on backends that don't.
@@ -146,7 +155,7 @@ pub trait CalendarWriter: Send + Sync {
         uid: &str,
         ical: &str,
         if_match: &str,
-    ) -> Result<String, Error>;
+    ) -> Result<CalendarEvent, Error>;
     /// Delete a calendar event by uid. `if_match` semantics match
     /// [`Self::update_event`].
     async fn delete_event(

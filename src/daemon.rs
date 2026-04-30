@@ -12,7 +12,9 @@ use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::mcp::PimstewardServer;
 use crate::permission::{Permissions, Resource};
-use crate::provider::{self, forwardemail::ForwardemailProvider, Provider};
+use crate::provider::{
+    forwardemail::ForwardemailProvider, icloud_caldav::IcloudCaldavProvider, Provider,
+};
 use crate::pull;
 use crate::source::{
     imap::idle_loop, CalendarSource, ContactsSource, MailSource,
@@ -274,7 +276,7 @@ async fn spawn_mcp_http_listener(
 /// Run the pull daemon indefinitely, optionally serving MCP over HTTP.
 /// Returns when a fatal error occurs or when a shutdown signal is received.
 pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
-    // Build the provider once. We keep two handles in scope:
+    // Build the provider exactly once and keep two handles in scope:
     //   * `provider: Arc<dyn Provider>` — the type-erased trait object the
     //     MCP factory and capability-gated pull spawners dispatch through.
     //   * `fe_provider: Option<Arc<ForwardemailProvider>>` — `Some` when the
@@ -282,16 +284,27 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     //     forwardemail-specific things (sieve pull's REST `Client`, IMAP
     //     IDLE listener, ManageSieve config). `None` for iCloud and any
     //     future calendar-only provider.
-    // Dispatch via `provider::build` keys off the [provider.*] section in
-    // config; doing the type-erasure at construction time avoids
-    // `Arc::downcast` gymnastics.
-    let provider: Arc<dyn Provider> = provider::build(&cfg)?;
-    let fe_provider: Option<Arc<ForwardemailProvider>> =
+    //
+    // Construction-once is load-bearing: `ForwardemailProvider::new`
+    // allocates a fresh REST `Client` each call (with its own connection
+    // pool), and the IMAP variant also pre-builds a per-instance session
+    // cache. Both `provider` and `fe_provider` MUST share the same
+    // underlying `ForwardemailProvider` so capability-routed traits
+    // (calendar-writer, mail-source, …) and forwardemail-only handles
+    // (sieve `Client`, IMAP IDLE config) point at one connection pool.
+    // We build the typed Arc first, then erase to `dyn Provider` — that
+    // also avoids `Arc::downcast` gymnastics.
+    let (provider, fe_provider): (Arc<dyn Provider>, Option<Arc<ForwardemailProvider>>) =
         match cfg.active_provider_kind()? {
             crate::config::ProviderKind::Forwardemail => {
-                Some(Arc::new(ForwardemailProvider::new(&cfg)?))
+                let fe = Arc::new(ForwardemailProvider::new(&cfg)?);
+                let dyn_provider: Arc<dyn Provider> = fe.clone();
+                (dyn_provider, Some(fe))
             }
-            crate::config::ProviderKind::IcloudCaldav => None,
+            crate::config::ProviderKind::IcloudCaldav => {
+                let ic: Arc<dyn Provider> = Arc::new(IcloudCaldavProvider::new(&cfg)?);
+                (ic, None)
+            }
         };
 
     // Reject configs that grant permissions on resources this provider

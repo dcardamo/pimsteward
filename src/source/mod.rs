@@ -14,9 +14,9 @@
 //! regardless of read source — forwardemail's write semantics are cleaner
 //! via REST and mixing write backends would complicate audit attribution.
 //!
-//! Calendar, contacts, and sieve don't have a trait abstraction in v2.2
-//! because only one backend exists for each (REST). Add per-resource
-//! traits when a second backend arrives.
+//! Calendar has both [`CalendarSource`] and [`CalendarWriter`] traits with
+//! REST and iCloud-CalDAV implementations. Contacts has [`ContactsSource`]
+//! (REST + CardDAV). Sieve is forwardemail-specific and has no trait.
 
 pub mod caldav;
 pub mod carddav;

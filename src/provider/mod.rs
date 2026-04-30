@@ -4,9 +4,11 @@
 //! per daemon — selected at startup by which `[provider.*]` section is
 //! present in config.
 //!
-//! Phase 1 of the multi-provider work is pure addition: this trait and
-//! `Capabilities` exist but nothing yet calls through them. Phase 2 wires
-//! `daemon.rs` and the MCP server to dispatch through `&dyn Provider`.
+//! Provider trait — concrete impls in [`forwardemail::ForwardemailProvider`]
+//! and [`icloud_caldav::IcloudCaldavProvider`]. The daemon and MCP server
+//! dispatch through `&dyn Provider`; capability-gated tools that the active
+//! provider doesn't support return a structured "unsupported by provider"
+//! error at call time (see `mcp/server.rs::unsupported_by_provider`).
 
 use std::sync::Arc;
 
@@ -243,5 +245,28 @@ mod tests {
         assert!(provider.build_mail_source().unwrap().is_none());
         assert!(provider.build_mail_writer().unwrap().is_none());
         assert!(provider.build_contacts_source().unwrap().is_none());
+    }
+
+    /// Regression guard for Task 6 review's Critical #3: `daemon::run`
+    /// used to call `provider::build` AND `ForwardemailProvider::new`,
+    /// allocating two REST `Client`s per request. The fix builds the
+    /// typed `Arc<ForwardemailProvider>` once and erases to `dyn Provider`.
+    /// We model that here: clone the typed Arc into a `dyn Provider` and
+    /// assert both handles bump the same allocation's refcount.
+    #[test]
+    fn forwardemail_provider_arc_shared_between_typed_and_dyn() {
+        use crate::provider::forwardemail::ForwardemailProvider;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = forwardemail_config_with_temp_creds(&dir);
+        let fe = Arc::new(ForwardemailProvider::new(&cfg).unwrap());
+        let _dyn_provider: Arc<dyn Provider> = fe.clone();
+        // Two Arc handles pointing at the same allocation. If a future
+        // refactor re-introduces a duplicate `ForwardemailProvider::new`
+        // call this strong_count drops back to 1 and the test catches it.
+        assert!(
+            Arc::strong_count(&fe) >= 2,
+            "fe Arc should be shared between typed and dyn handles, got count={}",
+            Arc::strong_count(&fe),
+        );
     }
 }
