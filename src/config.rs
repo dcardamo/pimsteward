@@ -381,37 +381,55 @@ impl Config {
     }
 
     /// Determine which provider this config configures. Errors if zero or
-    /// more than one is set.
+    /// more than one is set, or if both legacy and namespaced forwardemail
+    /// credentials are set simultaneously (mid-migration footgun).
     ///
-    /// "Set" here means: a `[provider.*]` section is present, OR (for
-    /// the legacy `[forwardemail]` shim) the user has filled in
-    /// credential file paths. An all-default `ForwardemailConfig` from
-    /// `#[serde(default)]` is treated as "not set" so a config with
-    /// only `[provider.icloud_caldav]` doesn't accidentally trip the
-    /// "both providers configured" guard.
+    /// "Set" here means: credential file paths are populated, either in
+    /// the namespaced `[provider.*]` section or (for forwardemail) in the
+    /// legacy top-level `[forwardemail]` shim. An empty `[provider.*]`
+    /// section with no credentials is treated as "not set" so a stub
+    /// section doesn't accidentally trip detection — that previously
+    /// returned `Ok` here and then failed with a worse error inside
+    /// `load_credentials`.
     pub fn active_provider_kind(&self) -> Result<ProviderKind, Error> {
-        let has_namespaced_fe = self.provider.forwardemail.is_some();
-        let has_namespaced_ic = self.provider.icloud_caldav.is_some();
+        // Namespaced providers count only when credential files are set;
+        // an empty `[provider.forwardemail]` / `[provider.icloud_caldav]`
+        // header with no fields is "not configured".
+        let has_namespaced_fe = self
+            .provider
+            .forwardemail
+            .as_ref()
+            .map(|fe| fe.alias_user_file.is_some() || fe.alias_password_file.is_some())
+            .unwrap_or(false);
+        let has_namespaced_ic = self
+            .provider
+            .icloud_caldav
+            .as_ref()
+            .map(|ic| ic.username_file.is_some() || ic.password_file.is_some())
+            .unwrap_or(false);
         // Legacy top-level [forwardemail] counts only if the user actually
         // configured credentials; the all-default ForwardemailConfig from
         // `#[serde(default)]` shouldn't impersonate a real provider.
         let has_legacy_fe = self.forwardemail.alias_user_file.is_some()
             || self.forwardemail.alias_password_file.is_some();
 
-        let has_fe = has_namespaced_fe || has_legacy_fe;
-        let has_ic = has_namespaced_ic;
-
-        match (has_fe, has_ic) {
-            (true, true) => Err(Error::config(
-                "config has both forwardemail and icloud_caldav providers; \
-                 exactly one [provider.*] section per daemon is required",
+        match (has_namespaced_fe, has_legacy_fe, has_namespaced_ic) {
+            (true, true, _) => Err(Error::config(
+                "config has both legacy [forwardemail] and namespaced \
+                 [provider.forwardemail] credentials; pick one form (the \
+                 namespaced form is preferred for new configs)",
             )),
-            (true, false) => Ok(ProviderKind::Forwardemail),
-            (false, true) => Ok(ProviderKind::IcloudCaldav),
-            (false, false) => Err(Error::config(
+            (true, false, true) | (false, true, true) => Err(Error::config(
+                "config has both a forwardemail credential and an \
+                 icloud_caldav config; pick one — pimsteward runs one \
+                 provider per daemon",
+            )),
+            (false, false, false) => Err(Error::config(
                 "no provider configured: set [provider.forwardemail] or \
-                 [provider.icloud_caldav]",
+                 [provider.icloud_caldav] (and provide credential files)",
             )),
+            (true, false, false) | (false, true, false) => Ok(ProviderKind::Forwardemail),
+            (false, false, true) => Ok(ProviderKind::IcloudCaldav),
         }
     }
 
@@ -758,6 +776,69 @@ password_file = "/tmp/p"
         let cfg = Config::load(&p).unwrap();
         let err = cfg.active_provider_kind().unwrap_err();
         assert!(err.to_string().contains("no provider"), "{}", err);
+    }
+
+    #[test]
+    fn provider_kind_empty_namespaced_fe_section_is_unconfigured() {
+        // An empty `[provider.forwardemail]` header with no fields used to
+        // count as "configured" and led to a confusing error inside
+        // load_credentials. Now it correctly reports "no provider".
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.forwardemail]
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        let err = cfg.active_provider_kind().unwrap_err();
+        assert!(err.to_string().contains("no provider"), "{}", err);
+    }
+
+    #[test]
+    fn provider_kind_empty_namespaced_icloud_section_is_unconfigured() {
+        // Symmetric guard for the icloud_caldav side.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.icloud_caldav]
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        let err = cfg.active_provider_kind().unwrap_err();
+        assert!(err.to_string().contains("no provider"), "{}", err);
+    }
+
+    #[test]
+    fn provider_kind_legacy_and_namespaced_forwardemail_errors() {
+        // Mid-migration footgun: both legacy [forwardemail] and namespaced
+        // [provider.forwardemail] credentials set. We refuse to guess
+        // which one wins — error and tell the user to pick.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[forwardemail]
+alias_user_file = "/tmp/u-legacy"
+alias_password_file = "/tmp/p-legacy"
+
+[provider.forwardemail]
+alias_user_file = "/tmp/u-ns"
+alias_password_file = "/tmp/p-ns"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        let err = cfg.active_provider_kind().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("both legacy"), "{}", msg);
+        assert!(msg.contains("namespaced"), "{}", msg);
     }
 
     #[test]

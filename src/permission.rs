@@ -387,17 +387,14 @@ impl Permissions {
     }
 
     /// Validate this permission set against a provider's capabilities.
-    /// Errors when a permission positively grants access to a resource
-    /// the provider doesn't support — that combination is a config bug
-    /// the daemon refuses to start with.
+    /// Errors when a permission *positively grants* access to a resource
+    /// the provider can't serve.
     ///
-    /// Pragmatic note: a permission of `none` / `denied` against an
-    /// unsupported resource is silently allowed (it's a no-op). The
-    /// strict behaviour ("any explicit key is rejected") would require
-    /// distinguishing "user wrote `none`" from "default None", which
-    /// pimsteward's current `Permissions` shape can't do without a
-    /// deeper schema change. The danger this guards against is granting
-    /// something the provider can't fulfil; granting nothing is safe.
+    /// `none` / `denied` against an unsupported resource is silently allowed
+    /// — the current `Permissions` shape can't distinguish "user wrote `none`"
+    /// from "default None", and granting nothing on an unsupported resource is
+    /// a no-op. A stricter check would require a schema change (e.g.
+    /// `Option<Access>`) which is out of scope here.
     pub fn validate_against_capabilities(
         &self,
         caps: &crate::provider::Capabilities,
@@ -844,6 +841,38 @@ calendar = "read_write"
             !msg.contains("calendar"),
             "calendar should be allowed: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_all_unsupported_resource_keys_against_calendar_only() {
+        use crate::provider::Capabilities;
+
+        // Cover every rejection branch in one go: email, contacts, sieve,
+        // and email_send all positively grant against a calendar-only
+        // provider, so all four must appear in the error message while
+        // calendar (which IS supported) must not.
+        let p: Permissions = toml::from_str(
+            r#"
+email      = "read"
+contacts   = "read_write"
+sieve      = "read"
+email_send = "allowed"
+calendar   = "read_write"
+"#,
+        )
+        .unwrap();
+
+        let err = p
+            .validate_against_capabilities(&Capabilities::calendar_only())
+            .unwrap_err();
+        let msg = err.to_string();
+        for key in ["email", "contacts", "sieve", "email_send"] {
+            assert!(
+                msg.contains(key),
+                "expected {key} in rejection message: {msg}"
+            );
+        }
+        assert!(!msg.contains("calendar"), "calendar must NOT be rejected: {msg}");
     }
 
     #[test]
