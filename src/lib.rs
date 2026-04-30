@@ -8,6 +8,7 @@ pub mod forwardemail;
 pub mod index;
 pub mod mcp;
 pub mod permission;
+pub mod provider;
 pub mod pull;
 pub mod restore;
 pub mod safety;
