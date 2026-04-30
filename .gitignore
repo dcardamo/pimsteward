@@ -2,3 +2,11 @@
 /result
 *.swp
 .env
+
+# iCloud test credentials — defense in depth so they can never be committed.
+# These would normally live OUTSIDE the repo at e.g. `~/.config/secrets/`,
+# but if they ever end up inside the repo path (test-tempdir mishap, etc.)
+# git must refuse to add them.
+**/icloud-username*
+**/icloud-app-password*
+**/icloud-test-creds*
