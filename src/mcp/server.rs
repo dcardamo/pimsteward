@@ -1416,7 +1416,7 @@ impl PimstewardServer {
             &self.inner.alias,
             &attr,
             &audit,
-            &[&folder],
+            &[folder],
         )
         .await;
 
