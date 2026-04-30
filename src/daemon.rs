@@ -7,16 +7,15 @@
 //! factory closure, giving session isolation without process-per-client
 //! overhead.
 
-use crate::config::{CalendarSourceKind, Config, ContactsSourceKind, MailSourceKind};
+use crate::config::Config;
 use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::mcp::PimstewardServer;
 use crate::permission::{Permissions, Resource};
+use crate::provider::{forwardemail::ForwardemailProvider, Provider};
 use crate::pull;
 use crate::source::{
-    imap::{idle_loop, ImapConfig},
-    CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource, ImapMailSource,
-    MailSource, MailWriter, RestCalendarSource, RestContactsSource, RestMailSource,
+    imap::idle_loop, CalendarSource, ContactsSource, MailSource,
 };
 use crate::store::Repo;
 use std::path::{Path, PathBuf};
@@ -54,32 +53,6 @@ pub struct HttpOptions {
     pub bearer_token_file: Option<PathBuf>,
 }
 
-/// Build the configured MailSource + MailWriter pair. Extracted here so
-/// both the pull loops and the MCP server factory can reuse it.
-fn build_mail_source(
-    cfg: &Config,
-    client: Client,
-    user: &str,
-    password: &str,
-) -> (Arc<dyn MailSource>, Arc<dyn MailWriter>) {
-    match cfg.forwardemail.mail_source {
-        MailSourceKind::Rest => {
-            let rest = Arc::new(crate::source::RestMailSource::new(client));
-            (rest.clone(), rest)
-        }
-        MailSourceKind::Imap => {
-            let imap_cfg = ImapConfig {
-                host: cfg.forwardemail.imap_host.clone(),
-                port: cfg.forwardemail.imap_port,
-                user: user.to_string(),
-                password: password.to_string(),
-            };
-            let imap = Arc::new(ImapMailSource::new(imap_cfg));
-            (imap.clone(), imap)
-        }
-    }
-}
-
 /// Read and validate a bearer token from a file. Trims whitespace and
 /// rejects empty files so a deployment bug can never silently produce
 /// an unauthenticated endpoint.
@@ -114,6 +87,8 @@ async fn spawn_mcp_http_listener(
     port: u16,
     expected_token: Option<String>,
     cfg: Arc<Config>,
+    provider: Arc<dyn Provider>,
+    fe_provider: Arc<ForwardemailProvider>,
     profile_permissions: Permissions,
     caller: String,
     mail_tx: broadcast::Sender<MailNotification>,
@@ -132,6 +107,12 @@ async fn spawn_mcp_http_listener(
     let cfg_for_factory = cfg.clone();
     let perms_for_factory = profile_permissions;
     let caller_for_factory = caller;
+    let provider_for_factory = provider.clone();
+    // TODO(provider): Client + ManageSieve config + SearchIndex are still
+    // forwardemail-specific — they live on the concrete provider so we
+    // can construct the MCP server until the trait grows the relevant
+    // builder methods. A future task will move these behind the trait.
+    let fe_for_factory = fe_provider.clone();
     let ct_http = ct.clone();
 
     let service: StreamableHttpService<PimstewardServer, LocalSessionManager> =
@@ -140,20 +121,34 @@ async fn spawn_mcp_http_listener(
                 let cfg = cfg_for_factory.clone();
                 let perms = perms_for_factory.clone();
                 let caller = caller_for_factory.clone();
-                let (user, pass) = cfg.load_credentials().map_err(std::io::Error::other)?;
-                let alias = user.replace('@', "-");
-                let client =
-                    Client::new(cfg.forwardemail.api_base.clone(), user.clone(), pass.clone())
-                        .map_err(std::io::Error::other)?;
-                let (mail_source, mail_writer) =
-                    build_mail_source(&cfg, client.clone(), &user, &pass);
+                let provider = provider_for_factory.clone();
+                let fe = fe_for_factory.clone();
+                let alias = provider.alias().to_string();
+                let mail_source = provider
+                    .build_mail_source()
+                    .map_err(std::io::Error::other)?
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "provider returned no mail source for MCP factory",
+                        )
+                    })?;
+                let mail_writer = provider
+                    .build_mail_writer()
+                    .map_err(std::io::Error::other)?
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "provider returned no mail writer for MCP factory",
+                        )
+                    })?;
+                let client = fe.client().clone();
+                let (user, pass) = fe.credentials();
                 let repo =
                     Repo::open_or_init(&cfg.storage.repo_path).map_err(std::io::Error::other)?;
                 let managesieve = crate::mcp::ManageSieveConfig {
                     host: cfg.forwardemail.managesieve_host.clone(),
                     port: cfg.forwardemail.managesieve_port,
-                    user: user.clone(),
-                    password: pass.clone(),
+                    user: user.to_string(),
+                    password: pass.to_string(),
                 };
                 let search_index = Arc::new(
                     crate::index::SearchIndex::open(repo.root())
@@ -253,9 +248,20 @@ async fn spawn_mcp_http_listener(
 /// Run the pull daemon indefinitely, optionally serving MCP over HTTP.
 /// Returns when a fatal error occurs or when a shutdown signal is received.
 pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
-    let (user, pass) = cfg.load_credentials()?;
-    let alias = user.replace('@', "-");
-    let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
+    // Build the provider once. We keep two handles in scope:
+    //   * `fe_provider: Arc<ForwardemailProvider>` for the still-forwardemail-
+    //     specific surfaces (sieve pull's `Client`, IMAP IDLE config, ManageSieve
+    //     config, search index). These will move into the trait in a future
+    //     task.
+    //   * `provider: Arc<dyn Provider>` erased to the trait — used for every
+    //     mail/calendar/contacts source construction in this function and in
+    //     the MCP factory closure.
+    // Doing the type-erasure at construction time avoids `Arc::downcast`
+    // gymnastics (which would otherwise need an `as_any` shim on the trait).
+    let fe_provider = Arc::new(ForwardemailProvider::new(&cfg)?);
+    let provider: Arc<dyn Provider> = fe_provider.clone();
+    let alias = provider.alias().to_string();
+    let client = fe_provider.client().clone();
     let repo = Arc::new(Repo::open_or_init(&cfg.storage.repo_path)?);
     let cfg = Arc::new(cfg);
 
@@ -264,26 +270,17 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     let mut handles = Vec::new();
 
     if cfg.permissions.check_read(Resource::Contacts).is_ok() {
-        let contacts_source: Arc<dyn ContactsSource> = match cfg.forwardemail.contacts_source {
-            ContactsSourceKind::Rest => Arc::new(RestContactsSource::new(client.clone())),
-            ContactsSourceKind::Carddav => {
-                let (u, p) = cfg.load_credentials()?;
-                Arc::new(DavContactsSource::new(
-                    cfg.forwardemail.carddav_base_url.clone(),
-                    u,
-                    p,
-                )?)
-            }
-        };
-        handles.push(spawn_contacts_puller(
-            Duration::from_secs(cfg.pull.contacts_interval_seconds),
-            contacts_source,
-            repo.clone(),
-            alias.clone(),
-        ));
+        if let Some(contacts_source) = provider.build_contacts_source()? {
+            handles.push(spawn_contacts_puller(
+                Duration::from_secs(cfg.pull.contacts_interval_seconds),
+                contacts_source,
+                repo.clone(),
+                alias.clone(),
+            ));
+        }
     }
 
-    if cfg.permissions.check_read(Resource::Sieve).is_ok() {
+    if cfg.permissions.check_read(Resource::Sieve).is_ok() && provider.capabilities().sieve {
         let h = spawn_puller(
             "sieve",
             Duration::from_secs(cfg.pull.sieve_interval_seconds),
@@ -302,23 +299,14 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     }
 
     if cfg.permissions.check_read(Resource::Calendar).is_ok() {
-        let calendar_source: Arc<dyn CalendarSource> = match cfg.forwardemail.calendar_source {
-            CalendarSourceKind::Rest => Arc::new(RestCalendarSource::new(client.clone())),
-            CalendarSourceKind::Caldav => {
-                let (u, p) = cfg.load_credentials()?;
-                Arc::new(DavCalendarSource::new(
-                    cfg.forwardemail.caldav_base_url.clone(),
-                    u,
-                    p,
-                )?)
-            }
-        };
-        handles.push(spawn_calendar_puller(
-            Duration::from_secs(cfg.pull.calendar_interval_seconds),
-            calendar_source,
-            repo.clone(),
-            alias.clone(),
-        ));
+        if let Some(calendar_source) = provider.build_calendar_source()? {
+            handles.push(spawn_calendar_puller(
+                Duration::from_secs(cfg.pull.calendar_interval_seconds),
+                calendar_source,
+                repo.clone(),
+                alias.clone(),
+            ));
+        }
     }
 
     // Broadcast channel for mail notifications. Consumers subscribe via
@@ -347,35 +335,18 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
 
         // Mail has a dedicated puller because it dispatches on a
         // MailSource trait object, not a concrete Client.
-        let mail_source: Arc<dyn MailSource> = match cfg.forwardemail.mail_source {
-            MailSourceKind::Rest => Arc::new(RestMailSource::new(client.clone())),
-            MailSourceKind::Imap => {
-                let (u, p) = cfg.load_credentials()?;
-                Arc::new(ImapMailSource::new(ImapConfig {
-                    host: cfg.forwardemail.imap_host.clone(),
-                    port: cfg.forwardemail.imap_port,
-                    user: u,
-                    password: p,
-                }))
-            }
-        };
+        let mail_source: Arc<dyn MailSource> = provider
+            .build_mail_source()?
+            .ok_or_else(|| Error::config("provider returned no mail source"))?;
 
         // If IMAP IDLE is enabled (only meaningful with mail_source=imap),
         // spawn a dedicated IDLE listener on its own connection and wire a
         // Notify to wake the puller when new data arrives. The periodic
         // ticker still runs as a safety net: if the IDLE connection dies
         // the puller keeps syncing on its interval.
-        let idle_notify = if cfg.forwardemail.imap_idle
-            && matches!(cfg.forwardemail.mail_source, MailSourceKind::Imap)
-        {
+        let idle_notify = if fe_provider.imap_idle_enabled() {
             let notify = Arc::new(Notify::new());
-            let (u, p) = cfg.load_credentials()?;
-            let idle_cfg = ImapConfig {
-                host: cfg.forwardemail.imap_host.clone(),
-                port: cfg.forwardemail.imap_port,
-                user: u,
-                password: p,
-            };
+            let idle_cfg = fe_provider.imap_config();
             let notify_clone = notify.clone();
             let span = tracing::info_span!("imap_idle");
             handles.push(tokio::spawn(
@@ -449,6 +420,8 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
             http_opts.port,
             expected_token,
             cfg.clone(),
+            provider.clone(),
+            fe_provider.clone(),
             cfg.permissions.clone(),
             default_caller,
             mail_tx.clone(),
@@ -480,6 +453,8 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
             profile.port,
             Some(token),
             cfg.clone(),
+            provider.clone(),
+            fe_provider.clone(),
             profile.permissions.clone(),
             profile.caller_name().to_string(),
             mail_tx.clone(),

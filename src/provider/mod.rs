@@ -10,11 +10,11 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
 use crate::config::Config;
 use crate::error::Error;
 use crate::source::{CalendarSource, ContactsSource, MailSource, MailWriter};
+
+pub mod forwardemail;
 
 /// Resource axes a provider may support. Distinct from
 /// [`crate::permission::Resource`] — that enum gates user-granted access on
@@ -93,7 +93,15 @@ impl Capabilities {
 /// don't support a resource can return `Ok(None)` — the daemon is expected
 /// to consult [`Provider::capabilities`] first, but the `Option` makes the
 /// invariant typecheck-able rather than panic-checkable.
-#[async_trait]
+///
+/// `build_*` is sync on purpose: the MCP `StreamableHttpService` factory
+/// closure that calls these methods runs on a tokio worker thread but is
+/// itself non-async, so an `async fn` here would force every caller into
+/// `block_on`, which can deadlock. All of pimsteward's source/writer
+/// constructors (`RestMailSource::new`, `ImapMailSource::new`,
+/// `DavCalendarSource::new`, etc.) are already synchronous — they only
+/// open the network when the trait methods are first awaited — so the
+/// constraint costs nothing.
 pub trait Provider: Send + Sync {
     /// Stable, lowercase identifier — `"forwardemail"`, `"icloud"`, etc.
     /// Used in logs and metric labels, not user-facing.
@@ -104,19 +112,17 @@ pub trait Provider: Send + Sync {
     /// by audit attribution and the git store layout.
     fn alias(&self) -> &str;
 
-    async fn build_mail_source(&self) -> Result<Option<Arc<dyn MailSource>>, Error>;
-    async fn build_mail_writer(&self) -> Result<Option<Arc<dyn MailWriter>>, Error>;
-    async fn build_calendar_source(&self) -> Result<Option<Arc<dyn CalendarSource>>, Error>;
-    async fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error>;
+    fn build_mail_source(&self) -> Result<Option<Arc<dyn MailSource>>, Error>;
+    fn build_mail_writer(&self) -> Result<Option<Arc<dyn MailWriter>>, Error>;
+    fn build_calendar_source(&self) -> Result<Option<Arc<dyn CalendarSource>>, Error>;
+    fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error>;
 }
 
-/// Construct the configured provider from a `Config`. Phase 1 placeholder
-/// — Task 2 replaces this body with a real `ForwardemailProvider::new(cfg)`
-/// call, and Task 6 adds iCloud dispatch.
-pub fn build(_cfg: &Config) -> Result<Arc<dyn Provider>, Error> {
-    Err(Error::config(
-        "provider::build is not yet wired up — use the legacy code paths in daemon.rs",
-    ))
+/// Construct the configured provider from a `Config`. Today this only
+/// produces a `ForwardemailProvider` — Task 6 adds iCloud dispatch keyed
+/// off whichever `[provider.*]` section is present.
+pub fn build(cfg: &Config) -> Result<Arc<dyn Provider>, Error> {
+    Ok(Arc::new(forwardemail::ForwardemailProvider::new(cfg)?))
 }
 
 #[cfg(test)]
