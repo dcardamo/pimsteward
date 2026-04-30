@@ -867,6 +867,26 @@ alias_password_file = "/tmp/p-ns"
     }
 
     #[test]
+    fn example_icloud_config_parses() {
+        // The shipped example must always parse cleanly so users can copy
+        // it as a starting point. Asserts the provider selection and the
+        // default permission shape so a future edit that silently changes
+        // either is caught here.
+        let cfg = Config::load(std::path::Path::new("examples/config-icloud-caldav.toml"))
+            .expect("example iCloud config should parse");
+        assert_eq!(
+            cfg.active_provider_kind().unwrap(),
+            ProviderKind::IcloudCaldav,
+            "example must declare iCloud as the active provider",
+        );
+        assert_eq!(
+            cfg.permissions.calendar.default_access(),
+            Access::Read,
+            "example permissions are flat-read by default; if this changes, update the comment in the example",
+        );
+    }
+
+    #[test]
     fn load_credentials_empty_errors() {
         let dir = tempfile::tempdir().unwrap();
         let u = dir.path().join("user");

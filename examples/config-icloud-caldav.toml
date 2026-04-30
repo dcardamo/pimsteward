@@ -1,0 +1,60 @@
+# pimsteward — iCloud CalDAV daemon (calendars only).
+#
+# Run ONE pimsteward daemon dedicated to backing up and mediating an
+# iCloud calendar account. This does NOT replace the forwardemail daemon
+# — the two run as parallel processes with separate ports, bearer
+# tokens, and git repos.
+#
+# Save credential files OUTSIDE this repository. The .gitignore patterns
+# defend against accidental check-in but the only safe path is to never
+# put secrets under the repo root in the first place.
+
+log_level = "info"
+
+[provider.icloud_caldav]
+# CalDAV discovery root. RFC 6764 well-known walk lands on the user's
+# principal shard (e.g. p07-caldav.icloud.com) automatically.
+discovery_url = "https://caldav.icloud.com/"
+
+# Apple ID email — CalDAV basic-auth username.
+username_file = "/run/pimsteward-icloud-secrets/icloud-username"
+
+# App-specific password generated at https://appleid.apple.com.
+# Rotate on suspected compromise. CalDAV basic-auth password.
+password_file = "/run/pimsteward-icloud-secrets/icloud-app-password"
+
+# iCloud rejects empty User-Agent headers with HTTP 403. Keep this set.
+user_agent = "pimsteward (iCloud CalDAV)"
+
+[storage]
+# Distinct from the forwardemail daemon's repo. Each daemon owns its own
+# git tree — backups, restores, and audit logs are per-daemon.
+repo_path = "/var/lib/pimsteward-icloud"
+
+[pull]
+# iCloud doesn't publish a CalDAV rate limit. 5 minutes is conservative.
+calendar_interval_seconds = 300
+
+# mail_interval_seconds, contacts_interval_seconds, and
+# sieve_interval_seconds MUST NOT be set here. The iCloud provider does
+# not support those resources, and config load rejects unknown keys at
+# the [pull] level via the active provider's capability matrix.
+
+[permissions]
+# Only `calendar` is supported by the iCloud provider. Setting `email`,
+# `contacts`, `sieve`, or `email_send` here causes the daemon to refuse
+# to start with a clear capability-mismatch error at startup.
+#
+# Use the flat form for read or read_write across all iCloud calendars,
+# or the scoped per-calendar-id form below to lock specific calendars
+# down. iCloud calendar IDs are full URLs returned by discovery, e.g.
+# https://p07-caldav.icloud.com/<principal>/calendars/<uuid>/
+calendar = "read"
+
+# Example scoped form (uncomment and adjust):
+#
+# [permissions.calendar]
+# default = "read"
+# [permissions.calendar.by_id]
+# "https://p07-caldav.icloud.com/<principal>/calendars/<work-uuid>/"   = "read_write"
+# "https://p07-caldav.icloud.com/<principal>/calendars/<family-uuid>/" = "read"
