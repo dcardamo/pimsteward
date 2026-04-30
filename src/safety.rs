@@ -119,6 +119,75 @@ pub fn assert_test_environment(alias: &str, repo_path: &std::path::Path) {
     }
 }
 
+/// Marker that must appear in a calendar's displayname for it to be
+/// considered safe for live iCloud e2e tests.
+pub const ICLOUD_TEST_CALENDAR_MARKER: &str = "_test";
+
+/// Defense-in-depth guard for iCloud CalDAV tests. Panics immediately on
+/// any failure — silent return is a footgun.
+///
+/// Required:
+/// - `displayname` contains `_test` (case-sensitive, mirrors
+///   [`assert_test_alias`])
+/// - `repo_path` is NOT under `/var/lib/pimsteward*` (string prefix —
+///   covers `pimsteward`, `pimsteward-icloud`, etc.) or `/data/Backups/`
+///
+/// Optional:
+/// - If env var `PIMSTEWARD_TEST_ICLOUD_CALENDAR_URL_ALLOW` is set
+///   (comma-separated URLs), `calendar_url` must be one of them. If
+///   unset, the URL is not pre-restricted — the displayname marker is
+///   the primary gate.
+///
+/// Recommended setup: create a calendar named `pimsteward_test` in your
+/// iCloud account, generate an app-specific password, and run
+/// `cargo nextest run --run-ignored all -- icloud_e2e` with
+/// `PIMSTEWARD_RUN_E2E_ICLOUD` set. See CONTRIBUTING.md.
+pub fn assert_icloud_test_calendar(
+    calendar_url: &str,
+    displayname: &str,
+    repo_path: &std::path::Path,
+) {
+    if !displayname.contains(ICLOUD_TEST_CALENDAR_MARKER) {
+        panic!(
+            "SAFETY GUARD TRIPPED: REFUSING to run iCloud test against calendar \
+             {displayname:?} (url {calendar_url}). Calendar displayname must contain \
+             '{ICLOUD_TEST_CALENDAR_MARKER}' (e.g. 'pimsteward_test'). This check \
+             cannot be bypassed — if you need to run e2e tests, create a dedicated \
+             test calendar in your iCloud account."
+        );
+    }
+
+    // String-prefix match (not Path::starts_with) so that
+    // `/var/lib/pimsteward-icloud` is also rejected, not only the
+    // exact-component `/var/lib/pimsteward` directory. Path-check runs
+    // before the optional URL-allowlist check so production paths are
+    // refused regardless of allowlist state.
+    let s = repo_path.to_string_lossy();
+    const FORBIDDEN_REPO_PREFIXES: &[&str] = &["/var/lib/pimsteward", "/data/Backups/"];
+    for prefix in FORBIDDEN_REPO_PREFIXES {
+        if s.starts_with(prefix) {
+            panic!(
+                "SAFETY GUARD TRIPPED: REFUSING to run iCloud test against repo path \
+                 {s} — production paths are forbidden (prefix {prefix:?}). Use \
+                 `tempfile::tempdir()` in tests."
+            );
+        }
+    }
+
+    if let Ok(allow) = std::env::var("PIMSTEWARD_TEST_ICLOUD_CALENDAR_URL_ALLOW") {
+        let allowed: std::collections::HashSet<&str> =
+            allow.split(',').map(str::trim).collect();
+        if !allowed.contains(calendar_url) {
+            panic!(
+                "SAFETY GUARD TRIPPED: REFUSING to run iCloud test against \
+                 {calendar_url} — not in PIMSTEWARD_TEST_ICLOUD_CALENDAR_URL_ALLOW \
+                 ({allow:?}). Either add the URL to the allowlist or unset the env \
+                 var to disable URL pre-restriction."
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +290,121 @@ mod tests {
     fn repo_path_under_tmp_allowed() {
         let p = std::path::Path::new("/tmp/pimsteward-e2e-test");
         assert_test_environment("dotfiles_mcp_test@purpose.dev", p);
+    }
+
+    // --- iCloud test-calendar guard ---
+    //
+    // Every iCloud-guard test below mutates (or reads) the
+    // PIMSTEWARD_TEST_ICLOUD_CALENDAR_URL_ALLOW env var, which is
+    // process-global. We serialize them with a static Mutex so they don't
+    // contaminate each other under cargo's parallel test runner. Each
+    // test also clears the env var on entry so a leaked value from
+    // another test crate (or the shell) cannot affect the assertion.
+
+    use std::sync::Mutex;
+    static ICLOUD_ENV_LOCK: Mutex<()> = Mutex::new(());
+    const ALLOW_KEY: &str = "PIMSTEWARD_TEST_ICLOUD_CALENDAR_URL_ALLOW";
+
+    /// Acquire the env-var lock and clear the allowlist var. Returns the
+    /// guard so the caller holds the lock for the duration of the test.
+    /// Poisoned-mutex case is benign here — we don't care about prior
+    /// state, we always reset.
+    fn icloud_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = ICLOUD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(ALLOW_KEY);
+        }
+        guard
+    }
+
+    #[test]
+    fn allows_icloud_test_calendar() {
+        let _g = icloud_test_guard();
+        let td = tempfile::tempdir().unwrap();
+        assert_icloud_test_calendar(
+            "https://p07-caldav.icloud.com/123/calendars/abc/",
+            "pimsteward_test",
+            td.path(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "displayname must contain '_test'")]
+    fn rejects_icloud_calendar_without_test_marker() {
+        let _g = icloud_test_guard();
+        let td = tempfile::tempdir().unwrap();
+        assert_icloud_test_calendar(
+            "https://p07-caldav.icloud.com/123/calendars/abc/",
+            "Personal",
+            td.path(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "production paths are forbidden")]
+    fn rejects_icloud_test_against_production_pimsteward_repo() {
+        let _g = icloud_test_guard();
+        assert_icloud_test_calendar(
+            "https://p07-caldav.icloud.com/123/calendars/abc/",
+            "pimsteward_test",
+            std::path::Path::new("/var/lib/pimsteward-icloud"),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "production paths are forbidden")]
+    fn rejects_icloud_test_against_production_data_backups_repo() {
+        let _g = icloud_test_guard();
+        assert_icloud_test_calendar(
+            "https://p07-caldav.icloud.com/123/calendars/abc/",
+            "pimsteward_test",
+            std::path::Path::new("/data/Backups/pimsteward-icloud"),
+        );
+    }
+
+    #[test]
+    fn allowlist_match_passes() {
+        let _g = icloud_test_guard();
+        let td = tempfile::tempdir().unwrap();
+        let url = "https://p07-caldav.icloud.com/123/calendars/abc/";
+        unsafe {
+            std::env::set_var(ALLOW_KEY, url);
+        }
+        let result = std::panic::catch_unwind(|| {
+            assert_icloud_test_calendar(url, "pimsteward_test", td.path());
+        });
+        unsafe {
+            std::env::remove_var(ALLOW_KEY);
+        }
+        result.expect("URL on allowlist should pass");
+    }
+
+    #[test]
+    fn allowlist_mismatch_panics() {
+        let _g = icloud_test_guard();
+        let td = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(ALLOW_KEY, "https://other.example/calendars/x/");
+        }
+        let result = std::panic::catch_unwind(|| {
+            assert_icloud_test_calendar(
+                "https://p07-caldav.icloud.com/123/calendars/abc/",
+                "pimsteward_test",
+                td.path(),
+            );
+        });
+        unsafe {
+            std::env::remove_var(ALLOW_KEY);
+        }
+        let err = result.expect_err("expected panic when URL not in allowlist");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("not in PIMSTEWARD_TEST_ICLOUD_CALENDAR_URL_ALLOW"),
+            "got: {msg}"
+        );
     }
 }
