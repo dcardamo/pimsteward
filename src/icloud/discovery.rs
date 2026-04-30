@@ -189,12 +189,21 @@ fn local_name(name: &[u8]) -> String {
 /// Extract the first non-empty `<href>` text inside a
 /// `<current-user-principal>` element. Returns `None` if the element is
 /// absent.
+//
+// Public for integration tests in `tests/icloud_caldav_test.rs` only —
+// not part of the stable API. Hidden from rustdoc to keep the surface
+// area honest.
+#[doc(hidden)]
 pub fn parse_principal_href(xml: &[u8]) -> Result<Option<String>, Error> {
     parse_first_href_inside(xml, "current-user-principal")
 }
 
 /// Extract the first non-empty `<href>` text inside a
 /// `<calendar-home-set>` element.
+//
+// Public for integration tests in `tests/icloud_caldav_test.rs` only —
+// not part of the stable API.
+#[doc(hidden)]
 pub fn parse_calendar_home_set_href(xml: &[u8]) -> Result<Option<String>, Error> {
     parse_first_href_inside(xml, "calendar-home-set")
 }
@@ -246,6 +255,10 @@ fn parse_first_href_inside(xml: &[u8], parent: &str) -> Result<Option<String>, E
 /// Parse a calendar-list multistatus response into discovered calendars.
 /// Resolves relative hrefs against `request_url`. Filters out collections
 /// that are not calendars and calendars whose component set lacks VEVENT.
+//
+// Public for integration tests in `tests/icloud_caldav_test.rs` only —
+// not part of the stable API.
+#[doc(hidden)]
 pub fn parse_calendar_list(
     xml: &[u8],
     request_url: &Url,
@@ -349,6 +362,13 @@ pub fn parse_calendar_list(
                         }
                         "response" => {
                             if let Some(p) = current.take() {
+                                // iCloud sends <supported-calendar-component-set>
+                                // for every real calendar; treat its absence as
+                                // "not a user-facing event calendar" rather than
+                                // RFC 4791 §5.2.3's strict "absent = all
+                                // components". This catches inbox/outbox-style
+                                // collections that show <C:calendar/> in
+                                // resourcetype but aren't event calendars.
                                 if p.is_calendar
                                     && !p.href.is_empty()
                                     && p.components.iter().any(|c| c.eq_ignore_ascii_case("VEVENT"))
