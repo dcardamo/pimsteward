@@ -77,11 +77,49 @@ fn is_cancelled(ev: &crate::forwardemail::calendar::CalendarEvent) -> bool {
 }
 
 /// Parse an ISO-8601 / RFC-3339 datetime, accepting both `Z` and
-/// `±HH:MM` offsets. Returns `None` on any parse failure.
+/// `±HH:MM` offsets. Also accepts the raw iCalendar value-portion forms
+/// the iCloud CalDAV path stores verbatim:
+///
+///   - `YYYYMMDD` (RFC 5545 §3.3.4 `DATE`) — treated as UTC midnight.
+///   - `YYYYMMDDTHHMMSS` (§3.3.5 `DATE-TIME`, floating local time) —
+///     treated as UTC. The iCal extractor drops the `TZID=` parameter
+///     on the floor (see `icloud::caldav::build_event_from_ical`), so
+///     by the time the value reaches us we have no zone to recover.
+///     UTC is the same convention iCloud's own server-side filter uses
+///     when no `TZID=` is present, and it's good enough for the
+///     today-sized windows callers actually pass — events at the
+///     midnight edge can land in either day, but missing the whole
+///     month (the previous behaviour: any non-RFC-3339 string returned
+///     `None`, so events were silently excluded from every window
+///     filter on iCloud) is strictly worse.
+///   - `YYYYMMDDTHHMMSSZ` (§3.3.5 `DATE-TIME`, UTC) — treated as UTC.
+///
+/// Returns `None` on any parse failure.
 fn parse_iso_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    let s = s.trim();
+    // iCal `DATE` — 8 digits.
+    if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+        let d = chrono::NaiveDate::parse_from_str(s, "%Y%m%d").ok()?;
+        let ndt = d.and_hms_opt(0, 0, 0)?;
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            ndt,
+            chrono::Utc,
+        ));
+    }
+    // iCal `DATE-TIME` — `YYYYMMDDTHHMMSS` (floating) or with trailing
+    // `Z` (UTC). Both shapes map to UTC for window comparison; see the
+    // function-level note on the floating case.
+    let body = s.strip_suffix('Z').unwrap_or(s);
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(body, "%Y%m%dT%H%M%S") {
+        return Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ));
+    }
+    None
 }
 
 /// True if the event's `[start_date, end_date)` interval overlaps the
@@ -3244,7 +3282,73 @@ mod tests {
         assert!(parse_iso_dt("2026-04-29T14:00:00-04:00").is_some());
         assert!(parse_iso_dt("2026-04-29T14:00:00.123-04:00").is_some());
         assert!(parse_iso_dt("not a date").is_none());
+        // RFC-3339 date-only (with dashes) still rejected — kept narrow on
+        // purpose so a malformed RFC-3339 timestamp doesn't silently land
+        // at midnight UTC. The iCal `DATE` form below is opt-in by virtue
+        // of the no-dash shape.
         assert!(parse_iso_dt("2026-04-29").is_none());
+    }
+
+    #[test]
+    fn parse_iso_dt_accepts_ical_date_and_datetime() {
+        // `DATE` form (RFC 5545 §3.3.4) — 8 digits, treated as UTC midnight.
+        let d = parse_iso_dt("20260429").expect("date-only iCal must parse");
+        assert_eq!(d.to_rfc3339(), "2026-04-29T00:00:00+00:00");
+
+        // `DATE-TIME` UTC form (§3.3.5 with trailing Z).
+        let dt_z = parse_iso_dt("20260429T180000Z").expect("Z form must parse");
+        assert_eq!(dt_z.to_rfc3339(), "2026-04-29T18:00:00+00:00");
+
+        // `DATE-TIME` floating form — TZID was already dropped upstream so
+        // we have no zone; treated as UTC for window comparison.
+        let dt_float = parse_iso_dt("20260429T180000").expect("floating must parse");
+        assert_eq!(dt_float.to_rfc3339(), "2026-04-29T18:00:00+00:00");
+
+        // Wrong length / non-digits / wrong shape — None.
+        assert!(parse_iso_dt("2026042").is_none());
+        assert!(parse_iso_dt("2026042X").is_none());
+        // chrono's %H%M%S accepts variable widths, but the basic-format
+        // numeric-offset shape (`+0400` rather than `+04:00`) and
+        // arbitrary trailing junk after the seconds field are rejected.
+        assert!(parse_iso_dt("20260429T180000+0400").is_none());
+        assert!(parse_iso_dt("20260429T180000garbage").is_none());
+    }
+
+    #[test]
+    fn event_in_window_filters_ical_format_dates() {
+        // The iCloud provider stores DTSTART/DTEND as the raw iCal
+        // value-portion (`20260430T120000` / `20260430Z` / `20260430`).
+        // Before the parse_iso_dt extension, every iCloud event was
+        // silently dropped from any filtered list_events response —
+        // because parse_from_rfc3339 rejected the no-dash shape.
+        let ws = Some(dt("2026-04-30T00:00:00-04:00"));
+        let we = Some(dt("2026-05-01T00:00:00-04:00"));
+
+        // Multi-day all-day event spanning today — `Pool opening` shape.
+        assert!(event_in_window(
+            &ev(Some("20260430"), Some("20260501")),
+            ws, we,
+        ));
+        // Single-day all-day event before today.
+        assert!(!event_in_window(
+            &ev(Some("20260415"), Some("20260416")),
+            ws, we,
+        ));
+        // DATE-TIME floating local form, today.
+        assert!(event_in_window(
+            &ev(Some("20260430T120000"), Some("20260430T130000")),
+            ws, we,
+        ));
+        // DATE-TIME UTC form, today.
+        assert!(event_in_window(
+            &ev(Some("20260430T160000Z"), Some("20260430T170000Z")),
+            ws, we,
+        ));
+        // DATE-TIME UTC form, week from now → out.
+        assert!(!event_in_window(
+            &ev(Some("20260507T160000Z"), Some("20260507T170000Z")),
+            ws, we,
+        ));
     }
 
     #[test]
