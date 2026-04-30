@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod forwardemail;
+pub mod icloud;
 pub mod index;
 pub mod mcp;
 pub mod permission;
