@@ -30,6 +30,14 @@ pub enum Error {
     #[error("forwardemail api: HTTP {status}: {message}")]
     Api { status: u16, message: String },
 
+    /// HTTP 412 Precondition Failed. Returned by CalDAV/CardDAV writes when
+    /// the `If-Match` etag no longer matches the server-side resource (or
+    /// `If-None-Match: *` collides with an existing resource). Carries the
+    /// new etag from the response when the server included one, so the
+    /// caller can re-read and retry without an extra round trip.
+    #[error("precondition failed (etag mismatch): server etag = {}", .etag.as_deref().unwrap_or("<none>"))]
+    PreconditionFailed { etag: Option<String> },
+
     /// Permission gate rejected the operation.
     #[error("permission denied: {resource} requires {required:?} but config grants {granted:?}")]
     PermissionDenied {
@@ -66,6 +74,12 @@ impl Error {
     }
     pub fn index(msg: impl Into<String>) -> Self {
         Self::Index(msg.into())
+    }
+    /// Construct a `PreconditionFailed` error. Used by CalDAV writers when
+    /// the server returns 412 — the `etag` (if any) lets callers re-read
+    /// without a second request.
+    pub fn precondition_failed(etag: Option<String>) -> Self {
+        Self::PreconditionFailed { etag }
     }
 }
 
