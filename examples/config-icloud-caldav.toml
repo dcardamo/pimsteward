@@ -35,10 +35,13 @@ repo_path = "/var/lib/pimsteward-icloud"
 # iCloud doesn't publish a CalDAV rate limit. 5 minutes is conservative.
 calendar_interval_seconds = 300
 
+
+
 # mail_interval_seconds, contacts_interval_seconds, and
-# sieve_interval_seconds MUST NOT be set here. The iCloud provider does
-# not support those resources, and config load rejects unknown keys at
-# the [pull] level via the active provider's capability matrix.
+# sieve_interval_seconds are no-ops here — the iCloud provider doesn't
+# spawn pull tasks for resources outside its capability set, so any
+# values are silently ignored. Permissions for those resources, by
+# contrast, are rejected at startup (see [permissions] below).
 
 [permissions]
 # Only `calendar` is supported by the iCloud provider. Setting `email`,
