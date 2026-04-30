@@ -153,8 +153,14 @@ fn parse_sse(body: &str) -> serde_json::Value {
 
 /// Run a full initialize → tools/call(get_permissions) cycle against
 /// `url` with the given bearer token. Returns the `result` field.
+///
+/// The daemon runs MCP in **stateless** mode (see daemon.rs's
+/// `with_stateful_mode(false)` rationale), so there's no `Mcp-Session-Id`
+/// header to track. Each HTTP POST is a self-contained JSON-RPC call.
 async fn get_permissions(url: &str, token: &str) -> serde_json::Value {
     let client = reqwest::Client::new();
+
+    // Initialize. Stateless mode returns plain JSON, no session header.
     let init = client
         .post(url)
         .header("Content-Type", "application/json")
@@ -165,35 +171,14 @@ async fn get_permissions(url: &str, token: &str) -> serde_json::Value {
         .await
         .unwrap();
     assert_eq!(init.status(), 200, "initialize should succeed");
-    let session = init
-        .headers()
-        .get("mcp-session-id")
-        .expect("initialize must return a session id")
-        .to_str()
-        .unwrap()
-        .to_string();
-    // Drain the initialize SSE body so the session is fully established.
     let _ = init.text().await.unwrap();
 
-    // initialized notification
-    client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Mcp-Session-Id", &session)
-        .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
-        .send()
-        .await
-        .unwrap();
-
-    // tools/call get_permissions
+    // tools/call get_permissions — also stateless; no session id needed.
     let resp = client
         .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .header("Authorization", format!("Bearer {token}"))
-        .header("Mcp-Session-Id", &session)
         .body(MCP_GET_PERMISSIONS)
         .send()
         .await

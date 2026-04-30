@@ -873,21 +873,23 @@ async fn cross_resource_isolation_contact_restore_leaves_calendar_alone() {
         !changed.is_empty(),
         "restore should have changed at least one file (contact vcard)"
     );
+    // git returns paths relative to the repo root (no leading slash), so
+    // prefix-match against the resource subtree names directly.
     for path in &changed {
         assert!(
-            path.contains("/contacts/"),
+            path.starts_with("contacts/"),
             "restore diff should only touch contact paths, but changed: {path}"
         );
         assert!(
-            !path.contains("/calendars/"),
+            !path.starts_with("calendars/"),
             "restore diff must not touch calendar paths, but changed: {path}"
         );
         assert!(
-            !path.contains("/sieve/"),
+            !path.starts_with("sieve/"),
             "restore diff must not touch sieve paths, but changed: {path}"
         );
         assert!(
-            !path.contains("/mail/"),
+            !path.starts_with("mail/"),
             "restore diff must not touch mail paths, but changed: {path}"
         );
     }

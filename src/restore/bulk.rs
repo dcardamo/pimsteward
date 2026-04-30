@@ -240,8 +240,12 @@ impl BulkRestoreResult {
 }
 
 fn ls_tree_files(repo: &Repo, sha: &str, prefix: &str) -> Result<Vec<String>, Error> {
+    // git rejects an empty pathspec ("") with a hard error; the documented
+    // "match all paths" syntax is ".". Normalise here so callers can pass
+    // "" as "no prefix" without thinking about git's pathspec rules.
+    let pathspec = if prefix.is_empty() { "." } else { prefix };
     let out = Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", sha, "--", prefix])
+        .args(["ls-tree", "-r", "--name-only", sha, "--", pathspec])
         .current_dir(repo.root())
         .output()
         .map_err(|e| Error::store(format!("git ls-tree: {e}")))?;
