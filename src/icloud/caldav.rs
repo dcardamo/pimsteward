@@ -25,7 +25,6 @@ use crate::source::dav::DavMultistatus;
 use crate::source::traits::CalendarSource;
 use async_trait::async_trait;
 use reqwest::{Client, Method, StatusCode};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -98,7 +97,7 @@ pub struct IcloudCalendarSource {
     /// invalidated by a 4xx). A `tokio::sync::Mutex` is sufficient here:
     /// discovery is rare relative to event reads, and we want exclusive
     /// access during the discovery walk anyway.
-    discovered: Arc<Mutex<Option<Vec<DiscoveredCalendar>>>>,
+    discovered: Mutex<Option<Vec<DiscoveredCalendar>>>,
     client: Client,
 }
 
@@ -122,7 +121,7 @@ impl IcloudCalendarSource {
         let client = creds.build_client()?;
         Ok(Self {
             creds,
-            discovered: Arc::new(Mutex::new(None)),
+            discovered: Mutex::new(None),
             client,
         })
     }
@@ -291,27 +290,52 @@ fn extract_ical_uid(ics: &str) -> Option<String> {
     extract_ical_field(ics, "UID")
 }
 
-/// Pull the first occurrence of a named property out of the first VEVENT
-/// block in an iCalendar blob. Minimal line-by-line parser — does NOT
-/// implement RFC 5545 unfolding or parameter handling, just `KEY:value`
-/// lookups, which is enough for surface-level fields like SUMMARY/UID.
-fn extract_ical_field(ics: &str, field: &str) -> Option<String> {
-    let prefix = format!("{field}:");
-    let mut in_vevent = false;
-    for line in ics.lines() {
-        let l = line.trim();
-        if l.eq_ignore_ascii_case("BEGIN:VEVENT") {
-            in_vevent = true;
-        } else if l.eq_ignore_ascii_case("END:VEVENT") {
-            in_vevent = false;
-        } else if in_vevent {
-            let upper = l.to_ascii_uppercase();
-            if let Some(rest) = upper.strip_prefix(&prefix) {
-                // Use the original (non-uppercased) text for the value
-                // so we don't mangle case.
-                let start = l.len() - rest.len();
-                return Some(l[start..].trim().to_string());
+/// Extract a top-level iCalendar property value from `ical`. Handles
+/// RFC 5545 §3.1 line folding (CRLF or LF followed by space/tab) and
+/// parametered properties (e.g. `SUMMARY;LANGUAGE=en:`). Property name
+/// match is case-insensitive.
+fn extract_ical_field(ical: &str, name: &str) -> Option<String> {
+    // Step 1: unfold (RFC 5545 §3.1). Replace any CRLF + (space|tab) or
+    // bare LF + (space|tab) with empty — folding is purely cosmetic and
+    // the rest of the parser wants a single logical line per property.
+    let unfolded: String = {
+        let mut out = String::with_capacity(ical.len());
+        let mut chars = ical.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next(); // consume \n
+                if matches!(chars.peek(), Some(' ') | Some('\t')) {
+                    chars.next(); // consume continuation space/tab
+                    continue;
+                }
+                out.push('\r');
+                out.push('\n');
+            } else if c == '\n' {
+                if matches!(chars.peek(), Some(' ') | Some('\t')) {
+                    chars.next();
+                    continue;
+                }
+                out.push('\n');
+            } else {
+                out.push(c);
             }
+        }
+        out
+    };
+
+    // Step 2: walk lines. Match property name with optional parameters:
+    // either "NAME:" or "NAME;...:".
+    let upper_name = name.to_ascii_uppercase();
+    for line in unfolded.lines() {
+        // Find the first ':' that ends the property name+params.
+        let Some(colon) = line.find(':') else { continue };
+        let head = &line[..colon];
+        // Property name is `head` up to the first ';' (params delimiter).
+        let prop_name = head.split(';').next().unwrap_or(head);
+        if prop_name.eq_ignore_ascii_case(&upper_name) {
+            // Strip any trailing CR (in case the input had CRLF without
+            // splitting cleanly on `lines()`).
+            return Some(line[colon + 1..].trim_end_matches('\r').to_string());
         }
     }
     None
@@ -509,6 +533,39 @@ mod tests {
     fn extract_ical_uid_from_vevent() {
         let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:abc-123\nSUMMARY:Hi\nEND:VEVENT\nEND:VCALENDAR";
         assert_eq!(extract_ical_uid(ics).as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn extract_ical_field_handles_folded_summary() {
+        let ical = "BEGIN:VEVENT\r\nSUMMARY:This is a long\r\n  summary that wraps\r\nEND:VEVENT\r\n";
+        assert_eq!(
+            extract_ical_field(ical, "SUMMARY"),
+            Some("This is a long summary that wraps".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_ical_field_handles_parametered_property() {
+        let ical = "BEGIN:VEVENT\r\nSUMMARY;LANGUAGE=en:Hi there\r\nEND:VEVENT\r\n";
+        assert_eq!(
+            extract_ical_field(ical, "SUMMARY"),
+            Some("Hi there".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_ical_field_handles_multiple_params() {
+        let ical = "BEGIN:VEVENT\r\nDTSTART;TZID=America/Toronto;VALUE=DATE-TIME:20260501T143000\r\nEND:VEVENT\r\n";
+        assert_eq!(
+            extract_ical_field(ical, "DTSTART"),
+            Some("20260501T143000".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_ical_field_returns_none_when_absent() {
+        let ical = "BEGIN:VEVENT\r\nEND:VEVENT\r\n";
+        assert_eq!(extract_ical_field(ical, "SUMMARY"), None);
     }
 
     #[test]

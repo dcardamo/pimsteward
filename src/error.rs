@@ -26,8 +26,8 @@ pub enum Error {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// The forwardemail API returned a non-2xx with a structured error body.
-    #[error("forwardemail api: HTTP {status}: {message}")]
+    /// An upstream HTTP API returned a non-2xx with a structured error body.
+    #[error("api: HTTP {status}: {message}")]
     Api { status: u16, message: String },
 
     /// HTTP 412 Precondition Failed. Returned by CalDAV/CardDAV writes when
