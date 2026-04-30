@@ -13,9 +13,9 @@
 //! client that cached it will see the familiar identifier.
 
 use crate::error::Error;
-use crate::forwardemail::Client;
 use crate::pull::calendar::pull_calendar;
 use crate::restore::read_git_blob;
+use crate::source::traits::{CalendarSource, CalendarWriter};
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ pub enum CalendarOperation {
 }
 
 pub async fn plan_calendar(
-    client: &Client,
+    source: &dyn CalendarSource,
     repo: &Repo,
     _alias: &str,
     calendar_id: &str,
@@ -56,7 +56,7 @@ pub async fn plan_calendar(
     // Find live event by iCalendar uid (not forwardemail's id field — uid
     // is what the VEVENT UID: property contains and what we use for
     // filenames).
-    let live_events = client.list_calendar_events(Some(calendar_id)).await?;
+    let live_events = source.list_events(Some(calendar_id)).await?;
     let live_event = live_events
         .iter()
         .find(|e| e.uid.as_deref() == Some(event_uid));
@@ -103,8 +103,10 @@ pub async fn plan_calendar(
     Ok((plan, token))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_calendar(
-    client: &Client,
+    writer: &dyn CalendarWriter,
+    source: &dyn CalendarSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
@@ -121,28 +123,32 @@ pub async fn apply_calendar(
     match &plan.operation {
         CalendarOperation::NoOp => return Ok(()),
         CalendarOperation::UpdateIcal { target_ical } => {
+            // For forwardemail, the trait's `uid` is forwardemail's
+            // global eventId — that's what `live_event_id` carries. For
+            // CalDAV-style writers, `live_event_id` should match the
+            // iCalendar UID; the bulk-restore path stores them as the
+            // same string. Restore deliberately overwrites without an
+            // etag (`""`) — the user explicitly asked to roll back.
             let id = plan
                 .live_event_id
                 .as_ref()
                 .ok_or_else(|| Error::config("UpdateIcal op requires live_event_id in plan"))?;
-            client
-                // Restore doesn't carry an etag — the user explicitly
-                // asked to overwrite, so we skip If-Match.
-                .update_calendar_event(id, Some(target_ical), None, None)
+            writer
+                .update_event(&plan.calendar_id, id, target_ical, "")
                 .await?;
         }
         CalendarOperation::Recreate { ical } => {
-            // Preserve the iCalendar UID by passing it as event_id — this
-            // ensures clients that cached the UID continue to see it.
-            client
-                .create_calendar_event(&plan.calendar_id, ical, Some(&plan.event_uid))
+            // Preserve the iCalendar UID — the writer addresses the new
+            // resource by uid, so passing the original UID keeps clients
+            // that cached it pointed at the same identifier.
+            writer
+                .create_event(&plan.calendar_id, &plan.event_uid, ical)
                 .await?;
         }
     }
 
-    let rest_source = crate::source::RestCalendarSource::new(client.clone());
     let _ = pull_calendar(
-        &rest_source,
+        source,
         repo,
         alias,
         &attribution.caller,

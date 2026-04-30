@@ -68,8 +68,11 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     let calendar_id = cal.id.clone();
     let event_uid = format!("bulk_event_{pid}@pimsteward");
     let good_ical = sample_ical(&event_uid, "bulk original");
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     let event = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -137,14 +140,15 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
 
     let bad_ical = sample_ical(&event_uid, "bulk BAD");
     write::calendar::update_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        &calendar_id,
         &event.id,
-        Some(&bad_ical),
-        None,
-        None,
+        &bad_ical,
+        "",
     )
     .await
     .expect("bad event update");
@@ -153,6 +157,7 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     let path_prefix = "".to_string();
     let (plan, token) = restore::bulk::plan_bulk(
         &ctx.client,
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &path_prefix,
@@ -177,6 +182,8 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     let wrong_token = "f".repeat(64);
     let err = restore::bulk::apply_bulk(
         &ctx.client,
+        cal_source.as_ref(),
+        cal_writer.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -189,6 +196,8 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     // Apply with correct token
     let result = restore::bulk::apply_bulk(
         &ctx.client,
+        cal_source.as_ref(),
+        cal_writer.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,

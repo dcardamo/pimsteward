@@ -25,6 +25,7 @@ use crate::restore::{
     calendar::CalendarRestorePlan, contacts::RestorePlan as ContactRestorePlan,
     sieve::SieveRestorePlan,
 };
+use crate::source::traits::{CalendarSource, CalendarWriter};
 use crate::store::Repo;
 use crate::write::audit::Attribution;
 use serde::{Deserialize, Serialize};
@@ -66,8 +67,10 @@ pub(crate) fn validate_path_prefix(prefix: &str) -> Result<(), Error> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn plan_bulk(
     client: &Client,
+    calendar_source: &dyn CalendarSource,
     repo: &Repo,
     alias: &str,
     path_prefix: &str,
@@ -106,7 +109,12 @@ pub async fn plan_bulk(
         // Calendar events: calendars/<cal>/events/<uid>.ics
         if let Some((cal_id, event_uid)) = extract_calendar_event(path, alias) {
             let (plan, _token) = crate::restore::calendar::plan_calendar(
-                client, repo, alias, &cal_id, &event_uid, at_sha,
+                calendar_source,
+                repo,
+                alias,
+                &cal_id,
+                &event_uid,
+                at_sha,
             )
             .await?;
             calendar_events.push(plan);
@@ -140,8 +148,11 @@ pub async fn plan_bulk(
 /// Apply a bulk restore plan. Re-verifies the bulk plan_token AND each
 /// sub-plan's token before executing. On first failure, stops and returns
 /// an error; the audit log reflects whatever succeeded before the failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_bulk(
     client: &Client,
+    calendar_source: &dyn CalendarSource,
+    calendar_writer: &dyn CalendarWriter,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
@@ -193,7 +204,8 @@ pub async fn apply_bulk(
     for sub in &plan.calendar_events {
         let sub_token = crate::restore::plan_token(sub)?;
         match crate::restore::calendar::apply_calendar(
-            client,
+            calendar_writer,
+            calendar_source,
             repo,
             alias,
             attribution,

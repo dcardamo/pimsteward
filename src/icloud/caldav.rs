@@ -481,6 +481,46 @@ impl IcloudCalendarWriter {
     }
 }
 
+// `IcloudCalendarWriter` exposes itself through the unified
+// `CalendarWriter` trait so the MCP layer can dispatch calendar mutations
+// without knowing which provider is active. The mapping is direct: the
+// trait's `calendar_id` parameter is the calendar's collection URL, and
+// `uid` is the iCalendar UID (also the `.ics` filename tail).
+#[async_trait]
+impl crate::source::traits::CalendarWriter for IcloudCalendarWriter {
+    fn tag(&self) -> &'static str {
+        "icloud-caldav-writer"
+    }
+
+    async fn create_event(
+        &self,
+        calendar_id: &str,
+        uid: &str,
+        ical: &str,
+    ) -> Result<String, Error> {
+        IcloudCalendarWriter::create_event(self, calendar_id, uid, ical).await
+    }
+
+    async fn update_event(
+        &self,
+        calendar_id: &str,
+        uid: &str,
+        ical: &str,
+        if_match: &str,
+    ) -> Result<String, Error> {
+        IcloudCalendarWriter::update_event(self, calendar_id, uid, ical, if_match).await
+    }
+
+    async fn delete_event(
+        &self,
+        calendar_id: &str,
+        uid: &str,
+        if_match: &str,
+    ) -> Result<(), Error> {
+        IcloudCalendarWriter::delete_event(self, calendar_id, uid, if_match).await
+    }
+}
+
 /// Pull the `ETag` header off a response, if present and decodable as
 /// UTF-8. CalDAV servers may include or omit ETag on PUT/DELETE — the
 /// caller decides whether the empty case is recoverable.

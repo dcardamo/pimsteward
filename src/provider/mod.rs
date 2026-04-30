@@ -10,11 +10,12 @@
 
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::config::{Config, ProviderKind};
 use crate::error::Error;
-use crate::source::{CalendarSource, ContactsSource, MailSource, MailWriter};
+use crate::source::{CalendarSource, CalendarWriter, ContactsSource, MailSource, MailWriter};
 
 pub mod forwardemail;
+pub mod icloud_caldav;
 
 /// Resource axes a provider may support. Distinct from
 /// [`crate::permission::Resource`] — that enum gates user-granted access on
@@ -115,14 +116,22 @@ pub trait Provider: Send + Sync {
     fn build_mail_source(&self) -> Result<Option<Arc<dyn MailSource>>, Error>;
     fn build_mail_writer(&self) -> Result<Option<Arc<dyn MailWriter>>, Error>;
     fn build_calendar_source(&self) -> Result<Option<Arc<dyn CalendarSource>>, Error>;
+    fn build_calendar_writer(&self) -> Result<Option<Arc<dyn CalendarWriter>>, Error>;
     fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error>;
 }
 
-/// Construct the configured provider from a `Config`. Today this only
-/// produces a `ForwardemailProvider` — Task 6 adds iCloud dispatch keyed
-/// off whichever `[provider.*]` section is present.
+/// Construct the configured provider from a `Config`. Dispatches on the
+/// `[provider.*]` section that the config selects (or the legacy
+/// top-level `[forwardemail]` shim, which counts as forwardemail).
 pub fn build(cfg: &Config) -> Result<Arc<dyn Provider>, Error> {
-    Ok(Arc::new(forwardemail::ForwardemailProvider::new(cfg)?))
+    match cfg.active_provider_kind()? {
+        ProviderKind::Forwardemail => {
+            Ok(Arc::new(forwardemail::ForwardemailProvider::new(cfg)?))
+        }
+        ProviderKind::IcloudCaldav => {
+            Ok(Arc::new(icloud_caldav::IcloudCaldavProvider::new(cfg)?))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +161,87 @@ mod tests {
         for r in Resource::all() {
             assert!(c.supports(*r), "{:?} should be supported", r);
         }
+    }
+
+    /// Helper: write throwaway credentials and return a Config that
+    /// configures `[provider.forwardemail]` with those file paths.
+    fn forwardemail_config_with_temp_creds(dir: &tempfile::TempDir) -> Config {
+        let u = dir.path().join("u");
+        let p = dir.path().join("p");
+        std::fs::write(&u, "alice@example.com").unwrap();
+        std::fs::write(&p, "passw0rd").unwrap();
+        Config {
+            provider: crate::config::ProviderConfigs {
+                forwardemail: Some(crate::config::ForwardemailConfig {
+                    alias_user_file: Some(u),
+                    alias_password_file: Some(p),
+                    ..crate::config::ForwardemailConfig::default()
+                }),
+                ..crate::config::ProviderConfigs::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    fn icloud_config_with_temp_creds(dir: &tempfile::TempDir) -> Config {
+        let u = dir.path().join("u");
+        let p = dir.path().join("p");
+        std::fs::write(&u, "alice@icloud.com").unwrap();
+        std::fs::write(&p, "app-spec-pass").unwrap();
+        Config {
+            provider: crate::config::ProviderConfigs {
+                icloud_caldav: Some(crate::config::IcloudCaldavConfig {
+                    username_file: Some(u),
+                    password_file: Some(p),
+                    ..crate::config::IcloudCaldavConfig::default()
+                }),
+                ..crate::config::ProviderConfigs::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn build_dispatches_to_forwardemail_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = forwardemail_config_with_temp_creds(&dir);
+        let provider = build(&cfg).expect("build should succeed");
+        assert_eq!(provider.name(), "forwardemail");
+        assert_eq!(provider.capabilities(), Capabilities::forwardemail_full());
+    }
+
+    #[test]
+    fn build_dispatches_to_icloud_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = icloud_config_with_temp_creds(&dir);
+        let provider = build(&cfg).expect("build should succeed");
+        assert_eq!(provider.name(), "icloud_caldav");
+        assert_eq!(provider.capabilities(), Capabilities::calendar_only());
+    }
+
+    #[test]
+    fn build_errors_when_no_provider_configured() {
+        let cfg = Config::default();
+        // `Arc<dyn Provider>` doesn't implement Debug — so we have to
+        // map to () before calling unwrap_err. The error case is what
+        // we actually care about asserting on here.
+        let err = build(&cfg).map(|_| ()).unwrap_err();
+        assert!(err.to_string().contains("no provider"), "{err}");
+    }
+
+    /// iCloud provider must return `Some` for calendar source/writer and
+    /// `None` for mail/contacts. This is the contract the MCP factory's
+    /// require_*/unwrap-or-error gates rely on — flipping any of these
+    /// would either crash the daemon or silently expose unsupported tools.
+    #[test]
+    fn icloud_provider_calendar_present_mail_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = icloud_config_with_temp_creds(&dir);
+        let provider = build(&cfg).unwrap();
+        assert!(provider.build_calendar_source().unwrap().is_some());
+        assert!(provider.build_calendar_writer().unwrap().is_some());
+        assert!(provider.build_mail_source().unwrap().is_none());
+        assert!(provider.build_mail_writer().unwrap().is_none());
+        assert!(provider.build_contacts_source().unwrap().is_none());
     }
 }

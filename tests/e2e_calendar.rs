@@ -56,8 +56,11 @@ async fn calendar_event_create_update_delete_lifecycle() {
     // Create event
     let uid = format!("e2e-event-{pid}@pimsteward");
     let ical_v1 = sample_ical(&uid, "original summary");
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     let created = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -80,14 +83,15 @@ async fn calendar_event_create_update_delete_lifecycle() {
     // Update
     let ical_v2 = sample_ical(&uid, "updated summary");
     write::calendar::update_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        &calendar_id,
         &event_id,
-        Some(&ical_v2),
-        None,
-        None,
+        &ical_v2,
+        "",
     )
     .await
     .expect("update event");
@@ -96,9 +100,18 @@ async fn calendar_event_create_update_delete_lifecycle() {
     assert!(ics2.contains("SUMMARY:updated summary"));
 
     // Delete
-    write::calendar::delete_event(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &event_id)
-        .await
-        .expect("delete event");
+    write::calendar::delete_event(
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &calendar_id,
+        &event_id,
+        "",
+    )
+    .await
+    .expect("delete event");
     assert!(ctx.repo.read_file(&ics_path).is_err());
 
     // Cleanup calendar
@@ -122,10 +135,13 @@ async fn calendar_event_restore_from_history() {
         .expect("create calendar");
     let calendar_id = cal.id.clone();
 
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     let uid = format!("restore-event-{pid}@pimsteward");
     let good_ical = sample_ical(&uid, "good summary");
     let created = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -142,21 +158,22 @@ async fn calendar_event_restore_from_history() {
     // Bad update
     let bad_ical = sample_ical(&uid, "BAD summary");
     write::calendar::update_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        &calendar_id,
         &event_id,
-        Some(&bad_ical),
-        None,
-        None,
+        &bad_ical,
+        "",
     )
     .await
     .expect("bad update");
 
     // Restore dry-run + apply
     let (plan, token) = restore::calendar::plan_calendar(
-        &ctx.client,
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &calendar_id,
@@ -171,7 +188,8 @@ async fn calendar_event_restore_from_history() {
     ));
 
     restore::calendar::apply_calendar(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -215,10 +233,13 @@ async fn calendar_event_restore_recreate_after_delete() {
         .expect("create calendar");
     let calendar_id = cal.id.clone();
 
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     let uid = format!("recreate-event-{pid}@pimsteward");
     let ical = sample_ical(&uid, "to be recreated");
     let created = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -232,13 +253,22 @@ async fn calendar_event_restore_recreate_after_delete() {
     let good_sha = current_head(&ctx.repo);
 
     // Delete the event
-    write::calendar::delete_event(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &event_id)
-        .await
-        .expect("delete");
+    write::calendar::delete_event(
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &calendar_id,
+        &event_id,
+        "",
+    )
+    .await
+    .expect("delete");
 
     // Restore should compute a Recreate operation
     let (plan, token) = restore::calendar::plan_calendar(
-        &ctx.client,
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &calendar_id,
@@ -253,7 +283,8 @@ async fn calendar_event_restore_recreate_after_delete() {
     ));
 
     restore::calendar::apply_calendar(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,

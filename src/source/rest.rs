@@ -166,6 +166,85 @@ impl crate::source::traits::CalendarSource for RestCalendarSource {
     }
 }
 
+// ── Calendar writes via REST ────────────────────────────────────────
+
+/// REST-backed `CalendarWriter`. Wraps `Client::{create,update,delete}_calendar_event`.
+///
+/// Identifier mapping for the trait:
+/// - `calendar_id` is forwardemail's stable calendar id (the `id` field on
+///   the Calendar struct).
+/// - `uid` is forwardemail's per-event eventId. `RestCalendarWriter` passes
+///   the same value to the REST API as the URL `:id` for update/delete and
+///   as the optional `event_id` body field on create — so callers that
+///   pre-allocate a UID (e.g. iCalendar UID round-trip) keep that identity
+///   end-to-end.
+/// - `if_match` is ignored (the forwardemail REST API does not surface
+///   ETags for calendar events). Forwarded as `None` to `update_calendar_event`.
+#[derive(Debug, Clone)]
+pub struct RestCalendarWriter {
+    client: Client,
+}
+
+impl RestCalendarWriter {
+    pub fn new(client: Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl crate::source::traits::CalendarWriter for RestCalendarWriter {
+    fn tag(&self) -> &'static str {
+        "rest-calendar-writer"
+    }
+
+    async fn create_event(
+        &self,
+        calendar_id: &str,
+        uid: &str,
+        ical: &str,
+    ) -> Result<String, Error> {
+        // Pass uid as event_id so callers can preserve a stable iCalendar
+        // UID across recreates (matches the existing
+        // `restore::calendar::apply_calendar` Recreate semantics).
+        let event_id = if uid.is_empty() { None } else { Some(uid) };
+        let created = self
+            .client
+            .create_calendar_event(calendar_id, ical, event_id)
+            .await?;
+        Ok(created.id)
+    }
+
+    async fn update_event(
+        &self,
+        _calendar_id: &str,
+        uid: &str,
+        ical: &str,
+        _if_match: &str,
+    ) -> Result<String, Error> {
+        // forwardemail's REST API addresses events by their global eventId
+        // (carried here as `uid`) rather than (calendar_id, uid) — the
+        // `calendar_id` argument is unused for plain ical updates. See
+        // `update_calendar_event`'s `target_calendar_id` parameter for the
+        // separate "move to a different calendar" surface, which is not
+        // exposed through the trait (move-to-calendar lives on the higher
+        // `mcp/server.rs::update_event` tool).
+        let updated = self
+            .client
+            .update_calendar_event(uid, Some(ical), None, None)
+            .await?;
+        Ok(updated.id)
+    }
+
+    async fn delete_event(
+        &self,
+        _calendar_id: &str,
+        uid: &str,
+        _if_match: &str,
+    ) -> Result<(), Error> {
+        self.client.delete_calendar_event(uid).await
+    }
+}
+
 // ── Contacts via REST ───────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

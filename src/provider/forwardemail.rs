@@ -12,8 +12,9 @@ use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::provider::{Capabilities, Provider};
 use crate::source::{
-    imap::ImapConfig, CalendarSource, ContactsSource, DavCalendarSource, DavContactsSource,
-    ImapMailSource, MailSource, MailWriter, RestCalendarSource, RestContactsSource, RestMailSource,
+    imap::ImapConfig, CalendarSource, CalendarWriter, ContactsSource, DavCalendarSource,
+    DavContactsSource, ImapMailSource, MailSource, MailWriter, RestCalendarSource,
+    RestCalendarWriter, RestContactsSource, RestMailSource,
 };
 
 /// Provider impl for forwardemail.net. Holds a clone of the
@@ -38,6 +39,7 @@ pub struct ForwardemailProvider {
     mail_source: Arc<dyn MailSource>,
     mail_writer: Arc<dyn MailWriter>,
     calendar_source: Arc<dyn CalendarSource>,
+    calendar_writer: Arc<dyn CalendarWriter>,
     contacts_source: Arc<dyn ContactsSource>,
 }
 
@@ -83,6 +85,14 @@ impl ForwardemailProvider {
             )?),
         };
 
+        // Calendar writes always go through the REST API regardless of
+        // `calendar_source`. Mirroring the mail-write story: writes carry
+        // audit attribution and the REST surface (PUT /v1/calendar-events/:id)
+        // is what forwardemail's audit log records — running write through
+        // CalDAV would split the write log between two different code paths.
+        let calendar_writer: Arc<dyn CalendarWriter> =
+            Arc::new(RestCalendarWriter::new(client.clone()));
+
         let contacts_source: Arc<dyn ContactsSource> = match cfg.contacts_source {
             ContactsSourceKind::Rest => Arc::new(RestContactsSource::new(client.clone())),
             ContactsSourceKind::Carddav => Arc::new(DavContactsSource::new(
@@ -101,6 +111,7 @@ impl ForwardemailProvider {
             mail_source,
             mail_writer,
             calendar_source,
+            calendar_writer,
             contacts_source,
         })
     }
@@ -170,6 +181,10 @@ impl Provider for ForwardemailProvider {
 
     fn build_calendar_source(&self) -> Result<Option<Arc<dyn CalendarSource>>, Error> {
         Ok(Some(self.calendar_source.clone()))
+    }
+
+    fn build_calendar_writer(&self) -> Result<Option<Arc<dyn CalendarWriter>>, Error> {
+        Ok(Some(self.calendar_writer.clone()))
     }
 
     fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error> {

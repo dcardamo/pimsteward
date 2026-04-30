@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::mcp::PimstewardServer;
 use crate::permission::{Permissions, Resource};
-use crate::provider::{forwardemail::ForwardemailProvider, Provider};
+use crate::provider::{self, forwardemail::ForwardemailProvider, Provider};
 use crate::pull;
 use crate::source::{
     imap::idle_loop, CalendarSource, ContactsSource, MailSource,
@@ -88,7 +88,7 @@ async fn spawn_mcp_http_listener(
     expected_token: Option<String>,
     cfg: Arc<Config>,
     provider: Arc<dyn Provider>,
-    fe_provider: Arc<ForwardemailProvider>,
+    fe_provider: Option<Arc<ForwardemailProvider>>,
     profile_permissions: Permissions,
     caller: String,
     mail_tx: broadcast::Sender<MailNotification>,
@@ -108,12 +108,13 @@ async fn spawn_mcp_http_listener(
     let perms_for_factory = profile_permissions;
     let caller_for_factory = caller;
     let provider_for_factory = provider.clone();
-    // TODO(provider): Client + ManageSieveConfig are still
-    // forwardemail-specific. They live alongside the typed
-    // Arc<ForwardemailProvider> here so the MCP factory can still
-    // construct the MCP server until the trait grows the relevant
-    // builder methods. A future task will move both behind the
-    // Provider trait. SearchIndex is repo-local and unaffected.
+    // `fe_for_factory` is `None` for providers that don't surface a
+    // forwardemail-style REST client (e.g. iCloud CalDAV). The MCP server
+    // accepts an `Option<Client>` and individual tools gate behind
+    // `require_*` helpers that return a structured "not supported by the
+    // active provider" error if invoked against a provider that lacks
+    // the resource. SearchIndex is repo-local — every daemon gets its
+    // own, regardless of which resources the provider exposes.
     let fe_for_factory = fe_provider.clone();
     let ct_http = ct.clone();
 
@@ -126,33 +127,52 @@ async fn spawn_mcp_http_listener(
                 let provider = provider_for_factory.clone();
                 let fe = fe_for_factory.clone();
                 let alias = provider.alias().to_string();
-                let mail_source = provider
-                    .build_mail_source()
+
+                // Mail / contacts are Optional — the factory tolerates
+                // calendar-only providers like iCloud by passing `None`
+                // through to the MCP server.
+                let mail_source =
+                    provider.build_mail_source().map_err(std::io::Error::other)?;
+                let mail_writer =
+                    provider.build_mail_writer().map_err(std::io::Error::other)?;
+                let contacts_source =
+                    provider.build_contacts_source().map_err(std::io::Error::other)?;
+
+                // Calendar source + writer are required: every provider
+                // pimsteward supports today exposes calendar. Unwrap loudly
+                // — a `None` here is a provider-impl bug, not a config issue.
+                let calendar_source = provider
+                    .build_calendar_source()
                     .map_err(std::io::Error::other)?
                     .ok_or_else(|| {
-                        std::io::Error::other(
-                            "provider returned no mail source for MCP factory",
-                        )
+                        std::io::Error::other("provider returned no calendar source for MCP factory")
                     })?;
-                let mail_writer = provider
-                    .build_mail_writer()
+                let calendar_writer = provider
+                    .build_calendar_writer()
                     .map_err(std::io::Error::other)?
                     .ok_or_else(|| {
-                        std::io::Error::other(
-                            "provider returned no mail writer for MCP factory",
-                        )
+                        std::io::Error::other("provider returned no calendar writer for MCP factory")
                     })?;
-                let client = fe.client().clone();
-                let user = fe.user();
-                let pass = fe.password();
+
+                // Client + ManageSieve config are forwardemail-specific.
+                // For the iCloud provider they're absent; mail/sieve tools
+                // that need them return "unsupported by provider" at call
+                // time.
+                let (client, managesieve) = match fe.as_ref() {
+                    Some(fe) => (
+                        Some(fe.client().clone()),
+                        Some(crate::mcp::ManageSieveConfig {
+                            host: cfg.forwardemail.managesieve_host.clone(),
+                            port: cfg.forwardemail.managesieve_port,
+                            user: fe.user().to_string(),
+                            password: fe.password().to_string(),
+                        }),
+                    ),
+                    None => (None, None),
+                };
+
                 let repo =
                     Repo::open_or_init(&cfg.storage.repo_path).map_err(std::io::Error::other)?;
-                let managesieve = crate::mcp::ManageSieveConfig {
-                    host: cfg.forwardemail.managesieve_host.clone(),
-                    port: cfg.forwardemail.managesieve_port,
-                    user: user.to_string(),
-                    password: pass.to_string(),
-                };
                 let search_index = Arc::new(
                     crate::index::SearchIndex::open(repo.root())
                         .map_err(std::io::Error::other)?,
@@ -165,6 +185,9 @@ async fn spawn_mcp_http_listener(
                     caller,
                     mail_source,
                     mail_writer,
+                    contacts_source,
+                    calendar_source,
+                    calendar_writer,
                     managesieve,
                     search_index,
                 ))
@@ -252,17 +275,24 @@ async fn spawn_mcp_http_listener(
 /// Returns when a fatal error occurs or when a shutdown signal is received.
 pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     // Build the provider once. We keep two handles in scope:
-    //   * `fe_provider: Arc<ForwardemailProvider>` for the still-forwardemail-
-    //     specific surfaces (sieve pull's `Client`, IMAP IDLE config, ManageSieve
-    //     config, search index). These will move into the trait in a future
-    //     task.
-    //   * `provider: Arc<dyn Provider>` erased to the trait — used for every
-    //     mail/calendar/contacts source construction in this function and in
-    //     the MCP factory closure.
-    // Doing the type-erasure at construction time avoids `Arc::downcast`
-    // gymnastics (which would otherwise need an `as_any` shim on the trait).
-    let fe_provider = Arc::new(ForwardemailProvider::new(&cfg)?);
-    let provider: Arc<dyn Provider> = fe_provider.clone();
+    //   * `provider: Arc<dyn Provider>` — the type-erased trait object the
+    //     MCP factory and capability-gated pull spawners dispatch through.
+    //   * `fe_provider: Option<Arc<ForwardemailProvider>>` — `Some` when the
+    //     active provider is forwardemail and the daemon needs to spawn
+    //     forwardemail-specific things (sieve pull's REST `Client`, IMAP
+    //     IDLE listener, ManageSieve config). `None` for iCloud and any
+    //     future calendar-only provider.
+    // Dispatch via `provider::build` keys off the [provider.*] section in
+    // config; doing the type-erasure at construction time avoids
+    // `Arc::downcast` gymnastics.
+    let provider: Arc<dyn Provider> = provider::build(&cfg)?;
+    let fe_provider: Option<Arc<ForwardemailProvider>> =
+        match cfg.active_provider_kind()? {
+            crate::config::ProviderKind::Forwardemail => {
+                Some(Arc::new(ForwardemailProvider::new(&cfg)?))
+            }
+            crate::config::ProviderKind::IcloudCaldav => None,
+        };
 
     // Reject configs that grant permissions on resources this provider
     // can't serve — fails the daemon at startup rather than at first
@@ -272,7 +302,6 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
         .validate_against_capabilities(&provider.capabilities())?;
 
     let alias = provider.alias().to_string();
-    let client = fe_provider.client().clone();
     let repo = Arc::new(Repo::open_or_init(&cfg.storage.repo_path)?);
     let cfg = Arc::new(cfg);
 
@@ -297,10 +326,17 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     }
 
     if cfg.permissions.check_read(Resource::Sieve).is_ok() && provider.capabilities().sieve {
+        // Sieve pull is forwardemail-specific (uses the REST `Client`).
+        // Capability-gated above: a non-forwardemail provider returns
+        // `false` for `sieve`, so we never reach the unwrap below.
+        let fe = fe_provider
+            .as_ref()
+            .expect("provider.capabilities().sieve true but no forwardemail provider");
+        let client = fe.client().clone();
         let h = spawn_puller(
             "sieve",
             Duration::from_secs(cfg.pull.sieve_interval_seconds),
-            client.clone(),
+            client,
             repo.clone(),
             alias.clone(),
             |c, r, a| {
@@ -362,9 +398,15 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
             // Notify to wake the puller when new data arrives. The periodic
             // ticker still runs as a safety net: if the IDLE connection dies
             // the puller keeps syncing on its interval.
-            let idle_notify = if fe_provider.imap_idle_enabled() {
+            //
+            // IDLE is forwardemail-only — gated behind the optional fe_provider.
+            let idle_notify = if fe_provider
+                .as_ref()
+                .is_some_and(|fe| fe.imap_idle_enabled())
+            {
+                let fe = fe_provider.as_ref().unwrap();
                 let notify = Arc::new(Notify::new());
-                let idle_cfg = fe_provider.imap_config();
+                let idle_cfg = fe.imap_config();
                 let notify_clone = notify.clone();
                 let span = tracing::info_span!("imap_idle");
                 handles.push(tokio::spawn(

@@ -341,11 +341,14 @@ async fn calendar_restore_isolation_from_new_events() {
         .expect("create calendar");
     let calendar_id = cal.id.clone();
 
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     // 1. Create event A.
     let uid_a = format!("iso-A-{pid}@pimsteward");
     let good_ical_a = sample_ical(&uid_a, "A original");
     let event_a = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -362,14 +365,15 @@ async fn calendar_restore_isolation_from_new_events() {
     // 3. Bad update to A.
     let bad_ical_a = sample_ical(&uid_a, "A BAD");
     write::calendar::update_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        &calendar_id,
         &event_a.id,
-        Some(&bad_ical_a),
-        None,
-        None,
+        &bad_ical_a,
+        "",
     )
     .await
     .expect("bad update A");
@@ -378,7 +382,8 @@ async fn calendar_restore_isolation_from_new_events() {
     let uid_b = format!("iso-B-{pid}@pimsteward");
     let ical_b = sample_ical(&uid_b, "B after snapshot");
     let event_b = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -392,7 +397,8 @@ async fn calendar_restore_isolation_from_new_events() {
     let uid_c = format!("iso-C-{pid}@pimsteward");
     let ical_c = sample_ical(&uid_c, "C after snapshot");
     let event_c = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -405,7 +411,7 @@ async fn calendar_restore_isolation_from_new_events() {
 
     // 5. Restore just A.
     let (plan, token) = restore::calendar::plan_calendar(
-        &ctx.client,
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &calendar_id,
@@ -415,7 +421,8 @@ async fn calendar_restore_isolation_from_new_events() {
     .await
     .expect("plan A");
     restore::calendar::apply_calendar(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -753,8 +760,11 @@ async fn cross_resource_isolation_contact_restore_leaves_calendar_alone() {
         .expect("create calendar");
     let event_uid = format!("xres-event-{pid}@pimsteward");
     let event_ical = sample_ical(&event_uid, "calendar survives");
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     let event = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -788,14 +798,15 @@ async fn cross_resource_isolation_contact_restore_leaves_calendar_alone() {
     // resource-type boundary, not just the item boundary.
     let event_ical_v2 = sample_ical(&event_uid, "updated post-snapshot");
     write::calendar::update_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        &cal.id,
         &event.id,
-        Some(&event_ical_v2),
-        None,
-        None,
+        &event_ical_v2,
+        "",
     )
     .await
     .expect("post-snapshot event update");
@@ -1169,8 +1180,11 @@ async fn calendar_restore_rejects_wrong_token() {
         .expect("create cal");
     let uid = format!("tok-event-{pid}@pimsteward");
     let ical = sample_ical(&uid, "v1");
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     let event = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -1182,20 +1196,21 @@ async fn calendar_restore_rejects_wrong_token() {
     .expect("create event");
     let good_sha = current_head(&ctx.repo);
     write::calendar::update_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
+        &cal.id,
         &event.id,
-        Some(&sample_ical(&uid, "v2")),
-        None,
-        None,
+        &sample_ical(&uid, "v2"),
+        "",
     )
     .await
     .expect("bad update");
 
     let (plan, _real_token) = restore::calendar::plan_calendar(
-        &ctx.client,
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &cal.id,
@@ -1206,7 +1221,8 @@ async fn calendar_restore_rejects_wrong_token() {
     .expect("plan");
     let wrong_token = "f".repeat(64);
     let err = restore::calendar::apply_calendar(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -1445,8 +1461,11 @@ async fn bulk_restore_scoped_to_contacts_touches_only_contact_paths() {
         .expect("create calendar");
     let event_uid = format!("bulk-iso-event-{pid}@pimsteward");
     let event_ical = sample_ical(&event_uid, "survivor");
+    let cal_writer = ctx.calendar_writer();
+    let cal_source = ctx.calendar_source();
     let event = write::calendar::create_event(
-        &ctx.client,
+        cal_writer.as_ref(),
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -1495,6 +1514,7 @@ async fn bulk_restore_scoped_to_contacts_touches_only_contact_paths() {
     let contacts_prefix = "contacts/".to_string();
     let (plan, token) = restore::bulk::plan_bulk(
         &ctx.client,
+        cal_source.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &contacts_prefix,
@@ -1519,6 +1539,8 @@ async fn bulk_restore_scoped_to_contacts_touches_only_contact_paths() {
 
     let result = restore::bulk::apply_bulk(
         &ctx.client,
+        cal_source.as_ref(),
+        cal_writer.as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,

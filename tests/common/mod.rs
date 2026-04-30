@@ -8,8 +8,12 @@
 #![allow(dead_code)] // not every test uses every helper
 
 use pimsteward::forwardemail::Client;
+use pimsteward::source::{
+    CalendarSource, CalendarWriter, RestCalendarSource, RestCalendarWriter,
+};
 use pimsteward::store::Repo;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct E2eContext {
     pub client: Client,
@@ -83,6 +87,17 @@ impl E2eContext {
     /// Standard attribution for e2e writes.
     pub fn attribution(&self, reason: &str) -> pimsteward::write::audit::Attribution {
         pimsteward::write::audit::Attribution::new("e2e-test", Some(reason.to_string()))
+    }
+
+    /// REST-backed `CalendarSource` over the test alias's client. Used by
+    /// e2e tests that exercise the trait-based calendar plumbing.
+    pub fn calendar_source(&self) -> Arc<dyn CalendarSource> {
+        Arc::new(RestCalendarSource::new(self.client.clone()))
+    }
+
+    /// REST-backed `CalendarWriter` over the test alias's client.
+    pub fn calendar_writer(&self) -> Arc<dyn CalendarWriter> {
+        Arc::new(RestCalendarWriter::new(self.client.clone()))
     }
 
     /// ManageSieve config for the test alias. Reads the same credentials

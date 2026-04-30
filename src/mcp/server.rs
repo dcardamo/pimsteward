@@ -4,7 +4,7 @@
 
 use crate::forwardemail::Client;
 use crate::index::{FlagFilter, FolderFilter, SearchQuery, SearchResult, Sort};
-use crate::source::{MailSource, MailWriter};
+use crate::source::{CalendarSource, CalendarWriter, ContactsSource, MailSource, MailWriter};
 use crate::permission::{Permissions, Resource, Scope};
 use crate::store::Repo;
 use crate::write::audit::Attribution;
@@ -33,6 +33,22 @@ pub const PERMISSION_DENIED_CODE: ErrorCode = ErrorCode(-32001);
 
 fn perm_denied(msg: impl Into<std::borrow::Cow<'static, str>>) -> McpError {
     McpError::new(PERMISSION_DENIED_CODE, msg, None)
+}
+
+/// Structured error for tools whose backing source/writer is unavailable
+/// because the active provider doesn't support that resource. Returned at
+/// call time by `require_*` helpers — the tool stays in the registered
+/// schema (so `tools/list` lists it for diagnostic visibility), but
+/// invocations against an iCloud-only daemon fail with a clear message
+/// instead of a raw NPE-style internal_error. METHOD_NOT_FOUND is the
+/// closest semantic match in JSON-RPC 2.0 — "you asked me to do something
+/// I don't have a handler for".
+fn unsupported_by_provider() -> McpError {
+    McpError::new(
+        ErrorCode::METHOD_NOT_FOUND,
+        "this tool is not supported by the active provider",
+        None,
+    )
 }
 
 /// Check if a calendar event has STATUS:CANCELLED. Checks the struct field
@@ -177,7 +193,10 @@ pub struct PimstewardServer {
 }
 
 struct Inner {
-    client: Client,
+    /// Forwardemail REST client. `None` for providers that don't expose a
+    /// forwardemail-style REST surface (e.g. iCloud CalDAV). Tools that
+    /// require it gate via [`PimstewardServer::require_client`].
+    client: Option<Client>,
     repo: Repo,
     permissions: Permissions,
     alias: String,
@@ -186,14 +205,22 @@ struct Inner {
     /// startup; defaults to `"ai"` when unset. Lets operators distinguish
     /// multiple assistants talking to the same backup repo in `git log`.
     caller: String,
-    /// Mail read source for post-write refresh. Matches the daemon's read
-    /// source so IDs stay consistent.
-    mail_source: Arc<dyn MailSource>,
-    /// Mail write backend: REST or IMAP, matching the read source.
-    mail_writer: Arc<dyn MailWriter>,
+    /// Mail read source for post-write refresh. `None` on providers that
+    /// don't support mail (iCloud CalDAV).
+    mail_source: Option<Arc<dyn MailSource>>,
+    /// Mail write backend. `None` when the active provider doesn't
+    /// support mail.
+    mail_writer: Option<Arc<dyn MailWriter>>,
+    /// Contacts read source. `None` on calendar-only providers.
+    contacts_source: Option<Arc<dyn ContactsSource>>,
+    /// Calendar read source. Always present — every provider supported
+    /// by pimsteward today exposes calendar.
+    calendar_source: Arc<dyn CalendarSource>,
+    /// Calendar write backend. Always present alongside `calendar_source`.
+    calendar_writer: Arc<dyn CalendarWriter>,
     /// ManageSieve connection info for sieve script activation.
-    /// Forwardemail's REST API treats is_active as read-only.
-    managesieve: ManageSieveConfig,
+    /// Forwardemail-specific; `None` on iCloud.
+    managesieve: Option<ManageSieveConfig>,
     /// Local search index (SQLite + FTS5) backing `search_email`.  See
     /// `crate::index` and `docs/specs/2026-04-20-local-search-index-
     /// design.md` for layout and invariants.
@@ -220,14 +247,17 @@ impl std::fmt::Debug for PimstewardServer {
 impl PimstewardServer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        client: Client,
+        client: Option<Client>,
         repo: Repo,
         permissions: Permissions,
         alias: String,
         caller: String,
-        mail_source: Arc<dyn MailSource>,
-        mail_writer: Arc<dyn MailWriter>,
-        managesieve: ManageSieveConfig,
+        mail_source: Option<Arc<dyn MailSource>>,
+        mail_writer: Option<Arc<dyn MailWriter>>,
+        contacts_source: Option<Arc<dyn ContactsSource>>,
+        calendar_source: Arc<dyn CalendarSource>,
+        calendar_writer: Arc<dyn CalendarWriter>,
+        managesieve: Option<ManageSieveConfig>,
         search_index: Arc<crate::index::SearchIndex>,
     ) -> Self {
         Self {
@@ -239,11 +269,51 @@ impl PimstewardServer {
                 caller,
                 mail_source,
                 mail_writer,
+                contacts_source,
+                calendar_source,
+                calendar_writer,
                 managesieve,
                 search_index,
             }),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Helper: return the forwardemail REST client, or a structured
+    /// "tool not supported by this provider" error. The MCP `call_tool`
+    /// path already filters out tools whose resource is denied; this
+    /// guard catches the orthogonal axis where the provider itself
+    /// doesn't expose the feature.
+    fn require_client(&self) -> Result<&Client, McpError> {
+        self.inner.client.as_ref().ok_or_else(unsupported_by_provider)
+    }
+
+    fn require_mail_source(&self) -> Result<&Arc<dyn MailSource>, McpError> {
+        self.inner
+            .mail_source
+            .as_ref()
+            .ok_or_else(unsupported_by_provider)
+    }
+
+    fn require_mail_writer(&self) -> Result<&Arc<dyn MailWriter>, McpError> {
+        self.inner
+            .mail_writer
+            .as_ref()
+            .ok_or_else(unsupported_by_provider)
+    }
+
+    fn require_contacts_source(&self) -> Result<&Arc<dyn ContactsSource>, McpError> {
+        self.inner
+            .contacts_source
+            .as_ref()
+            .ok_or_else(unsupported_by_provider)
+    }
+
+    fn require_managesieve(&self) -> Result<&ManageSieveConfig, McpError> {
+        self.inner
+            .managesieve
+            .as_ref()
+            .ok_or_else(unsupported_by_provider)
     }
 
     fn check(&self, resource: Resource) -> Result<(), McpError> {
@@ -726,12 +796,22 @@ pub struct CreateEventParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct UpdateEventParams {
-    /// Forwardemail event id from list_events or create_event.
+    /// Event identifier. For forwardemail this is the eventId from
+    /// list_events or create_event; for iCloud CalDAV providers it's the
+    /// iCalendar UID (the `.ics` filename tail).
     pub id: String,
+    /// Calendar this event lives on. Required for CalDAV-style providers
+    /// (the URL is part of the event's address). Optional for forwardemail
+    /// — REST addresses events globally by event id, so the calendar is
+    /// implied.
+    #[serde(default)]
+    pub calendar_id: Option<String>,
     /// New iCalendar text. Replaces the previous ics entirely.
     #[serde(default)]
     pub ical: Option<String>,
-    /// Optionally move the event to a different calendar.
+    /// Optionally move the event to a different calendar. Forwardemail-
+    /// only — iCloud has no equivalent (a move is delete + create at a
+    /// new URL).
     #[serde(default)]
     pub target_calendar_id: Option<String>,
     /// Optimistic concurrency: pass the event's last-known etag (from a
@@ -746,7 +826,19 @@ pub struct UpdateEventParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DeleteEventParams {
+    /// Event identifier. For forwardemail this is the eventId; for iCloud
+    /// CalDAV providers it's the iCalendar UID (the `.ics` filename tail).
     pub id: String,
+    /// Calendar this event lives on. Required for CalDAV-style providers.
+    /// Optional for forwardemail (REST addresses by global event id).
+    #[serde(default)]
+    pub calendar_id: Option<String>,
+    /// Optimistic concurrency: pass the event's last-known etag (from a
+    /// CalDAV-sourced pull) to satisfy iCloud's strict If-Match
+    /// requirement on DELETE. Forwardemail's REST backend ignores this
+    /// field (the API has no per-event etag concept).
+    #[serde(default)]
+    pub if_match: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -974,9 +1066,8 @@ impl PimstewardServer {
     )]
     async fn list_folders(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
         self.check(Resource::Email)?;
-        let folders = self
-            .inner
-            .client
+        let mail_source = self.require_mail_source()?;
+        let folders = mail_source
             .list_folders()
             .await
             .map_err(|e| self.api_error(e))?;
@@ -992,7 +1083,7 @@ impl PimstewardServer {
         self.check(Resource::Calendar)?;
         let cals = self
             .inner
-            .client
+            .calendar_source
             .list_calendars()
             .await
             .map_err(|e| self.api_error(e))?;
@@ -1032,15 +1123,15 @@ impl PimstewardServer {
         };
 
         // Scoped path: caller asked for one calendar. Gate that specific
-        // calendar id and pass it through to forwardemail as a filter.
+        // calendar id and pass it through to the source as a filter.
         if let Some(ref cal_id) = p.calendar_id {
             self.check_scoped(Scope::Calendar {
                 calendar_id: Some(cal_id),
             })?;
             let events = self
                 .inner
-                .client
-                .list_calendar_events(Some(cal_id))
+                .calendar_source
+                .list_events(Some(cal_id))
                 .await
                 .map_err(|e| self.api_error(e))?;
             let mut filtered: Vec<_> = events
@@ -1070,8 +1161,8 @@ impl PimstewardServer {
         }
         let events = self
             .inner
-            .client
-            .list_calendar_events(None)
+            .calendar_source
+            .list_events(None)
             .await
             .map_err(|e| self.api_error(e))?;
         let mut filtered: Vec<_> = events
@@ -1102,9 +1193,8 @@ impl PimstewardServer {
     )]
     async fn list_contacts(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
         self.check(Resource::Contacts)?;
-        let contacts = self
-            .inner
-            .client
+        let source = self.require_contacts_source()?;
+        let contacts = source
             .list_contacts()
             .await
             .map_err(|e| self.api_error(e))?;
@@ -1118,7 +1208,8 @@ impl PimstewardServer {
     )]
     async fn list_sieve_rules(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
         self.check(Resource::Sieve)?;
-        let ms = &self.inner.managesieve;
+        let ms = self.require_managesieve()?;
+        let client = self.require_client()?;
         let active_name = crate::forwardemail::managesieve::get_active_script(
             &ms.host, ms.port, &ms.user, &ms.password,
         )
@@ -1128,9 +1219,7 @@ impl PimstewardServer {
             return Ok("[]".to_string());
         };
 
-        let scripts = self
-            .inner
-            .client
+        let scripts = client
             .list_sieve_scripts()
             .await
             .map_err(|e| self.api_error(e))?;
@@ -1138,9 +1227,7 @@ impl PimstewardServer {
             return Ok("[]".to_string());
         };
 
-        let full = self
-            .inner
-            .client
+        let full = client
             .get_sieve_script(&active.id)
             .await
             .map_err(|e| self.api_error(e))?;
@@ -1161,6 +1248,7 @@ impl PimstewardServer {
         Parameters(p): Parameters<CreateContactParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Contacts)?;
+        let client = self.require_client()?;
         let attr = self.attribution(None, p.reason);
         let emails: Vec<(&str, &str)> = p
             .emails
@@ -1168,7 +1256,7 @@ impl PimstewardServer {
             .map(|e| (e.kind.as_str(), e.value.as_str()))
             .collect();
         let created = crate::write::contacts::create_contact(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1190,10 +1278,11 @@ impl PimstewardServer {
         Parameters(p): Parameters<UpdateContactParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Contacts)?;
+        let client = self.require_client()?;
         let attr = self.attribution(None, p.reason);
         let updated = if let Some(vcard) = p.vcard.as_deref() {
             crate::write::contacts::update_contact_vcard(
-                &self.inner.client,
+                client,
                 &self.inner.repo,
                 &self.inner.alias,
                 &attr,
@@ -1211,7 +1300,7 @@ impl PimstewardServer {
                 )
             })?;
             crate::write::contacts::update_contact_name(
-                &self.inner.client,
+                client,
                 &self.inner.repo,
                 &self.inner.alias,
                 &attr,
@@ -1235,9 +1324,10 @@ impl PimstewardServer {
         Parameters(p): Parameters<DeleteContactParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Contacts)?;
+        let client = self.require_client()?;
         let attr = self.attribution(None, p.reason);
         crate::write::contacts::delete_contact(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1257,13 +1347,15 @@ impl PimstewardServer {
         Parameters(p): Parameters<AddSieveRuleParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Sieve)?;
+        let client = self.require_client()?;
+        let ms = self.require_managesieve()?;
         let attr = self.attribution(None, p.reason);
         let updated = crate::write::sieve::add_sieve_rule(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            &self.inner.managesieve,
+            ms,
             &p.rule,
             p.comment.as_deref(),
         )
@@ -1282,13 +1374,15 @@ impl PimstewardServer {
         Parameters(p): Parameters<RemoveSieveRuleParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Sieve)?;
+        let client = self.require_client()?;
+        let ms = self.require_managesieve()?;
         let attr = self.attribution(None, p.reason);
         let updated = crate::write::sieve::remove_sieve_rule(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            &self.inner.managesieve,
+            ms,
             &p.name,
         )
         .await
@@ -1312,6 +1406,8 @@ impl PimstewardServer {
         self.check_write_scoped(Scope::Email {
             folder: Some(folder),
         })?;
+        let client = self.require_client()?;
+        let mail_source = self.require_mail_source()?;
         let attr = self.attribution(None, p.reason);
         let msg = crate::forwardemail::writes::NewMessage {
             folder: folder.to_string(),
@@ -1325,8 +1421,8 @@ impl PimstewardServer {
             references: vec![],
         };
         let result = crate::write::mail::create_draft(
-            &self.inner.client,
-            self.inner.mail_source.as_ref(),
+            client,
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1354,7 +1450,9 @@ impl PimstewardServer {
             folder: Some(folder),
         })?;
 
-        let from = self.inner.client.alias_user();
+        let client = self.require_client()?;
+        let mail_source = self.require_mail_source()?;
+        let from = client.alias_user();
         let attr = self.attribution(None, p.reason.clone());
 
         // Build RFC822 message with threading headers
@@ -1384,9 +1482,7 @@ impl PimstewardServer {
         let body = p.text.as_deref().unwrap_or("");
         let raw = format!("{headers}{body}");
 
-        let result = self
-            .inner
-            .client
+        let result = client
             .append_raw_message(folder, raw.as_bytes())
             .await
             .map_err(|e| self.api_error(e))?;
@@ -1411,7 +1507,7 @@ impl PimstewardServer {
                 folder, p.subject, p.in_reply_to),
         };
         let _ = crate::write::mail::refresh(
-            self.inner.mail_source.as_ref(),
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1462,6 +1558,8 @@ impl PimstewardServer {
             ));
         }
 
+        let client = self.require_client()?;
+        let mail_source = self.require_mail_source()?;
         let attr = self.attribution(None, Some(p.reason));
         let msg = crate::forwardemail::writes::NewMessage {
             // `folder` is unused by the send path — forwardemail writes
@@ -1478,8 +1576,8 @@ impl PimstewardServer {
             references: p.references,
         };
         let result = crate::write::mail::send_email(
-            &self.inner.client,
-            self.inner.mail_source.as_ref(),
+            client,
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1514,10 +1612,12 @@ impl PimstewardServer {
         self.check_write_scoped(Scope::Email {
             folder: Some(folder),
         })?;
+        let mail_source = self.require_mail_source()?;
+        let mail_writer = self.require_mail_writer()?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::update_flags(
-            self.inner.mail_writer.as_ref(),
-            self.inner.mail_source.as_ref(),
+            mail_writer.as_ref(),
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1550,10 +1650,12 @@ impl PimstewardServer {
         self.check_write_scoped(Scope::Email {
             folder: Some(&p.folder),
         })?;
+        let mail_source = self.require_mail_source()?;
+        let mail_writer = self.require_mail_writer()?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::move_message(
-            self.inner.mail_writer.as_ref(),
-            self.inner.mail_source.as_ref(),
+            mail_writer.as_ref(),
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1579,10 +1681,12 @@ impl PimstewardServer {
         self.check_write_scoped(Scope::Email {
             folder: Some(folder),
         })?;
+        let mail_source = self.require_mail_source()?;
+        let mail_writer = self.require_mail_writer()?;
         let attr = self.attribution(None, p.reason);
         crate::write::mail::delete_message(
-            self.inner.mail_writer.as_ref(),
-            self.inner.mail_source.as_ref(),
+            mail_writer.as_ref(),
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1638,7 +1742,8 @@ impl PimstewardServer {
 
         let attr = self.attribution(None, p.reason);
         let created = crate::write::calendar::create_event(
-            &self.inner.client,
+            self.inner.calendar_writer.as_ref(),
+            self.inner.calendar_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1654,7 +1759,7 @@ impl PimstewardServer {
 
     #[tool(
         name = "update_event",
-        description = "Update a calendar event's iCal payload and/or move it to a different calendar. Either `ical` or `target_calendar_id` (or both) must be provided."
+        description = "Update a calendar event's iCal payload and/or move it to a different calendar. Either `ical` or `target_calendar_id` (or both) must be provided. Cross-calendar moves (`target_calendar_id`) are only supported on providers that expose a forwardemail-style REST surface; calendar-only providers (e.g. iCloud) reject this branch as unsupported."
     )]
     async fn update_event(
         &self,
@@ -1677,16 +1782,73 @@ impl PimstewardServer {
                 None,
             ));
         }
+        let reason_for_msg = p.reason.clone();
         let attr = self.attribution(None, p.reason);
+
+        // Cross-calendar move is forwardemail-specific: REST exposes
+        // `target_calendar_id` on PUT /v1/calendar-events/:id, but CalDAV
+        // has no equivalent (a move is a delete + create at a new URL).
+        // Route this branch through the REST client and the legacy refresh
+        // wrapper; iCloud providers (no client) hit the
+        // unsupported_by_provider gate.
+        if let Some(target) = p.target_calendar_id.as_deref() {
+            let client = self.require_client()?;
+            let updated = client
+                .update_calendar_event(
+                    &p.id,
+                    p.ical.as_deref(),
+                    Some(target),
+                    p.if_match.as_deref(),
+                )
+                .await
+                .map_err(|e| self.api_error(e))?;
+            // Refresh through the configured calendar source (REST or
+            // CalDAV) so the local tree reflects the move.
+            let _ = crate::pull::calendar::pull_calendar(
+                self.inner.calendar_source.as_ref(),
+                &self.inner.repo,
+                &self.inner.alias,
+                &attr.caller,
+                &attr.caller_email,
+            )
+            .await
+            .map_err(|e| self.api_error(e))?;
+            let msg = format!(
+                "calendar: move event {} to {target}\n\nReason: {}",
+                p.id,
+                reason_for_msg.as_deref().unwrap_or("(none)")
+            );
+            let sha = self
+                .inner
+                .repo
+                .commit_all(&attr.caller, &attr.caller_email, &msg)
+                .map_err(|e| self.api_error(e))?;
+            if sha.is_none() {
+                self.inner
+                    .repo
+                    .empty_commit(&attr.caller, &attr.caller_email, &msg)
+                    .map_err(|e| self.api_error(e))?;
+            }
+            return serde_json::to_string_pretty(&updated)
+                .map_err(|e| McpError::internal_error(e.to_string(), None));
+        }
+
+        // ical-only update — dispatched through the trait so iCloud
+        // and forwardemail share the same code path. `calendar_id` is
+        // forwarded as-is: forwardemail's `RestCalendarWriter` ignores it
+        // (REST addresses by global event id), while iCloud needs it as
+        // the calendar URL.
+        let ical = p.ical.expect("checked above");
         let updated = crate::write::calendar::update_event(
-            &self.inner.client,
+            self.inner.calendar_writer.as_ref(),
+            self.inner.calendar_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
+            p.calendar_id.as_deref().unwrap_or(""),
             &p.id,
-            p.ical.as_deref(),
-            p.target_calendar_id.as_deref(),
-            p.if_match.as_deref(),
+            &ical,
+            p.if_match.as_deref().unwrap_or(""),
         )
         .await
         .map_err(|e| self.api_error(e))?;
@@ -1694,7 +1856,10 @@ impl PimstewardServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
-    #[tool(name = "delete_event", description = "Delete a calendar event by id.")]
+    #[tool(
+        name = "delete_event",
+        description = "Delete a calendar event by id. On iCloud, also pass `if_match` (the event's etag) to satisfy CalDAV's optimistic-concurrency requirement; forwardemail ignores it."
+    )]
     async fn delete_event(
         &self,
         Parameters(p): Parameters<DeleteEventParams>,
@@ -1702,11 +1867,14 @@ impl PimstewardServer {
         self.check_write(Resource::Calendar)?;
         let attr = self.attribution(None, p.reason);
         crate::write::calendar::delete_event(
-            &self.inner.client,
+            self.inner.calendar_writer.as_ref(),
+            self.inner.calendar_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
+            p.calendar_id.as_deref().unwrap_or(""),
             &p.id,
+            p.if_match.as_deref().unwrap_or(""),
         )
         .await
         .map_err(|e| self.api_error(e))?;
@@ -1728,8 +1896,9 @@ impl PimstewardServer {
         // before deciding whether to grant write. The matching apply tool
         // still enforces write.
         self.check(Resource::Contacts)?;
+        let client = self.require_client()?;
         let (plan, token) = crate::restore::plan_contact(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &p.contact_uid,
@@ -1755,12 +1924,13 @@ impl PimstewardServer {
         Parameters(p): Parameters<RestoreContactApplyParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Contacts)?;
+        let client = self.require_client()?;
         let plan: crate::restore::RestorePlan = serde_json::from_value(p.plan).map_err(|e| {
             McpError::invalid_params(format!("plan is not a valid RestorePlan: {e}"), None)
         })?;
         let attr = self.attribution(None, p.reason);
         crate::restore::apply_contact(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1788,8 +1958,9 @@ impl PimstewardServer {
     ) -> Result<String, McpError> {
         // Read-only preview; apply enforces write.
         self.check(Resource::Sieve)?;
+        let client = self.require_client()?;
         let (plan, token) = crate::restore::sieve::plan_sieve(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &p.script_name,
@@ -1811,13 +1982,14 @@ impl PimstewardServer {
         Parameters(p): Parameters<RestoreSieveApplyParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Sieve)?;
+        let client = self.require_client()?;
         let plan: crate::restore::sieve::SieveRestorePlan = serde_json::from_value(p.plan)
             .map_err(|e| {
                 McpError::invalid_params(format!("plan is not a SieveRestorePlan: {e}"), None)
             })?;
         let attr = self.attribution(None, p.reason);
         crate::restore::sieve::apply_sieve(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1845,7 +2017,7 @@ impl PimstewardServer {
             calendar_id: Some(&p.calendar_id),
         })?;
         let (plan, token) = crate::restore::calendar::plan_calendar(
-            &self.inner.client,
+            self.inner.calendar_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &p.calendar_id,
@@ -1874,7 +2046,8 @@ impl PimstewardServer {
             })?;
         let attr = self.attribution(None, p.reason);
         crate::restore::calendar::apply_calendar(
-            &self.inner.client,
+            self.inner.calendar_writer.as_ref(),
+            self.inner.calendar_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1905,8 +2078,9 @@ impl PimstewardServer {
         self.check_scoped(Scope::Email {
             folder: Some(&p.folder),
         })?;
+        let client = self.require_client()?;
         let (plan, token) = crate::restore::mail::plan_mail(
-            &self.inner.client,
+            client,
             &self.inner.repo,
             &self.inner.alias,
             &p.folder,
@@ -1953,11 +2127,14 @@ impl PimstewardServer {
                 })?;
             }
         }
+        let client = self.require_client()?;
+        let mail_source = self.require_mail_source()?;
+        let mail_writer = self.require_mail_writer()?;
         let attr = self.attribution(None, p.reason);
         crate::restore::mail::apply_mail(
-            &self.inner.client,
-            self.inner.mail_writer.as_ref(),
-            self.inner.mail_source.as_ref(),
+            client,
+            mail_writer.as_ref(),
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -1988,8 +2165,10 @@ impl PimstewardServer {
         self.check_write(Resource::Sieve)?;
         self.check_write(Resource::Calendar)?;
 
+        let client = self.require_client()?;
         let (plan, token) = crate::restore::bulk::plan_bulk(
-            &self.inner.client,
+            client,
+            self.inner.calendar_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &p.path_prefix,
@@ -2022,9 +2201,12 @@ impl PimstewardServer {
             serde_json::from_value(p.plan).map_err(|e| {
                 McpError::invalid_params(format!("plan is not a BulkRestorePlan: {e}"), None)
             })?;
+        let client = self.require_client()?;
         let attr = self.attribution(None, p.reason);
         let result = crate::restore::bulk::apply_bulk(
-            &self.inner.client,
+            client,
+            self.inner.calendar_source.as_ref(),
+            self.inner.calendar_writer.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
@@ -3716,5 +3898,117 @@ mod tests {
         let (hs, _) = parse_headers(msg);
         assert!(hs.get("authentication-results").is_none());
         assert!(hs.get("arc-authentication-results").is_none());
+    }
+
+    // ── Provider gate (Task 6) ─────────────────────────────────────
+    //
+    // For calendar-only providers like iCloud CalDAV, the MCP server is
+    // constructed with `client: None`, `mail_source: None`, etc. The
+    // require_* helpers must surface a structured "tool not supported"
+    // error rather than crashing or silently accepting the call.
+
+    /// Build a `PimstewardServer` shaped like an iCloud daemon would
+    /// receive from the daemon factory: calendar-only, with empty mail
+    /// and contacts. Uses `IcloudCalendarSource`/`IcloudCalendarWriter`
+    /// constructed against a localhost discovery URL — no network is
+    /// touched in these tests; the source/writer are only ever held as
+    /// `Arc<dyn …>` to satisfy the type invariants.
+    fn icloud_shaped_server() -> PimstewardServer {
+        use crate::icloud::caldav::{IcloudCalendarSource, IcloudCalendarWriter};
+        use crate::permission::{Access, CalendarPermission, EmailPermission, SendPermission};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::store::Repo::open_or_init(dir.path()).unwrap();
+        // Permissions matter for some tests below — grant read on every
+        // resource so the permission gate doesn't intercept the call
+        // before reaching the provider gate. We're testing "permission
+        // OK + provider absent → unsupported" not "permission denied".
+        let perms = Permissions {
+            email: EmailPermission::Flat(Access::ReadWrite),
+            email_send: SendPermission::Allowed,
+            calendar: CalendarPermission::Flat(Access::ReadWrite),
+            contacts: Access::ReadWrite,
+            sieve: Access::ReadWrite,
+        };
+        let calendar_source: Arc<dyn CalendarSource> = Arc::new(
+            IcloudCalendarSource::new(
+                "https://caldav.icloud.com/".into(),
+                "test-ua".into(),
+                "u@example.com".into(),
+                "p".into(),
+            )
+            .unwrap(),
+        );
+        let calendar_writer: Arc<dyn CalendarWriter> = Arc::new(
+            IcloudCalendarWriter::new(
+                "https://caldav.icloud.com/".into(),
+                "test-ua".into(),
+                "u@example.com".into(),
+                "p".into(),
+            )
+            .unwrap(),
+        );
+        let search_index =
+            Arc::new(crate::index::SearchIndex::open(dir.path()).unwrap());
+        // We deliberately leak the tempdir's path by putting the repo
+        // inside it before dropping. SearchIndex is open against the same
+        // path; since we hold an Arc the dir tempdir can drop freely.
+        std::mem::forget(dir);
+        PimstewardServer::new(
+            None,
+            repo,
+            perms,
+            "u-example.com".to_string(),
+            "test".to_string(),
+            None,
+            None,
+            None,
+            calendar_source,
+            calendar_writer,
+            None,
+            search_index,
+        )
+    }
+
+    #[tokio::test]
+    async fn icloud_shaped_server_rejects_list_folders() {
+        let s = icloud_shaped_server();
+        let err = s
+            .list_folders(Parameters(EmptyParams {}))
+            .await
+            .expect_err("must fail without mail_source");
+        let msg = err.message.to_string();
+        assert!(
+            msg.contains("not supported by the active provider"),
+            "{msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn icloud_shaped_server_rejects_list_contacts() {
+        let s = icloud_shaped_server();
+        let err = s
+            .list_contacts(Parameters(EmptyParams {}))
+            .await
+            .expect_err("must fail without contacts_source");
+        let msg = err.message.to_string();
+        assert!(
+            msg.contains("not supported by the active provider"),
+            "{msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn icloud_shaped_server_rejects_list_sieve_rules() {
+        let s = icloud_shaped_server();
+        let err = s
+            .list_sieve_rules(Parameters(EmptyParams {}))
+            .await
+            .expect_err("must fail without managesieve");
+        let msg = err.message.to_string();
+        assert!(
+            msg.contains("not supported by the active provider"),
+            "{msg}",
+        );
     }
 }
