@@ -108,10 +108,12 @@ async fn spawn_mcp_http_listener(
     let perms_for_factory = profile_permissions;
     let caller_for_factory = caller;
     let provider_for_factory = provider.clone();
-    // TODO(provider): Client + ManageSieve config + SearchIndex are still
-    // forwardemail-specific — they live on the concrete provider so we
-    // can construct the MCP server until the trait grows the relevant
-    // builder methods. A future task will move these behind the trait.
+    // TODO(provider): Client + ManageSieveConfig are still
+    // forwardemail-specific. They live alongside the typed
+    // Arc<ForwardemailProvider> here so the MCP factory can still
+    // construct the MCP server until the trait grows the relevant
+    // builder methods. A future task will move both behind the
+    // Provider trait. SearchIndex is repo-local and unaffected.
     let fe_for_factory = fe_provider.clone();
     let ct_http = ct.clone();
 
@@ -141,7 +143,8 @@ async fn spawn_mcp_http_listener(
                         )
                     })?;
                 let client = fe.client().clone();
-                let (user, pass) = fe.credentials();
+                let user = fe.user();
+                let pass = fe.password();
                 let repo =
                     Repo::open_or_init(&cfg.storage.repo_path).map_err(std::io::Error::other)?;
                 let managesieve = crate::mcp::ManageSieveConfig {
@@ -277,6 +280,11 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
                 repo.clone(),
                 alias.clone(),
             ));
+        } else {
+            tracing::warn!(
+                provider = provider.name(),
+                "permission grants Contacts but provider does not support it; ignoring",
+            );
         }
     }
 
@@ -306,6 +314,11 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
                 repo.clone(),
                 alias.clone(),
             ));
+        } else {
+            tracing::warn!(
+                provider = provider.name(),
+                "permission grants Calendar but provider does not support it; ignoring",
+            );
         }
     }
 
@@ -335,43 +348,46 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
 
         // Mail has a dedicated puller because it dispatches on a
         // MailSource trait object, not a concrete Client.
-        let mail_source: Arc<dyn MailSource> = provider
-            .build_mail_source()?
-            .ok_or_else(|| Error::config("provider returned no mail source"))?;
+        if let Some(mail_source) = provider.build_mail_source()? {
+            // If IMAP IDLE is enabled (only meaningful with mail_source=imap),
+            // spawn a dedicated IDLE listener on its own connection and wire a
+            // Notify to wake the puller when new data arrives. The periodic
+            // ticker still runs as a safety net: if the IDLE connection dies
+            // the puller keeps syncing on its interval.
+            let idle_notify = if fe_provider.imap_idle_enabled() {
+                let notify = Arc::new(Notify::new());
+                let idle_cfg = fe_provider.imap_config();
+                let notify_clone = notify.clone();
+                let span = tracing::info_span!("imap_idle");
+                handles.push(tokio::spawn(
+                    async move {
+                        // INBOX is where new mail lands; IDLE there covers the
+                        // overwhelming majority of push-worthy events. Non-INBOX
+                        // changes fall through to the periodic ticker.
+                        idle_loop(idle_cfg, "INBOX".to_string(), notify_clone, None).await;
+                    }
+                    .instrument(span),
+                ));
+                Some(notify)
+            } else {
+                None
+            };
 
-        // If IMAP IDLE is enabled (only meaningful with mail_source=imap),
-        // spawn a dedicated IDLE listener on its own connection and wire a
-        // Notify to wake the puller when new data arrives. The periodic
-        // ticker still runs as a safety net: if the IDLE connection dies
-        // the puller keeps syncing on its interval.
-        let idle_notify = if fe_provider.imap_idle_enabled() {
-            let notify = Arc::new(Notify::new());
-            let idle_cfg = fe_provider.imap_config();
-            let notify_clone = notify.clone();
-            let span = tracing::info_span!("imap_idle");
-            handles.push(tokio::spawn(
-                async move {
-                    // INBOX is where new mail lands; IDLE there covers the
-                    // overwhelming majority of push-worthy events. Non-INBOX
-                    // changes fall through to the periodic ticker.
-                    idle_loop(idle_cfg, "INBOX".to_string(), notify_clone, None).await;
-                }
-                .instrument(span),
-            ));
-            Some(notify)
+            let h = spawn_mail_puller(
+                Duration::from_secs(cfg.pull.mail_interval_seconds),
+                mail_source,
+                repo.clone(),
+                alias.clone(),
+                idle_notify,
+                mail_tx.clone(),
+            );
+            handles.push(h);
         } else {
-            None
-        };
-
-        let h = spawn_mail_puller(
-            Duration::from_secs(cfg.pull.mail_interval_seconds),
-            mail_source,
-            repo.clone(),
-            alias.clone(),
-            idle_notify,
-            mail_tx.clone(),
-        );
-        handles.push(h);
+            tracing::warn!(
+                provider = provider.name(),
+                "permission grants Email but provider does not support it; ignoring",
+            );
+        }
     }
 
     // Weekly git gc timer. Runs `git gc --auto` against the backup repo
