@@ -263,6 +263,14 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     // gymnastics (which would otherwise need an `as_any` shim on the trait).
     let fe_provider = Arc::new(ForwardemailProvider::new(&cfg)?);
     let provider: Arc<dyn Provider> = fe_provider.clone();
+
+    // Reject configs that grant permissions on resources this provider
+    // can't serve — fails the daemon at startup rather than at first
+    // tool call. Pure config bug: better to scream now than to silently
+    // expose a permission key the provider will always refuse.
+    cfg.permissions
+        .validate_against_capabilities(&provider.capabilities())?;
+
     let alias = provider.alias().to_string();
     let client = fe_provider.client().clone();
     let repo = Arc::new(Repo::open_or_init(&cfg.storage.repo_path)?);

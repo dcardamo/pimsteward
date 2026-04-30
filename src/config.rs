@@ -17,6 +17,15 @@ pub struct Config {
     #[serde(default)]
     pub forwardemail: ForwardemailConfig,
 
+    /// Namespaced provider configs. Replaces the legacy top-level
+    /// `[forwardemail]` block — exactly one variant inside this struct
+    /// must be set, validated by [`Config::active_provider_kind`]. The
+    /// legacy `[forwardemail]` block above is still accepted as a
+    /// back-compat shim, and configs that set it count as
+    /// [`ProviderKind::Forwardemail`].
+    #[serde(default)]
+    pub provider: ProviderConfigs,
+
     #[serde(default)]
     pub storage: StorageConfig,
 
@@ -54,6 +63,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             forwardemail: ForwardemailConfig::default(),
+            provider: ProviderConfigs::default(),
             storage: StorageConfig::default(),
             permissions: Permissions::default(),
             pull: PullConfig::default(),
@@ -288,6 +298,62 @@ fn default_api_base() -> String {
     "https://api.forwardemail.net".into()
 }
 
+/// iCloud CalDAV provider configuration. Calendar-only — iCloud's other
+/// resources (mail, contacts) are out of scope for pimsteward today.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IcloudCaldavConfig {
+    /// CalDAV discovery root. Walks `.well-known/caldav` then PROPFINDs
+    /// for the principal URL and `calendar-home-set` per RFC 6764.
+    #[serde(default = "default_icloud_discovery_url")]
+    pub discovery_url: String,
+
+    /// File containing the Apple ID email (CalDAV basic-auth username).
+    pub username_file: Option<PathBuf>,
+
+    /// File containing an Apple-ID app-specific password (CalDAV basic-auth
+    /// password). Generate at appleid.apple.com; rotate on suspected compromise.
+    pub password_file: Option<PathBuf>,
+
+    /// HTTP User-Agent for CalDAV requests. iCloud rejects empty UAs with 403.
+    #[serde(default = "default_icloud_user_agent")]
+    pub user_agent: String,
+}
+
+impl Default for IcloudCaldavConfig {
+    fn default() -> Self {
+        Self {
+            discovery_url: default_icloud_discovery_url(),
+            username_file: None,
+            password_file: None,
+            user_agent: default_icloud_user_agent(),
+        }
+    }
+}
+
+fn default_icloud_discovery_url() -> String {
+    "https://caldav.icloud.com/".into()
+}
+
+fn default_icloud_user_agent() -> String {
+    "pimsteward (iCloud CalDAV)".into()
+}
+
+/// Namespaced provider config holder. Exactly one variant must be set —
+/// validated by [`Config::active_provider_kind`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderConfigs {
+    pub forwardemail: Option<ForwardemailConfig>,
+    pub icloud_caldav: Option<IcloudCaldavConfig>,
+}
+
+/// Which provider this config selects. Determined at startup by
+/// [`Config::active_provider_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    Forwardemail,
+    IcloudCaldav,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     #[serde(default = "default_repo_path")]
@@ -314,16 +380,62 @@ impl Config {
         figment.extract().map_err(|e| Error::config(e.to_string()))
     }
 
-    /// Read alias credentials from the configured files. Returns
-    /// `(alias_user, alias_password)`.
-    pub fn load_credentials(&self) -> Result<(String, String), Error> {
-        let user_path = self
+    /// Determine which provider this config configures. Errors if zero or
+    /// more than one is set.
+    ///
+    /// "Set" here means: a `[provider.*]` section is present, OR (for
+    /// the legacy `[forwardemail]` shim) the user has filled in
+    /// credential file paths. An all-default `ForwardemailConfig` from
+    /// `#[serde(default)]` is treated as "not set" so a config with
+    /// only `[provider.icloud_caldav]` doesn't accidentally trip the
+    /// "both providers configured" guard.
+    pub fn active_provider_kind(&self) -> Result<ProviderKind, Error> {
+        let has_namespaced_fe = self.provider.forwardemail.is_some();
+        let has_namespaced_ic = self.provider.icloud_caldav.is_some();
+        // Legacy top-level [forwardemail] counts only if the user actually
+        // configured credentials; the all-default ForwardemailConfig from
+        // `#[serde(default)]` shouldn't impersonate a real provider.
+        let has_legacy_fe = self.forwardemail.alias_user_file.is_some()
+            || self.forwardemail.alias_password_file.is_some();
+
+        let has_fe = has_namespaced_fe || has_legacy_fe;
+        let has_ic = has_namespaced_ic;
+
+        match (has_fe, has_ic) {
+            (true, true) => Err(Error::config(
+                "config has both forwardemail and icloud_caldav providers; \
+                 exactly one [provider.*] section per daemon is required",
+            )),
+            (true, false) => Ok(ProviderKind::Forwardemail),
+            (false, true) => Ok(ProviderKind::IcloudCaldav),
+            (false, false) => Err(Error::config(
+                "no provider configured: set [provider.forwardemail] or \
+                 [provider.icloud_caldav]",
+            )),
+        }
+    }
+
+    /// Effective ForwardemailConfig — namespaced [provider.forwardemail]
+    /// wins over legacy top-level [forwardemail] when both present, but
+    /// `active_provider_kind` will already have errored in that case.
+    pub fn effective_forwardemail(&self) -> ForwardemailConfig {
+        self.provider
             .forwardemail
+            .clone()
+            .unwrap_or_else(|| self.forwardemail.clone())
+    }
+
+    /// Read alias credentials from the configured files. Returns
+    /// `(alias_user, alias_password)`. Uses [`Self::effective_forwardemail`]
+    /// so a config with only `[provider.forwardemail]` (no legacy top-level
+    /// block) still resolves the right file paths.
+    pub fn load_credentials(&self) -> Result<(String, String), Error> {
+        let fe = self.effective_forwardemail();
+        let user_path = fe
             .alias_user_file
             .as_ref()
             .ok_or_else(|| Error::config("forwardemail.alias_user_file is required"))?;
-        let pass_path = self
-            .forwardemail
+        let pass_path = fe
             .alias_password_file
             .as_ref()
             .ok_or_else(|| Error::config("forwardemail.alias_password_file is required"))?;
@@ -554,6 +666,123 @@ default = "read_write"
             ..p
         };
         assert_eq!(p.caller_name(), "filter-bot");
+    }
+
+    #[test]
+    fn provider_kind_forwardemail_legacy_top_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[forwardemail]
+alias_user_file = "/tmp/u"
+alias_password_file = "/tmp/p"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(
+            cfg.active_provider_kind().unwrap(),
+            ProviderKind::Forwardemail
+        );
+    }
+
+    #[test]
+    fn provider_kind_forwardemail_namespaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.forwardemail]
+alias_user_file = "/tmp/u"
+alias_password_file = "/tmp/p"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(
+            cfg.active_provider_kind().unwrap(),
+            ProviderKind::Forwardemail
+        );
+    }
+
+    #[test]
+    fn provider_kind_icloud_namespaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.icloud_caldav]
+username_file = "/tmp/u"
+password_file = "/tmp/p"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(
+            cfg.active_provider_kind().unwrap(),
+            ProviderKind::IcloudCaldav
+        );
+    }
+
+    #[test]
+    fn provider_kind_both_set_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[forwardemail]
+alias_user_file = "/tmp/u"
+alias_password_file = "/tmp/p"
+
+[provider.icloud_caldav]
+username_file = "/tmp/u"
+password_file = "/tmp/p"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        let err = cfg.active_provider_kind().unwrap_err();
+        assert!(err.to_string().contains("both"), "{}", err);
+    }
+
+    #[test]
+    fn provider_kind_none_set_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, r#"log_level = "info""#).unwrap();
+        let cfg = Config::load(&p).unwrap();
+        let err = cfg.active_provider_kind().unwrap_err();
+        assert!(err.to_string().contains("no provider"), "{}", err);
+    }
+
+    #[test]
+    fn effective_forwardemail_prefers_namespaced() {
+        // Note: in production active_provider_kind would error on this dual
+        // config. The function is called on ProviderKind::Forwardemail paths
+        // only — but assert the precedence anyway as a regression catch.
+        let cfg = Config {
+            forwardemail: ForwardemailConfig {
+                api_base: "https://legacy.example".into(),
+                ..ForwardemailConfig::default()
+            },
+            provider: ProviderConfigs {
+                forwardemail: Some(ForwardemailConfig {
+                    api_base: "https://namespaced.example".into(),
+                    ..ForwardemailConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.effective_forwardemail().api_base,
+            "https://namespaced.example"
+        );
     }
 
     #[test]

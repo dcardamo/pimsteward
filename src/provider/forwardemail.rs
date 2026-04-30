@@ -43,7 +43,9 @@ pub struct ForwardemailProvider {
 
 impl ForwardemailProvider {
     pub fn new(top_cfg: &Config) -> Result<Self, Error> {
-        let cfg = top_cfg.forwardemail.clone();
+        // Prefer the namespaced [provider.forwardemail] block when set;
+        // fall back to the legacy top-level [forwardemail] for back-compat.
+        let cfg = top_cfg.effective_forwardemail();
         let (user, password) = top_cfg.load_credentials()?;
         let alias = user.replace('@', "-");
         let client = Client::new(cfg.api_base.clone(), user.clone(), password.clone())?;

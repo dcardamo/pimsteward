@@ -385,6 +385,77 @@ impl Permissions {
             })
         }
     }
+
+    /// Validate this permission set against a provider's capabilities.
+    /// Errors when a permission positively grants access to a resource
+    /// the provider doesn't support — that combination is a config bug
+    /// the daemon refuses to start with.
+    ///
+    /// Pragmatic note: a permission of `none` / `denied` against an
+    /// unsupported resource is silently allowed (it's a no-op). The
+    /// strict behaviour ("any explicit key is rejected") would require
+    /// distinguishing "user wrote `none`" from "default None", which
+    /// pimsteward's current `Permissions` shape can't do without a
+    /// deeper schema change. The danger this guards against is granting
+    /// something the provider can't fulfil; granting nothing is safe.
+    pub fn validate_against_capabilities(
+        &self,
+        caps: &crate::provider::Capabilities,
+    ) -> Result<(), crate::Error> {
+        let mut bad: Vec<&'static str> = Vec::new();
+
+        // Email — granted if default is non-None or any folder grants non-None.
+        if email_grants_anything(&self.email) && !caps.mail {
+            bad.push("email");
+        }
+        // Calendar — granted if default non-None or any by-id non-None.
+        if calendar_grants_anything(&self.calendar) && !caps.calendar {
+            bad.push("calendar");
+        }
+        // Contacts — flat Access; non-None means a positive grant.
+        if self.contacts != Access::None && !caps.contacts {
+            bad.push("contacts");
+        }
+        // Sieve — same shape as contacts.
+        if self.sieve != Access::None && !caps.sieve {
+            bad.push("sieve");
+        }
+        // Email send — only "Allowed" is a positive grant.
+        if matches!(self.email_send, SendPermission::Allowed) && !caps.email_send {
+            bad.push("email_send");
+        }
+
+        if bad.is_empty() {
+            return Ok(());
+        }
+        Err(crate::Error::config(format!(
+            "provider does not support permission key(s): {} — \
+             remove or set to none/denied",
+            bad.join(", ")
+        )))
+    }
+}
+
+/// True iff this email permission grants anything beyond `None` —
+/// either at the default, or in any per-folder override.
+fn email_grants_anything(p: &EmailPermission) -> bool {
+    match p {
+        EmailPermission::Flat(a) => *a != Access::None,
+        EmailPermission::Scoped(s) => {
+            s.default != Access::None || s.folders.values().any(|a| *a != Access::None)
+        }
+    }
+}
+
+/// True iff this calendar permission grants anything beyond `None` —
+/// either at the default, or in any per-id override.
+fn calendar_grants_anything(p: &CalendarPermission) -> bool {
+    match p {
+        CalendarPermission::Flat(a) => *a != Access::None,
+        CalendarPermission::Scoped(s) => {
+            s.default != Access::None || s.by_id.values().any(|a| *a != Access::None)
+        }
+    }
 }
 
 fn scope_resource(scope: &Scope<'_>) -> Resource {
@@ -747,6 +818,63 @@ by_id = { "cal-abc" = "read_write" }
             Access::Read,
             "unknown cal id falls back to default"
         );
+    }
+
+    // ── Capability validation ─────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_unsupported_keys() {
+        use crate::provider::Capabilities;
+
+        // Email = read, calendar = read_write. Calendar-only provider
+        // should reject email but accept calendar.
+        let p: Permissions = toml::from_str(
+            r#"
+email = "read"
+calendar = "read_write"
+"#,
+        )
+        .unwrap();
+
+        let caps = Capabilities::calendar_only();
+        let err = p.validate_against_capabilities(&caps).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("email"), "expected email rejection, got: {msg}");
+        assert!(
+            !msg.contains("calendar"),
+            "calendar should be allowed: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_passes_when_all_supported() {
+        use crate::provider::Capabilities;
+
+        let p: Permissions = toml::from_str(
+            r#"
+email = "read_write"
+calendar = "read_write"
+contacts = "read"
+sieve = "read"
+email_send = "allowed"
+"#,
+        )
+        .unwrap();
+
+        p.validate_against_capabilities(&Capabilities::forwardemail_full())
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_silently_accepts_default_none() {
+        use crate::provider::Capabilities;
+
+        // No keys set (all default to None / Denied). A calendar-only
+        // provider should accept this — nothing is actually granted, so
+        // there's nothing to refuse.
+        let p: Permissions = toml::from_str("").unwrap();
+        p.validate_against_capabilities(&Capabilities::calendar_only())
+            .unwrap();
     }
 
     #[test]
