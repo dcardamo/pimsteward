@@ -273,39 +273,53 @@ async fn spawn_mcp_http_listener(
     }))
 }
 
+/// Pair of provider handles the daemon keeps in scope: the type-erased
+/// trait object plus an optional forwardemail-specific handle for
+/// resources only the forwardemail provider exposes (sieve REST client,
+/// IMAP IDLE config). Aliased so `build_provider_handles` doesn't trip
+/// `clippy::type_complexity`.
+pub(crate) type ProviderHandles = (Arc<dyn Provider>, Option<Arc<ForwardemailProvider>>);
+
+/// Build the daemon's two provider handles from a `Config`. Extracted
+/// from [`run`] so the construction-once invariant is testable in
+/// isolation (see [`tests::build_provider_handles_for_forwardemail_returns_shared_arc`]).
+///
+/// Returns a [`ProviderHandles`] pair:
+///   * `Arc<dyn Provider>` — the type-erased trait object the MCP factory
+///     and capability-gated pull spawners dispatch through.
+///   * `Option<Arc<ForwardemailProvider>>` — `Some` when the active
+///     provider is forwardemail and the daemon needs forwardemail-specific
+///     handles (sieve pull's REST `Client`, IMAP IDLE listener,
+///     ManageSieve config). `None` for iCloud and any future
+///     calendar-only provider.
+///
+/// Construction-once is load-bearing: `ForwardemailProvider::new`
+/// allocates a fresh REST `Client` each call (with its own connection
+/// pool), and the IMAP variant also pre-builds a per-instance session
+/// cache. The two returned Arcs MUST share the same underlying
+/// `ForwardemailProvider` so capability-routed traits (calendar-writer,
+/// mail-source, …) and forwardemail-only handles (sieve `Client`, IMAP
+/// IDLE config) point at one connection pool. We build the typed Arc
+/// first, then erase to `dyn Provider` — that also avoids
+/// `Arc::downcast` gymnastics.
+pub(crate) fn build_provider_handles(cfg: &Config) -> Result<ProviderHandles, Error> {
+    match cfg.active_provider_kind()? {
+        crate::config::ProviderKind::Forwardemail => {
+            let fe = Arc::new(ForwardemailProvider::new(cfg)?);
+            let dyn_provider: Arc<dyn Provider> = fe.clone();
+            Ok((dyn_provider, Some(fe)))
+        }
+        crate::config::ProviderKind::IcloudCaldav => {
+            let ic: Arc<dyn Provider> = Arc::new(IcloudCaldavProvider::new(cfg)?);
+            Ok((ic, None))
+        }
+    }
+}
+
 /// Run the pull daemon indefinitely, optionally serving MCP over HTTP.
 /// Returns when a fatal error occurs or when a shutdown signal is received.
 pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
-    // Build the provider exactly once and keep two handles in scope:
-    //   * `provider: Arc<dyn Provider>` — the type-erased trait object the
-    //     MCP factory and capability-gated pull spawners dispatch through.
-    //   * `fe_provider: Option<Arc<ForwardemailProvider>>` — `Some` when the
-    //     active provider is forwardemail and the daemon needs to spawn
-    //     forwardemail-specific things (sieve pull's REST `Client`, IMAP
-    //     IDLE listener, ManageSieve config). `None` for iCloud and any
-    //     future calendar-only provider.
-    //
-    // Construction-once is load-bearing: `ForwardemailProvider::new`
-    // allocates a fresh REST `Client` each call (with its own connection
-    // pool), and the IMAP variant also pre-builds a per-instance session
-    // cache. Both `provider` and `fe_provider` MUST share the same
-    // underlying `ForwardemailProvider` so capability-routed traits
-    // (calendar-writer, mail-source, …) and forwardemail-only handles
-    // (sieve `Client`, IMAP IDLE config) point at one connection pool.
-    // We build the typed Arc first, then erase to `dyn Provider` — that
-    // also avoids `Arc::downcast` gymnastics.
-    let (provider, fe_provider): (Arc<dyn Provider>, Option<Arc<ForwardemailProvider>>) =
-        match cfg.active_provider_kind()? {
-            crate::config::ProviderKind::Forwardemail => {
-                let fe = Arc::new(ForwardemailProvider::new(&cfg)?);
-                let dyn_provider: Arc<dyn Provider> = fe.clone();
-                (dyn_provider, Some(fe))
-            }
-            crate::config::ProviderKind::IcloudCaldav => {
-                let ic: Arc<dyn Provider> = Arc::new(IcloudCaldavProvider::new(&cfg)?);
-                (ic, None)
-            }
-        };
+    let (provider, fe_provider) = build_provider_handles(&cfg)?;
 
     // Reject configs that grant permissions on resources this provider
     // can't serve — fails the daemon at startup rather than at first
@@ -841,6 +855,99 @@ mod startup_rebuild_tests {
         std::fs::create_dir_all(root.join("mail/_attachments")).unwrap();
         std::fs::write(root.join("mail/_attachments/xxx"), b"blob").unwrap();
         assert_eq!(count_eml_files(root), 3);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::config::{ForwardemailConfig, ProviderConfigs};
+
+    /// Build a forwardemail-shaped Config with on-disk credential files
+    /// so `ForwardemailProvider::new` succeeds. Mirrors the same pattern
+    /// used by the IMAP-shared-Arc test in `provider/forwardemail.rs`.
+    fn forwardemail_config_with_temp_creds(dir: &tempfile::TempDir) -> Config {
+        let u = dir.path().join("u");
+        let p = dir.path().join("p");
+        std::fs::write(&u, "alice@example.com").unwrap();
+        std::fs::write(&p, "passw0rd").unwrap();
+        Config {
+            provider: ProviderConfigs {
+                forwardemail: Some(ForwardemailConfig {
+                    alias_user_file: Some(u),
+                    alias_password_file: Some(p),
+                    ..ForwardemailConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// Real regression test for the daemon's construct-once invariant.
+    /// Calls `build_provider_handles` (the helper extracted from
+    /// `daemon::run`), then asserts the two returned `Arc`s share one
+    /// allocation. If a future refactor reverts `daemon::run`'s match arm
+    /// to construct via `provider::build` AND `ForwardemailProvider::new`
+    /// separately, the strong_count drops to 1 here and this test fails.
+    /// The previous test in `provider/mod.rs` only exercised `Arc::clone`
+    /// and missed that regression class.
+    #[test]
+    fn build_provider_handles_for_forwardemail_returns_shared_arc() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = forwardemail_config_with_temp_creds(&dir);
+        let (dyn_provider, fe) =
+            build_provider_handles(&cfg).expect("forwardemail config builds cleanly");
+        let fe = fe.expect("forwardemail config returns Some(fe)");
+
+        // Two Arcs, one allocation. If the daemon ever goes back to
+        // double-construction, count drops to 1.
+        assert!(
+            Arc::strong_count(&fe) >= 2,
+            "fe Arc strong_count = {}; expected >= 2 (would be 1 if daemon \
+             construction allocates twice)",
+            Arc::strong_count(&fe),
+        );
+
+        // Drop the dyn_provider; strong_count must drop accordingly,
+        // proving the two Arcs really did share one allocation rather
+        // than independently happening to point at equal data.
+        drop(dyn_provider);
+        assert_eq!(
+            Arc::strong_count(&fe),
+            1,
+            "after dropping dyn_provider, fe must be the only owner",
+        );
+    }
+
+    /// iCloud path: no `fe_provider` returned, and the dyn_provider is
+    /// the only handle to its allocation.
+    #[test]
+    fn build_provider_handles_for_icloud_returns_no_fe() {
+        let dir = tempfile::tempdir().unwrap();
+        let u = dir.path().join("u");
+        let p = dir.path().join("p");
+        std::fs::write(&u, "alice@icloud.com").unwrap();
+        std::fs::write(&p, "app-spec-pass").unwrap();
+        let cfg = Config {
+            provider: ProviderConfigs {
+                icloud_caldav: Some(crate::config::IcloudCaldavConfig {
+                    username_file: Some(u),
+                    password_file: Some(p),
+                    ..crate::config::IcloudCaldavConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+        let (dyn_provider, fe) = build_provider_handles(&cfg).unwrap();
+        assert!(fe.is_none(), "iCloud path must not return an fe handle");
+        assert_eq!(
+            Arc::strong_count(&dyn_provider),
+            1,
+            "iCloud dyn_provider is the only handle"
+        );
     }
 }
 

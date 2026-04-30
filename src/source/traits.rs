@@ -129,12 +129,19 @@ pub trait CalendarSource: Send + Sync {
 /// Returned `CalendarEvent` fields:
 /// - **forwardemail:** the server-normalised response — every derived field
 ///   (`summary`, `start_date`, `end_date`, `created_at`, `updated_at`, …) is
-///   populated by forwardemail's server-side iCal parser.
+///   populated by forwardemail's server-side iCal parser, and
+///   `start_date` / `end_date` are RFC-3339 timestamps.
 /// - **iCloud:** synthesized from the request — `id` is the `.ics` filename
 ///   tail, `etag` is the response ETag header, and `summary`/`location`/
 ///   `status`/`start_date`/`end_date` are parsed out of the caller's iCal.
 ///   `created_at`/`updated_at` are `None` since CalDAV does not expose
-///   server-side timestamps for events.
+///   server-side timestamps for events. **Format difference:**
+///   `start_date` / `end_date` are the raw iCal value-portion
+///   (e.g. `"20270115T100000Z"` or floating `"20270115T100000"`), NOT
+///   RFC-3339 — and any `TZID=…` parameter is stripped, so timezone is
+///   lost on non-UTC events. Consumers that need timezone fidelity must
+///   parse the full `ical` field. This is a documented loss; preserving
+///   TZID would require a full iCalendar grammar.
 #[async_trait]
 pub trait CalendarWriter: Send + Sync {
     fn tag(&self) -> &'static str;

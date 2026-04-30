@@ -314,6 +314,8 @@ VERSION:2.0
 BEGIN:VEVENT
 UID:event-uid
 SUMMARY:Test event
+DTSTART:20270115T100000Z
+DTEND:20270115T110000Z
 END:VEVENT
 END:VCALENDAR</cal:calendar-data>
       </prop>
@@ -427,6 +429,10 @@ async fn caldav_list_events_round_trips() {
     assert_eq!(e.etag.as_deref(), Some("\"etag-1\""));
     assert!(e.ical.as_deref().unwrap().contains("SUMMARY:Test event"));
     assert_eq!(e.summary.as_deref(), Some("Test event"));
+    // Listed events must populate the same derived fields as freshly
+    // created ones — see C1 fix: parse_report used to leave these as None.
+    assert_eq!(e.start_date.as_deref(), Some("20270115T100000Z"));
+    assert_eq!(e.end_date.as_deref(), Some("20270115T110000Z"));
 }
 
 #[tokio::test]

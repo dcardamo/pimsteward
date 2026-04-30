@@ -236,6 +236,12 @@ impl CalendarSource for IcloudCalendarSource {
 ///
 /// `calendar_url` is the URL the REPORT was issued against — it becomes
 /// the event's `calendar_id`.
+///
+/// Defers to [`build_event_from_ical`] for field extraction so the shape
+/// here matches what `IcloudCalendarWriter::create_event` /
+/// `update_event` synthesize from a freshly written event — there is no
+/// `list_events` vs `create_event` asymmetry on derived fields like
+/// `start_date`, `description`, `summary`, etc.
 fn parse_report(xml: &[u8], calendar_url: &str) -> Result<Vec<CalendarEvent>, Error> {
     let ms = DavMultistatus::parse(xml)?;
     let mut out = Vec::with_capacity(ms.responses.len());
@@ -249,27 +255,51 @@ fn parse_report(xml: &[u8], calendar_url: &str) -> Result<Vec<CalendarEvent>, Er
         // If the href has no tail (collection root), fall back to the
         // full href so the id is at least non-empty.
         let id = href_tail(&r.href).unwrap_or_else(|| r.href.clone());
-        let uid = extract_ical_uid(&ical);
-        let summary = extract_ical_field(&ical, "SUMMARY");
-        let location = extract_ical_field(&ical, "LOCATION");
-        let status = extract_ical_field(&ical, "STATUS");
-        out.push(CalendarEvent {
-            id,
-            uid,
-            calendar_id: Some(calendar_url.to_string()),
-            ical: Some(ical),
-            etag: r.etag,
-            summary,
-            description: None,
-            location,
-            start_date: None,
-            end_date: None,
-            status,
-            created_at: None,
-            updated_at: None,
-        });
+        out.push(build_event_from_ical(id, calendar_url, &ical, r.etag, ical.clone()));
     }
     Ok(out)
+}
+
+/// Single source of truth for `CalendarEvent` construction in the iCloud
+/// CalDAV path. Used by both `parse_report` (REPORT-side reads) and
+/// `IcloudCalendarWriter::{create,update}_event` (PUT-side writes) so the
+/// shape is identical no matter which entry point produced the event —
+/// removes the asymmetry where a freshly-created event had `start_date` /
+/// `end_date` populated but a re-listed copy did not.
+///
+/// Note on lossy fields: [`extract_ical_field`] returns the value-portion
+/// only, so parameters like `TZID` are stripped. For typed fields like
+/// `DTSTART;TZID=America/New_York:20270115T100000` the returned
+/// `start_date` is `"20270115T100000"` — the timezone is dropped on the
+/// floor. This is documented loss; preserving TZID requires a real
+/// iCalendar parser. See the trait docs on
+/// [`crate::source::traits::CalendarWriter::create_event`] for the
+/// cross-provider format difference (forwardemail returns RFC-3339 strings
+/// from a server-side parser; iCloud returns the raw iCal value-portion
+/// extracted client-side).
+fn build_event_from_ical(
+    id: String,
+    calendar_url: &str,
+    ical_for_extract: &str,
+    etag: Option<String>,
+    ical_to_store: String,
+) -> CalendarEvent {
+    CalendarEvent {
+        id,
+        uid: extract_ical_uid(ical_for_extract),
+        calendar_id: Some(calendar_url.to_string()),
+        ical: Some(ical_to_store),
+        etag,
+        summary: extract_ical_field(ical_for_extract, "SUMMARY"),
+        description: extract_ical_field(ical_for_extract, "DESCRIPTION"),
+        location: extract_ical_field(ical_for_extract, "LOCATION"),
+        start_date: extract_ical_field(ical_for_extract, "DTSTART"),
+        end_date: extract_ical_field(ical_for_extract, "DTEND"),
+        status: extract_ical_field(ical_for_extract, "STATUS"),
+        // CalDAV does not expose server-side timestamps for events.
+        created_at: None,
+        updated_at: None,
+    }
 }
 
 /// Extract the last path segment of an href, ignoring trailing slashes.
@@ -294,6 +324,14 @@ fn extract_ical_uid(ics: &str) -> Option<String> {
 /// RFC 5545 §3.1 line folding (CRLF or LF followed by space/tab) and
 /// parametered properties (e.g. `SUMMARY;LANGUAGE=en:`). Property name
 /// match is case-insensitive.
+///
+/// **Lossy:** any property parameters (TZID, VALUE, LANGUAGE, …) are
+/// stripped — only the value-portion after the first `:` is returned.
+/// For `DTSTART;TZID=America/New_York:20270115T100000` the return is
+/// `"20270115T100000"` and the timezone is gone. Callers that need
+/// timezone fidelity must parse iCalendar with a real grammar — this
+/// helper exists to surface the most common derived fields cheaply for
+/// the LLM, not to round-trip events losslessly.
 fn extract_ical_field(ical: &str, name: &str) -> Option<String> {
     // Step 1: unfold (RFC 5545 §3.1). Replace any CRLF + (space|tab) or
     // bare LF + (space|tab) with empty — folding is purely cosmetic and
@@ -533,10 +571,16 @@ impl crate::source::traits::CalendarWriter for IcloudCalendarWriter {
 }
 
 /// Build a `CalendarEvent` from a successful CalDAV PUT — caller's iCal +
-/// response etag. Parses the same derived fields (summary, location,
-/// status, start/end) the source-side `parse_report` extracts, so a freshly
+/// response etag. Delegates to [`build_event_from_ical`] so a freshly
 /// created event looks the same to MCP callers as one re-read via
-/// `list_events`.
+/// `list_events`. Adds two PUT-specific touches on top of the shared
+/// helper:
+///
+/// - `id` is constructed from the request `uid` (`<uid>.ics`) since there
+///   is no server response `href` to crack open.
+/// - `uid` falls back to the request argument when `extract_ical_uid`
+///   can't find a UID line in the iCal text — defensive only; well-formed
+///   payloads always have one.
 fn synthesize_event(
     calendar_url: &str,
     uid: &str,
@@ -547,22 +591,15 @@ fn synthesize_event(
     // For iCloud writes the URL is `<calendar_url>/<uid>.ics`, so the tail
     // is exactly `<uid>.ics` — no need to actually parse it.
     let id = format!("{uid}.ics");
-    CalendarEvent {
-        id,
-        uid: extract_ical_uid(ical).or_else(|| Some(uid.to_string())),
-        calendar_id: Some(calendar_url.to_string()),
-        ical: Some(ical.to_string()),
-        etag: if etag.is_empty() { None } else { Some(etag) },
-        summary: extract_ical_field(ical, "SUMMARY"),
-        description: extract_ical_field(ical, "DESCRIPTION"),
-        location: extract_ical_field(ical, "LOCATION"),
-        start_date: extract_ical_field(ical, "DTSTART"),
-        end_date: extract_ical_field(ical, "DTEND"),
-        status: extract_ical_field(ical, "STATUS"),
-        // CalDAV does not expose server-side timestamps for events.
-        created_at: None,
-        updated_at: None,
+    let etag_opt = if etag.is_empty() { None } else { Some(etag) };
+    let mut ev = build_event_from_ical(id, calendar_url, ical, etag_opt, ical.to_string());
+    // Defensive UID fallback: CalDAV requires a UID in every VEVENT, but if
+    // a malformed payload reaches us we still have the argument `uid` to
+    // fall back on so downstream consumers always see *something*.
+    if ev.uid.is_none() {
+        ev.uid = Some(uid.to_string());
     }
+    ev
 }
 
 /// Pull the `ETag` header off a response, if present and decodable as
@@ -680,6 +717,49 @@ END:VCALENDAR</CAL:calendar-data>
         assert_eq!(e.uid.as_deref(), Some("event-uid"));
         assert_eq!(e.calendar_id.as_deref(), Some("https://example/cal/"));
         assert_eq!(e.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(e.summary.as_deref(), Some("Hello"));
+    }
+
+    /// Regression guard for the asymmetry where `parse_report` (the
+    /// REPORT-side read path) used to hard-code `start_date: None` /
+    /// `end_date: None` while `synthesize_event` (the PUT-side write path)
+    /// populated them — same event yielded different shapes depending on
+    /// which tool surfaced it. Both paths now go through
+    /// `build_event_from_ical`; this test pins the listed-event shape.
+    #[test]
+    fn parse_report_populates_start_and_end_dates() {
+        let xml = br#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:" xmlns:CAL="urn:ietf:params:xml:ns:caldav">
+  <D:response>
+    <D:href>/123/calendars/home/event-uid.ics</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getetag>"abc"</D:getetag>
+        <CAL:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:event-uid
+SUMMARY:Hello
+DTSTART:20270115T100000Z
+DTEND:20270115T110000Z
+DESCRIPTION:Notes here
+LOCATION:Room 4
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR</CAL:calendar-data>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+        let events = parse_report(xml, "https://example/cal/").unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.start_date.as_deref(), Some("20270115T100000Z"));
+        assert_eq!(e.end_date.as_deref(), Some("20270115T110000Z"));
+        assert_eq!(e.description.as_deref(), Some("Notes here"));
+        assert_eq!(e.location.as_deref(), Some("Room 4"));
+        assert_eq!(e.status.as_deref(), Some("CONFIRMED"));
         assert_eq!(e.summary.as_deref(), Some("Hello"));
     }
 }

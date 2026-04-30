@@ -12,7 +12,6 @@
 
 use std::sync::Arc;
 
-use crate::config::{Config, ProviderKind};
 use crate::error::Error;
 use crate::source::{CalendarSource, CalendarWriter, ContactsSource, MailSource, MailWriter};
 
@@ -122,23 +121,16 @@ pub trait Provider: Send + Sync {
     fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error>;
 }
 
-/// Construct the configured provider from a `Config`. Dispatches on the
-/// `[provider.*]` section that the config selects (or the legacy
-/// top-level `[forwardemail]` shim, which counts as forwardemail).
-pub fn build(cfg: &Config) -> Result<Arc<dyn Provider>, Error> {
-    match cfg.active_provider_kind()? {
-        ProviderKind::Forwardemail => {
-            Ok(Arc::new(forwardemail::ForwardemailProvider::new(cfg)?))
-        }
-        ProviderKind::IcloudCaldav => {
-            Ok(Arc::new(icloud_caldav::IcloudCaldavProvider::new(cfg)?))
-        }
-    }
-}
+// Construction lives in `daemon::build_provider_handles`. The previous
+// `provider::build` helper was deleted as dead code (Task 6 review minor):
+// only this file's own tests called it, and the daemon needs both the
+// typed `Arc<ForwardemailProvider>` and the `Arc<dyn Provider>` handles
+// — a single-arm helper here couldn't return both without down-casting.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     #[test]
     fn default_capabilities_all_false() {
@@ -204,31 +196,23 @@ mod tests {
     }
 
     #[test]
-    fn build_dispatches_to_forwardemail_when_configured() {
+    fn forwardemail_provider_constructs_with_full_capabilities() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = forwardemail_config_with_temp_creds(&dir);
-        let provider = build(&cfg).expect("build should succeed");
+        let provider = forwardemail::ForwardemailProvider::new(&cfg)
+            .expect("forwardemail provider should build");
         assert_eq!(provider.name(), "forwardemail");
         assert_eq!(provider.capabilities(), Capabilities::forwardemail_full());
     }
 
     #[test]
-    fn build_dispatches_to_icloud_when_configured() {
+    fn icloud_provider_constructs_with_calendar_only_capability() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = icloud_config_with_temp_creds(&dir);
-        let provider = build(&cfg).expect("build should succeed");
+        let provider = icloud_caldav::IcloudCaldavProvider::new(&cfg)
+            .expect("iCloud provider should build");
         assert_eq!(provider.name(), "icloud_caldav");
         assert_eq!(provider.capabilities(), Capabilities::calendar_only());
-    }
-
-    #[test]
-    fn build_errors_when_no_provider_configured() {
-        let cfg = Config::default();
-        // `Arc<dyn Provider>` doesn't implement Debug — so we have to
-        // map to () before calling unwrap_err. The error case is what
-        // we actually care about asserting on here.
-        let err = build(&cfg).map(|_| ()).unwrap_err();
-        assert!(err.to_string().contains("no provider"), "{err}");
     }
 
     /// iCloud provider must return `Some` for calendar source/writer and
@@ -239,34 +223,11 @@ mod tests {
     fn icloud_provider_calendar_present_mail_absent() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = icloud_config_with_temp_creds(&dir);
-        let provider = build(&cfg).unwrap();
+        let provider = icloud_caldav::IcloudCaldavProvider::new(&cfg).unwrap();
         assert!(provider.build_calendar_source().unwrap().is_some());
         assert!(provider.build_calendar_writer().unwrap().is_some());
         assert!(provider.build_mail_source().unwrap().is_none());
         assert!(provider.build_mail_writer().unwrap().is_none());
         assert!(provider.build_contacts_source().unwrap().is_none());
-    }
-
-    /// Regression guard for Task 6 review's Critical #3: `daemon::run`
-    /// used to call `provider::build` AND `ForwardemailProvider::new`,
-    /// allocating two REST `Client`s per request. The fix builds the
-    /// typed `Arc<ForwardemailProvider>` once and erases to `dyn Provider`.
-    /// We model that here: clone the typed Arc into a `dyn Provider` and
-    /// assert both handles bump the same allocation's refcount.
-    #[test]
-    fn forwardemail_provider_arc_shared_between_typed_and_dyn() {
-        use crate::provider::forwardemail::ForwardemailProvider;
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = forwardemail_config_with_temp_creds(&dir);
-        let fe = Arc::new(ForwardemailProvider::new(&cfg).unwrap());
-        let _dyn_provider: Arc<dyn Provider> = fe.clone();
-        // Two Arc handles pointing at the same allocation. If a future
-        // refactor re-introduces a duplicate `ForwardemailProvider::new`
-        // call this strong_count drops back to 1 and the test catches it.
-        assert!(
-            Arc::strong_count(&fe) >= 2,
-            "fe Arc should be shared between typed and dyn handles, got count={}",
-            Arc::strong_count(&fe),
-        );
     }
 }
