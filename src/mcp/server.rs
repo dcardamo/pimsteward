@@ -302,13 +302,23 @@ const MULTI_ACCOUNT_HINT_TOOLS: &[&str] = &["list_calendars", "list_events"];
 /// than ambient text.
 const MULTI_ACCOUNT_HINT: &str = "Multiple calendar accounts may be exposed via separate MCP servers; if you need a complete picture of the user's schedule, call this tool on every available server (each represents one account).";
 
-/// Rewrite a tool's description to include the alias served by this
-/// daemon as a leading `[account: <alias>]` tag, plus a multi-account
-/// hint for the calendar-listing tools that benefit from one. The
-/// returned `Tool` carries an owned `Cow` because we're building a
-/// per-alias string at runtime.
-fn stamp_account_context(mut t: rmcp::model::Tool, alias: &str) -> rmcp::model::Tool {
-    let prefix = format!("[account: {alias}] ");
+/// Rewrite a tool's description to include the alias and provider
+/// served by this daemon as a leading `[account: <alias> @ <provider>]`
+/// tag, plus a multi-account hint for the calendar-listing tools that
+/// benefit from one. The returned `Tool` carries an owned `Cow`
+/// because we're building a per-alias string at runtime.
+///
+/// The provider name (`forwardemail` / `icloud` / etc.) is part of
+/// the tag because aliases collide in practice — Dan's Apple ID is
+/// his Fastmail address `dan@hld.ca`, so both daemons would render
+/// `[account: dan-hld.ca]` without the provider suffix and the LLM
+/// would still see two indistinguishable tools.
+fn stamp_account_context(
+    mut t: rmcp::model::Tool,
+    alias: &str,
+    provider: &str,
+) -> rmcp::model::Tool {
+    let prefix = format!("[account: {alias} @ {provider}] ");
     let original = t
         .description
         .as_deref()
@@ -465,6 +475,14 @@ struct Inner {
     repo: Repo,
     permissions: Permissions,
     alias: String,
+    /// Stable identifier of the active provider — `"forwardemail"`,
+    /// `"icloud"`, etc. Combined with `alias` for the `[account: ...]`
+    /// tag injected into every tool description so an MCP client that
+    /// simultaneously exposes daemons sharing the same alias (Apple ID
+    /// equals Fastmail address is the canonical case) still gives the
+    /// LLM enough information to disambiguate. See
+    /// [`stamp_account_context`].
+    provider_name: &'static str,
     /// Default caller name attributed to writes initiated through this
     /// server. Set from `PIMSTEWARD_CALLER` (or `config.mcp.caller`) at
     /// startup; defaults to `"ai"` when unset. Lets operators distinguish
@@ -516,6 +534,7 @@ impl PimstewardServer {
         repo: Repo,
         permissions: Permissions,
         alias: String,
+        provider_name: &'static str,
         caller: String,
         mail_source: Option<Arc<dyn MailSource>>,
         mail_writer: Option<Arc<dyn MailWriter>>,
@@ -531,6 +550,7 @@ impl PimstewardServer {
                 repo,
                 permissions,
                 alias,
+                provider_name,
                 caller,
                 mail_source,
                 mail_writer,
@@ -2744,12 +2764,13 @@ impl ServerHandler for PimstewardServer {
         // with the alias gives the LLM a stable disambiguator that
         // doesn't depend on the calling client's namespacing scheme.
         let alias = self.inner.alias.as_str();
+        let provider = self.inner.provider_name;
         let tools = self
             .tool_router
             .list_all()
             .into_iter()
             .filter(|t| self.tool_visible(&t.name))
-            .map(|t| stamp_account_context(t, alias))
+            .map(|t| stamp_account_context(t, alias, provider))
             .collect();
         Ok(rmcp::model::ListToolsResult {
             tools,
@@ -4511,6 +4532,7 @@ mod tests {
             repo,
             perms,
             "u-example.com".to_string(),
+            "icloud",
             "test".to_string(),
             None,
             None,
@@ -4596,18 +4618,42 @@ mod tests {
     }
 
     #[test]
-    fn stamp_account_context_prepends_alias_to_every_description() {
+    fn stamp_account_context_prepends_alias_and_provider_to_every_description() {
         let stamped = stamp_account_context(
             fake_tool("get_email", Some("Fetch a single email by canonical id.")),
             "dan@hld.ca",
+            "forwardemail",
         );
         let desc = stamped.description.as_deref().unwrap_or_default();
         assert!(
-            desc.starts_with("[account: dan@hld.ca] "),
-            "expected leading account tag, got: {desc:?}",
+            desc.starts_with("[account: dan@hld.ca @ forwardemail] "),
+            "expected leading account+provider tag, got: {desc:?}",
         );
         // Original text is preserved verbatim after the prefix.
         assert!(desc.contains("Fetch a single email by canonical id."));
+    }
+
+    #[test]
+    fn stamp_account_context_distinguishes_same_alias_across_providers() {
+        // Concrete regression: Dan's Apple ID is his Fastmail address,
+        // so both daemons render `[account: dan-hld.ca]` without the
+        // provider suffix. The composite tag must give the LLM enough
+        // to tell them apart.
+        let fe = stamp_account_context(
+            fake_tool("list_events", Some("body")),
+            "dan-hld.ca",
+            "forwardemail",
+        );
+        let icloud = stamp_account_context(
+            fake_tool("list_events", Some("body")),
+            "dan-hld.ca",
+            "icloud",
+        );
+        let fe_desc = fe.description.as_deref().unwrap_or_default();
+        let ic_desc = icloud.description.as_deref().unwrap_or_default();
+        assert_ne!(fe_desc, ic_desc, "shared-alias daemons must produce distinct descriptions");
+        assert!(fe_desc.contains("forwardemail"));
+        assert!(ic_desc.contains("icloud"));
     }
 
     #[test]
@@ -4617,9 +4663,9 @@ mod tests {
         // non-empty, well-formed description rather than panicking on
         // the None branch or emitting a bare `[account: ...]` with a
         // dangling trailing space that the LLM might read literally.
-        let stamped = stamp_account_context(fake_tool("noop", None), "icloud");
+        let stamped = stamp_account_context(fake_tool("noop", None), "user", "icloud");
         let desc = stamped.description.as_deref().unwrap_or_default();
-        assert!(desc.starts_with("[account: icloud] "));
+        assert!(desc.starts_with("[account: user @ icloud] "));
     }
 
     #[test]
@@ -4631,6 +4677,7 @@ mod tests {
             let stamped = stamp_account_context(
                 fake_tool(name, Some("Static stub.")),
                 "dan@hld.ca",
+                "forwardemail",
             );
             let desc = stamped.description.as_deref().unwrap_or_default();
             assert!(
@@ -4650,6 +4697,7 @@ mod tests {
             let stamped = stamp_account_context(
                 fake_tool(name, Some("Static stub.")),
                 "dan@hld.ca",
+                "forwardemail",
             );
             let desc = stamped.description.as_deref().unwrap_or_default();
             assert!(
@@ -4657,7 +4705,7 @@ mod tests {
                 "{name} must NOT carry the calendar multi-account directive: {desc:?}",
             );
             // But the account tag is still present everywhere.
-            assert!(desc.starts_with("[account: dan@hld.ca] "));
+            assert!(desc.starts_with("[account: dan@hld.ca @ forwardemail] "));
         }
     }
 

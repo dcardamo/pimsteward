@@ -129,6 +129,7 @@ async fn spawn_mcp_http_listener(
                 let provider = provider_for_factory.clone();
                 let fe = fe_for_factory.clone();
                 let alias = provider.alias().to_string();
+                let provider_name = provider.name();
 
                 // Mail / contacts are Optional — the factory tolerates
                 // calendar-only providers like iCloud by passing `None`
@@ -184,6 +185,7 @@ async fn spawn_mcp_http_listener(
                     repo,
                     perms,
                     alias,
+                    provider_name,
                     caller,
                     mail_source,
                     mail_writer,
