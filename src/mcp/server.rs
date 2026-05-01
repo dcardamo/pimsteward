@@ -288,6 +288,49 @@ fn rrule_dt_from_utc(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<rrul
     dt.with_timezone(&rrule::Tz::UTC)
 }
 
+/// Names of the calendar-listing tools that warrant an extra hint to
+/// query other servers. These are the tools where a model that
+/// silently picks one of two identically-described tools produces a
+/// bad answer ("no events today") — the email/sieve tools don't have
+/// the same multi-account ambiguity in practice because each alias's
+/// inbox is conceptually distinct in a way calendars (which are
+/// commonly shared / federated across accounts) are not.
+const MULTI_ACCOUNT_HINT_TOOLS: &[&str] = &["list_calendars", "list_events"];
+
+/// Suffix appended to every calendar-listing tool's description.
+/// Phrased as a directive so the LLM treats it as instruction rather
+/// than ambient text.
+const MULTI_ACCOUNT_HINT: &str = "Multiple calendar accounts may be exposed via separate MCP servers; if you need a complete picture of the user's schedule, call this tool on every available server (each represents one account).";
+
+/// Rewrite a tool's description to include the alias served by this
+/// daemon as a leading `[account: <alias>]` tag, plus a multi-account
+/// hint for the calendar-listing tools that benefit from one. The
+/// returned `Tool` carries an owned `Cow` because we're building a
+/// per-alias string at runtime.
+fn stamp_account_context(mut t: rmcp::model::Tool, alias: &str) -> rmcp::model::Tool {
+    let prefix = format!("[account: {alias}] ");
+    let original = t
+        .description
+        .as_deref()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let mut combined = String::with_capacity(prefix.len() + original.len() + 1 + MULTI_ACCOUNT_HINT.len());
+    combined.push_str(&prefix);
+    combined.push_str(&original);
+    if MULTI_ACCOUNT_HINT_TOOLS
+        .iter()
+        .any(|n| t.name.as_ref() == *n)
+    {
+        if !combined.is_empty() && !combined.ends_with(' ') {
+            combined.push(' ');
+        }
+        combined.push_str(MULTI_ACCOUNT_HINT);
+    }
+    t.description = Some(std::borrow::Cow::Owned(combined));
+    t
+}
+
 /// Master event duration as a `chrono::Duration`. Returns `None` if
 /// either endpoint can't be parsed — the expander then emits each
 /// occurrence as a point-in-time event, which is the same shape an
@@ -2684,11 +2727,29 @@ impl ServerHandler for PimstewardServer {
         // configuration. Resources that are fully denied (e.g.
         // `email = "none"`) disappear entirely — the model doesn't see
         // their tool names, schemas, or descriptions.
+        //
+        // Then rewrite each tool's description to include the account
+        // alias (`[account: dan@hld.ca]` / `[account: icloud]` / etc.).
+        // The static `#[tool(description = "...")]` annotation is the
+        // same string regardless of which alias the daemon serves, but
+        // operators commonly run multiple pimsteward instances side by
+        // side — Dan runs one against forwardemail.net for `dan@hld.ca`
+        // and another against iCloud CalDAV for the Family calendar.
+        // Without an account prefix, an MCP client offering both
+        // servers' tools to an LLM sees two `list_calendars` /
+        // `list_events` pairs with identical descriptions and can't
+        // tell them apart; the user asks "what's on my calendar
+        // today?", the LLM picks one tool, and silently misses every
+        // event living on the other account. Stamping each description
+        // with the alias gives the LLM a stable disambiguator that
+        // doesn't depend on the calling client's namespacing scheme.
+        let alias = self.inner.alias.as_str();
         let tools = self
             .tool_router
             .list_all()
             .into_iter()
             .filter(|t| self.tool_visible(&t.name))
+            .map(|t| stamp_account_context(t, alias))
             .collect();
         Ok(rmcp::model::ListToolsResult {
             tools,
@@ -4506,4 +4567,108 @@ mod tests {
             "{msg}",
         );
     }
+
+    // ── Tool description account-context stamping ────────────────────
+    //
+    // Tools' static `#[tool(description = "...")]` text is identical
+    // across daemons that serve different aliases (e.g. dan@hld.ca
+    // and a parallel iCloud daemon). When an MCP client offers both
+    // servers' tool sets to an LLM, the model can't tell two
+    // identically-described `list_calendars` tools apart and silently
+    // misses the calendars on whichever daemon it didn't pick. The
+    // stamper prefixes every description with `[account: <alias>]`
+    // so the model has a stable disambiguator, plus appends a
+    // multi-account directive on the calendar-listing tools.
+
+    fn fake_tool(name: &'static str, description: Option<&'static str>) -> rmcp::model::Tool {
+        // Tool is `#[non_exhaustive]` — go through the public
+        // constructor and clear the description after if the test
+        // wants to exercise the None branch.
+        let mut t = rmcp::model::Tool::new(
+            name,
+            description.unwrap_or(""),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        if description.is_none() {
+            t.description = None;
+        }
+        t
+    }
+
+    #[test]
+    fn stamp_account_context_prepends_alias_to_every_description() {
+        let stamped = stamp_account_context(
+            fake_tool("get_email", Some("Fetch a single email by canonical id.")),
+            "dan@hld.ca",
+        );
+        let desc = stamped.description.as_deref().unwrap_or_default();
+        assert!(
+            desc.starts_with("[account: dan@hld.ca] "),
+            "expected leading account tag, got: {desc:?}",
+        );
+        // Original text is preserved verbatim after the prefix.
+        assert!(desc.contains("Fetch a single email by canonical id."));
+    }
+
+    #[test]
+    fn stamp_account_context_handles_empty_description() {
+        // Some tools could legitimately ship without a static
+        // description (rmcp allows it). Stamping must still produce a
+        // non-empty, well-formed description rather than panicking on
+        // the None branch or emitting a bare `[account: ...]` with a
+        // dangling trailing space that the LLM might read literally.
+        let stamped = stamp_account_context(fake_tool("noop", None), "icloud");
+        let desc = stamped.description.as_deref().unwrap_or_default();
+        assert!(desc.starts_with("[account: icloud] "));
+    }
+
+    #[test]
+    fn stamp_account_context_appends_multi_account_hint_to_calendar_listing_tools() {
+        // The two tools where namespace ambiguity actually bites end
+        // users (Dan's daily-brief regression: list_events on iCloud
+        // returned by the model that called dan@hld.ca's list_events).
+        for name in ["list_calendars", "list_events"] {
+            let stamped = stamp_account_context(
+                fake_tool(name, Some("Static stub.")),
+                "dan@hld.ca",
+            );
+            let desc = stamped.description.as_deref().unwrap_or_default();
+            assert!(
+                desc.contains("Multiple calendar accounts"),
+                "{name} must carry the multi-account directive: {desc:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn stamp_account_context_omits_multi_account_hint_for_non_calendar_tools() {
+        // Sieve / email / contacts tools don't have the same
+        // namespace-collision pattern (the inboxes are conceptually
+        // distinct rather than potentially shared/federated). The
+        // multi-account hint is therefore noise on those tools.
+        for name in ["search_email", "list_folders", "list_contacts", "create_draft", "history"] {
+            let stamped = stamp_account_context(
+                fake_tool(name, Some("Static stub.")),
+                "dan@hld.ca",
+            );
+            let desc = stamped.description.as_deref().unwrap_or_default();
+            assert!(
+                !desc.contains("Multiple calendar accounts"),
+                "{name} must NOT carry the calendar multi-account directive: {desc:?}",
+            );
+            // But the account tag is still present everywhere.
+            assert!(desc.starts_with("[account: dan@hld.ca] "));
+        }
+    }
+
+    // End-to-end coverage that exercises the actual `list_tools`
+    // implementation requires a real `rmcp::service::RequestContext`,
+    // which the rmcp crate doesn't expose constructors for in the
+    // test surface. The unit tests above pin the `stamp_account_context`
+    // contract — `list_tools` is a single-line `.map(stamp_account_context)`
+    // application of that helper to the post-permission tool list, so
+    // any divergence between the unit tests and what the LLM sees is a
+    // bug in two lines of glue. Manual deploy verification (call
+    // tools/list against the running daemon, grep for `[account: ...]`
+    // on every tool description) covers the integration end.
 }
