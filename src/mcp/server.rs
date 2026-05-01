@@ -122,6 +122,184 @@ fn parse_iso_dt(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
+/// Expand an event against a window. For non-recurring events this is
+/// a 0-or-1 result that mirrors the previous [`event_in_window`]
+/// filter. For events whose iCal payload carries an `RRULE`, the
+/// pattern is fed to a real iCalendar parser (`rrule` crate) and the
+/// occurrences inside the window are emitted as separate
+/// `CalendarEvent`s — one per occurrence — with `start_date` /
+/// `end_date` rewritten to the occurrence's actual moment.
+///
+/// Why this exists: iCloud and Apple Calendar express weekly /
+/// monthly / yearly recurrences as a single VEVENT with a master
+/// `DTSTART` plus `RRULE`. Before this expander, the only date
+/// pimsteward knew about an "Erica Tutoring weekly Thursdays from
+/// 2026-03-05" event was `20260305T180000`. Asking for
+/// `start = today, end = tomorrow` against `today = 2026-04-30`
+/// returned nothing — the master is six weeks before the window even
+/// though the recurrence lands today. The filter could only see what
+/// the source had stored, and the source had stored the master only.
+///
+/// Callers that pass no window bounds (`window_start.is_none() &&
+/// window_end.is_none()`) get the master back verbatim — expansion
+/// would be unbounded for an infinite RRULE and the windowless API is
+/// documented to return the raw stored events.
+fn expand_event_in_window(
+    ev: &crate::forwardemail::calendar::CalendarEvent,
+    window_start: Option<chrono::DateTime<chrono::Utc>>,
+    window_end: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<crate::forwardemail::calendar::CalendarEvent> {
+    // No window: pass the master through untouched. Don't expand —
+    // unbounded RRULEs (FREQ=WEEKLY with no UNTIL/COUNT) would otherwise
+    // loop forever and the windowless contract is "give me what's
+    // stored".
+    if window_start.is_none() && window_end.is_none() {
+        return vec![ev.clone()];
+    }
+
+    // Need an iCal payload to inspect RRULE / EXDATE / RDATE; legacy
+    // paths or partial events that lack one fall through to point
+    // comparison on the master start_date / end_date strings.
+    let Some(ical) = ev.ical.as_deref() else {
+        return point_filter(ev, window_start, window_end);
+    };
+
+    let rrule_lines = crate::ical::vevent_raw_lines_named(ical, "RRULE");
+    if rrule_lines.is_empty() {
+        // Non-recurring event — same semantics as before.
+        return point_filter(ev, window_start, window_end);
+    }
+
+    let dtstart_lines = crate::ical::vevent_raw_lines_named(ical, "DTSTART");
+    if dtstart_lines.is_empty() {
+        // RRULE without DTSTART is malformed iCal; rrule's parser would
+        // reject it. Don't conjure occurrences out of nothing.
+        return point_filter(ev, window_start, window_end);
+    }
+    let exdate_lines = crate::ical::vevent_raw_lines_named(ical, "EXDATE");
+    let rdate_lines = crate::ical::vevent_raw_lines_named(ical, "RDATE");
+
+    // Build the minimal iCal block the `rrule` crate parses. It only
+    // cares about DTSTART, RRULE, EXDATE, RDATE — VTIMEZONE, SUMMARY,
+    // and friends are noise. Feeding lines verbatim preserves the
+    // `;TZID=America/Toronto` parameter that anchors the recurrence in
+    // a real zone.
+    let mut block = String::new();
+    for l in &dtstart_lines {
+        block.push_str(l);
+        block.push('\n');
+    }
+    for l in &rrule_lines {
+        block.push_str(l);
+        block.push('\n');
+    }
+    for l in &exdate_lines {
+        block.push_str(l);
+        block.push('\n');
+    }
+    for l in &rdate_lines {
+        block.push_str(l);
+        block.push('\n');
+    }
+
+    let rule_set: rrule::RRuleSet = match block.parse() {
+        Ok(s) => s,
+        Err(e) => {
+            // A malformed pattern gracefully degrades to point
+            // comparison: better to show only the master than to lose
+            // the event entirely. Logged at debug because real iCal in
+            // the wild does occasionally emit RRULEs the crate's strict
+            // parser refuses.
+            tracing::debug!(
+                event_uid = ?ev.uid,
+                error = %e,
+                "RRULE parse failed; falling back to master point comparison",
+            );
+            return point_filter(ev, window_start, window_end);
+        }
+    };
+
+    // `before`/`after` on RRuleSet are exclusive bounds. Our window is
+    // `[start, end)` (start inclusive, end exclusive). Subtract a tick
+    // from `start` so an occurrence starting exactly at `start` still
+    // matches; pass `end` as-is.
+    let mut builder = rule_set;
+    if let Some(ws) = window_start {
+        let after = ws - chrono::Duration::nanoseconds(1);
+        builder = builder.after(rrule_dt_from_utc(after));
+    }
+    if let Some(we) = window_end {
+        builder = builder.before(rrule_dt_from_utc(we));
+    }
+
+    // Cap at 366 occurrences. A windowed query covering at most one
+    // year of a daily-frequency recurrence fits, and any reasonable
+    // brief / agent caller is well under that; the cap exists so a
+    // pathological window doesn't enumerate forever.
+    let result = builder.all(366);
+
+    // Master event duration is preserved across occurrences. iCloud
+    // events almost always carry DTEND; if the master has no parseable
+    // duration we fall back to a point-in-time event at the occurrence.
+    let duration = master_duration(ev);
+
+    let mut out = Vec::with_capacity(result.dates.len());
+    for occ in result.dates {
+        let mut clone = ev.clone();
+        // Emit the occurrence as RFC-3339 with offset so downstream
+        // consumers (the brief sender's Python `datetime.fromisoformat`
+        // and pimsteward's own `parse_iso_dt`) parse it directly. The
+        // original TZID is preserved as the offset rather than the
+        // zone name — sufficient for "what time today" rendering;
+        // round-tripping the symbolic zone would require keeping the
+        // raw iCal value-portion, but then iCal/RFC-3339 inconsistency
+        // would surface to clients.
+        clone.start_date = Some(occ.to_rfc3339());
+        if let Some(d) = duration {
+            clone.end_date = Some((occ + d).to_rfc3339());
+        } else {
+            clone.end_date = None;
+        }
+        out.push(clone);
+    }
+    out
+}
+
+/// Filter a single event by point-comparison of its master
+/// `start_date` / `end_date` against the window. Used for both
+/// non-recurring events and the fallback path when RRULE expansion
+/// can't run (no iCal payload, no DTSTART, parse failure).
+fn point_filter(
+    ev: &crate::forwardemail::calendar::CalendarEvent,
+    window_start: Option<chrono::DateTime<chrono::Utc>>,
+    window_end: Option<chrono::DateTime<chrono::Utc>>,
+) -> Vec<crate::forwardemail::calendar::CalendarEvent> {
+    if event_in_window(ev, window_start, window_end) {
+        vec![ev.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Convert a UTC datetime into the `rrule` crate's `Tz` wrapper. The
+/// crate uses its own enum to distinguish chrono_tz from local time;
+/// our windows are always UTC, so we map through `chrono_tz::UTC`.
+fn rrule_dt_from_utc(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<rrule::Tz> {
+    dt.with_timezone(&rrule::Tz::UTC)
+}
+
+/// Master event duration as a `chrono::Duration`. Returns `None` if
+/// either endpoint can't be parsed — the expander then emits each
+/// occurrence as a point-in-time event, which is the same shape an
+/// upstream event with no `DTEND` would have.
+fn master_duration(
+    ev: &crate::forwardemail::calendar::CalendarEvent,
+) -> Option<chrono::Duration> {
+    let s = parse_iso_dt(ev.start_date.as_deref()?)?;
+    let e = parse_iso_dt(ev.end_date.as_deref()?)?;
+    Some(e - s)
+}
+
 /// True if the event's `[start_date, end_date)` interval overlaps the
 /// requested `[window_start, window_end)`. If both bounds are `None`
 /// the filter is a no-op and every event passes. When any bound is
@@ -1180,10 +1358,8 @@ impl PimstewardServer {
                 .map_err(|e| self.api_error(e))?;
             let mut filtered: Vec<_> = events
                 .into_iter()
-                .filter(|ev| {
-                    (include_cancelled || !is_cancelled(ev))
-                        && event_in_window(ev, window_start, window_end)
-                })
+                .filter(|ev| include_cancelled || !is_cancelled(ev))
+                .flat_map(|ev| expand_event_in_window(&ev, window_start, window_end))
                 .collect();
             if !include_ical {
                 for ev in &mut filtered {
@@ -1219,8 +1395,8 @@ impl PimstewardServer {
                     })
                     .is_ok()
                     && (include_cancelled || !is_cancelled(ev))
-                    && event_in_window(ev, window_start, window_end)
             })
+            .flat_map(|ev| expand_event_in_window(&ev, window_start, window_end))
             .collect();
         if !include_ical {
             for ev in &mut filtered {
@@ -3272,6 +3448,19 @@ mod tests {
         }
     }
 
+    /// Build an event with iCal text attached. Master `start_date` /
+    /// `end_date` are derived from the iCal so the test fixture only
+    /// needs to spell out the recurrence pattern once.
+    fn ev_with_ical(
+        ical: &str,
+        master_start: Option<&str>,
+        master_end: Option<&str>,
+    ) -> crate::forwardemail::calendar::CalendarEvent {
+        let mut e = ev(master_start, master_end);
+        e.ical = Some(ical.to_string());
+        e
+    }
+
     fn dt(s: &str) -> chrono::DateTime<chrono::Utc> {
         parse_iso_dt(s).expect("test datetime must parse")
     }
@@ -3312,6 +3501,197 @@ mod tests {
         // arbitrary trailing junk after the seconds field are rejected.
         assert!(parse_iso_dt("20260429T180000+0400").is_none());
         assert!(parse_iso_dt("20260429T180000garbage").is_none());
+    }
+
+    /// The canonical regression: an "Erica Tutoring" weekly recurrence
+    /// whose master DTSTART is six weeks before the requested window.
+    /// Pre-expander, list_events would point-compare the master and
+    /// silently drop the event from every windowed query. Now the
+    /// expander emits one event per Thursday occurrence inside the
+    /// window — the brief renders the right ones for "today".
+    #[test]
+    fn expand_weekly_recurrence_emits_per_occurrence_in_window() {
+        // Master Thursday 2026-03-05 18:00 America/Toronto, no UNTIL.
+        // RFC-3339 master start_date so the helper duration computation
+        // works without depending on parse_iso_dt's iCal-form path
+        // (covered by its own tests).
+        let ical = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "DTSTART;TZID=America/Toronto:20260305T180000\r\n",
+            "DTEND;TZID=America/Toronto:20260305T190000\r\n",
+            "RRULE:FREQ=WEEKLY\r\n",
+            "SUMMARY:Erica Tutoring\r\n",
+            "UID:tutoring-1\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let e = ev_with_ical(
+            ical,
+            Some("2026-03-05T18:00:00-05:00"),
+            Some("2026-03-05T19:00:00-05:00"),
+        );
+
+        // Window: Thursday 2026-04-30 local Toronto, all-day.
+        let ws = parse_iso_dt("2026-04-30T00:00:00-04:00");
+        let we = parse_iso_dt("2026-05-01T00:00:00-04:00");
+        let out = expand_event_in_window(&e, ws, we);
+        assert_eq!(
+            out.len(),
+            1,
+            "exactly one occurrence (Thu 2026-04-30 18:00) overlaps the window"
+        );
+        // The occurrence's start is rewritten to that Thursday's 18:00,
+        // not the master's 2026-03-05.
+        let s = out[0].start_date.as_deref().expect("start_date set");
+        let parsed = parse_iso_dt(s).expect("rewritten start parses");
+        assert_eq!(parsed.to_rfc3339(), "2026-04-30T22:00:00+00:00");
+        // Duration preserved: end is one hour after start.
+        let parsed_end = parse_iso_dt(out[0].end_date.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed_end - parsed, chrono::Duration::hours(1));
+    }
+
+    /// Multi-occurrence window: two Thursdays in a single fortnight
+    /// query. Confirms the expander emits each separately rather than
+    /// returning one collapsed event.
+    #[test]
+    fn expand_weekly_recurrence_emits_multiple_in_wider_window() {
+        let ical = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "DTSTART;TZID=America/Toronto:20260305T180000\r\n",
+            "DTEND;TZID=America/Toronto:20260305T190000\r\n",
+            "RRULE:FREQ=WEEKLY\r\n",
+            "UID:tutoring-2\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let e = ev_with_ical(ical, Some("2026-03-05T18:00:00-05:00"), Some("2026-03-05T19:00:00-05:00"));
+        // Window: 2026-04-23 → 2026-05-08 covers Thursdays 04-23, 04-30, 05-07.
+        let ws = parse_iso_dt("2026-04-23T00:00:00-04:00");
+        let we = parse_iso_dt("2026-05-08T00:00:00-04:00");
+        let out = expand_event_in_window(&e, ws, we);
+        assert_eq!(out.len(), 3);
+    }
+
+    /// EXDATE inside the VEVENT block must skip those specific
+    /// occurrences. Apple Calendar emits one EXDATE line per excluded
+    /// occurrence rather than the comma-separated list form.
+    #[test]
+    fn expand_weekly_recurrence_honours_exdate() {
+        let ical = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "DTSTART;TZID=America/Toronto:20260305T180000\r\n",
+            "DTEND;TZID=America/Toronto:20260305T190000\r\n",
+            "RRULE:FREQ=WEEKLY\r\n",
+            "EXDATE;TZID=America/Toronto:20260430T180000\r\n",
+            "UID:tutoring-3\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let e = ev_with_ical(ical, Some("2026-03-05T18:00:00-05:00"), Some("2026-03-05T19:00:00-05:00"));
+        // Same today-window — but the 04-30 occurrence is excluded.
+        let ws = parse_iso_dt("2026-04-30T00:00:00-04:00");
+        let we = parse_iso_dt("2026-05-01T00:00:00-04:00");
+        let out = expand_event_in_window(&e, ws, we);
+        assert!(out.is_empty(), "EXDATE-excluded occurrence must drop");
+    }
+
+    /// Yearly recurrence (birthday-style). Window selects exactly one.
+    #[test]
+    fn expand_yearly_recurrence_emits_yearly_occurrence() {
+        let ical = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "DTSTART;TZID=America/Toronto:20240417T180000\r\n",
+            "DTEND;TZID=America/Toronto:20240417T220000\r\n",
+            "RRULE:FREQ=YEARLY\r\n",
+            "SUMMARY:Miles birthday dinner\r\n",
+            "UID:miles-bday\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let e = ev_with_ical(ical, Some("2024-04-17T18:00:00-04:00"), Some("2024-04-17T22:00:00-04:00"));
+        // Window covering only April 17, 2026.
+        let ws = parse_iso_dt("2026-04-17T00:00:00-04:00");
+        let we = parse_iso_dt("2026-04-18T00:00:00-04:00");
+        let out = expand_event_in_window(&e, ws, we);
+        assert_eq!(out.len(), 1);
+        let parsed = parse_iso_dt(out[0].start_date.as_deref().unwrap()).unwrap();
+        // 22:00 UTC = 18:00 EDT (Apr 17 2026 is daylight time).
+        assert_eq!(parsed.to_rfc3339(), "2026-04-17T22:00:00+00:00");
+    }
+
+    /// Non-recurring event with iCal payload but no RRULE: behave
+    /// identically to the previous filter — no expansion, master
+    /// passes/fails the window unchanged. Pool-opening shape (all-day
+    /// DATE-only DTSTART/DTEND).
+    #[test]
+    fn expand_non_recurring_falls_back_to_point_filter() {
+        let ical = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "BEGIN:VEVENT\r\n",
+            "DTSTART;VALUE=DATE:20260430\r\n",
+            "DTEND;VALUE=DATE:20260501\r\n",
+            "SUMMARY:Pool opening\r\n",
+            "UID:pool-1\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let e = ev_with_ical(ical, Some("20260430"), Some("20260501"));
+        let ws = parse_iso_dt("2026-04-30T00:00:00-04:00");
+        let we = parse_iso_dt("2026-05-01T00:00:00-04:00");
+        let out = expand_event_in_window(&e, ws, we);
+        // The master itself overlaps the window → exactly one entry,
+        // master_start preserved (not rewritten — non-recurring path).
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start_date.as_deref(), Some("20260430"));
+    }
+
+    /// No window bounds: every event is returned untouched, even ones
+    /// with infinite RRULEs. The contract is "give me what's stored",
+    /// and expanding an unbounded WEEKLY would loop forever.
+    #[test]
+    fn expand_with_no_window_returns_master_unchanged() {
+        let ical = concat!(
+            "BEGIN:VEVENT\r\n",
+            "DTSTART;TZID=America/Toronto:20260305T180000\r\n",
+            "RRULE:FREQ=WEEKLY\r\n",
+            "UID:never-ending\r\n",
+            "END:VEVENT\r\n",
+        );
+        let e = ev_with_ical(ical, Some("2026-03-05T18:00:00-05:00"), None);
+        let out = expand_event_in_window(&e, None, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start_date.as_deref(), Some("2026-03-05T18:00:00-05:00"));
+    }
+
+    /// Garbage RRULE: do not synthesize occurrences, but don't lose
+    /// the event either — fall back to point comparison on the master.
+    /// This protects against a strict parser refusing some real-world
+    /// RRULE while the master event itself is still useful for
+    /// rendering "today's calendar" in the brief.
+    #[test]
+    fn expand_malformed_rrule_falls_back_to_master() {
+        let ical = concat!(
+            "BEGIN:VEVENT\r\n",
+            "DTSTART;TZID=America/Toronto:20260430T180000\r\n",
+            "DTEND;TZID=America/Toronto:20260430T190000\r\n",
+            "RRULE:FREQ=NOTAREALFREQUENCY\r\n",
+            "UID:bad-rrule\r\n",
+            "END:VEVENT\r\n",
+        );
+        let e = ev_with_ical(
+            ical,
+            Some("2026-04-30T18:00:00-04:00"),
+            Some("2026-04-30T19:00:00-04:00"),
+        );
+        let ws = parse_iso_dt("2026-04-30T00:00:00-04:00");
+        let we = parse_iso_dt("2026-05-01T00:00:00-04:00");
+        let out = expand_event_in_window(&e, ws, we);
+        assert_eq!(out.len(), 1, "master overlaps window even when RRULE bad");
+        assert_eq!(out[0].start_date.as_deref(), Some("2026-04-30T18:00:00-04:00"));
     }
 
     #[test]

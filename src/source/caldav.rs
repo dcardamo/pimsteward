@@ -145,17 +145,28 @@ impl CalendarSource for DavCalendarSource {
                     .next()
                     .map(|s| s.trim_end_matches(".ics").to_string())
                     .unwrap_or_default();
+                // Populate the derived fields from the iCal payload.
+                // Previous behaviour was to leave summary/description/
+                // location/start_date/end_date as `None`, which made the
+                // forwardemail CalDAV path opaque to MCP `list_events`
+                // window filters: every event had `start_date == None`,
+                // every windowed query returned the empty list, and the
+                // dan@hld.ca calendar appeared empty in the daily brief
+                // even when it had events. The shared `vevent_field`
+                // helper is `VEVENT`-scoped (Fastmail puts `VTIMEZONE`
+                // first, so an unscoped grep would otherwise return
+                // 1895-era timezone-transition timestamps as `DTSTART`).
                 out.push(CalendarEvent {
                     id: href_id,
                     uid,
                     calendar_id: Some(cal_id.clone()),
-                    ical: Some(ical),
+                    summary: crate::ical::vevent_field(&ical, "SUMMARY"),
+                    description: crate::ical::vevent_field(&ical, "DESCRIPTION"),
+                    location: crate::ical::vevent_field(&ical, "LOCATION"),
+                    start_date: crate::ical::vevent_field(&ical, "DTSTART"),
+                    end_date: crate::ical::vevent_field(&ical, "DTEND"),
                     etag: r.etag,
-                    summary: None,
-                    description: None,
-                    location: None,
-                    start_date: None,
-                    end_date: None,
+                    ical: Some(ical),
                     status,
                     created_at: None,
                     updated_at: None,
@@ -166,34 +177,17 @@ impl CalendarSource for DavCalendarSource {
     }
 }
 
-/// Extract the first UID: line from a VEVENT in an iCalendar blob. Minimal
-/// parser — good enough for forwardemail output.
+/// Extract the first `UID` line from a `VEVENT` in an iCalendar blob.
+/// Thin convenience wrapper over [`crate::ical::vevent_field`] — kept
+/// for the call sites in this module that want a focused name.
 fn extract_ical_uid(ics: &str) -> Option<String> {
-    extract_ical_field(ics, "UID")
+    crate::ical::vevent_field(ics, "UID")
 }
 
-/// Extract the first STATUS: line from a VEVENT in an iCalendar blob.
-/// Returns values like "CONFIRMED", "TENTATIVE", or "CANCELLED".
+/// Extract the first `STATUS` line from a `VEVENT`. Returns values
+/// like `"CONFIRMED"`, `"TENTATIVE"`, or `"CANCELLED"`.
 fn extract_ical_status(ics: &str) -> Option<String> {
-    extract_ical_field(ics, "STATUS")
-}
-
-/// Extract the first occurrence of a named property from the first VEVENT
-/// block in an iCalendar blob. Minimal line-by-line parser.
-fn extract_ical_field(ics: &str, field: &str) -> Option<String> {
-    let prefix = format!("{}:", field);
-    let mut in_vevent = false;
-    for line in ics.lines() {
-        let l = line.trim();
-        if l.eq_ignore_ascii_case("BEGIN:VEVENT") {
-            in_vevent = true;
-        } else if l.eq_ignore_ascii_case("END:VEVENT") {
-            in_vevent = false;
-        } else if in_vevent && l.to_ascii_uppercase().starts_with(&prefix) {
-            return Some(l[prefix.len()..].trim().to_string());
-        }
-    }
-    None
+    crate::ical::vevent_field(ics, "STATUS")
 }
 
 #[cfg(test)]
@@ -231,5 +225,58 @@ mod tests {
     fn extract_status_absent() {
         let ics = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSUMMARY:Hi\nEND:VEVENT\nEND:VCALENDAR";
         assert_eq!(extract_ical_status(ics), None);
+    }
+
+    /// Direct shape check for the `Fastmail` payload layout (VTIMEZONE
+    /// before VEVENT, parametered DTSTART with TZID). The previous
+    /// `list_events` impl hardcoded `start_date: None`, which made every
+    /// dan@hld.ca calendar event invisible to MCP window filters. The
+    /// fields below must round-trip out of `vevent_field` so the
+    /// `CalendarEvent` returned by the caldav source carries usable
+    /// dates.
+    #[test]
+    fn fastmail_style_payload_yields_full_event_fields() {
+        let ics = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "VERSION:2.0\r\n",
+            "BEGIN:VTIMEZONE\r\n",
+            "TZID:America/Toronto\r\n",
+            "BEGIN:STANDARD\r\n",
+            "DTSTART:18950101T000000\r\n",
+            "RRULE:FREQ=YEARLY;UNTIL=19230513T070000Z;BYMONTH=5\r\n",
+            "END:STANDARD\r\n",
+            "END:VTIMEZONE\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:b28741c0\r\n",
+            "SUMMARY:🔧 Rivian Key Drop-off\r\n",
+            "DTSTART;TZID=America/Toronto:20260214T131000\r\n",
+            "DTEND;TZID=America/Toronto:20260214T133000\r\n",
+            "LOCATION:5720 Rue Ferrier\\, Mount Royal\r\n",
+            "STATUS:CONFIRMED\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+
+        // The shared helper is what list_events now calls when building
+        // the CalendarEvent. Pin the values so a regression in the
+        // extractor surfaces here as well as in src/ical.rs.
+        assert_eq!(
+            crate::ical::vevent_field(ics, "DTSTART").as_deref(),
+            Some("20260214T131000"),
+        );
+        assert_eq!(
+            crate::ical::vevent_field(ics, "DTEND").as_deref(),
+            Some("20260214T133000"),
+        );
+        assert_eq!(
+            crate::ical::vevent_field(ics, "SUMMARY").as_deref(),
+            Some("🔧 Rivian Key Drop-off"),
+        );
+        assert_eq!(
+            crate::ical::vevent_field(ics, "LOCATION").as_deref(),
+            Some("5720 Rue Ferrier\\, Mount Royal"),
+        );
+        assert_eq!(extract_ical_uid(ics).as_deref(), Some("b28741c0"));
+        assert_eq!(extract_ical_status(ics).as_deref(), Some("CONFIRMED"));
     }
 }

@@ -49,6 +49,15 @@ quick-xml = { version = "0.39.2", features = ["serialize"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 mailparse = "0.15"
 regex = "1"
+# RFC 5545 RRULE parsing + occurrence enumeration. We feed `RRuleSet`
+# the original VEVENT block (DTSTART, RRULE, EXDATE, RDATE) and ask
+# for the occurrences inside the requested window — see
+# `mcp::server::expand_recurring_event`. iCloud and Apple Calendar
+# emit recurrence patterns that the master `start_date` alone cannot
+# express ("Erica Tutoring" weekly Thursdays from a fixed master),
+# and without expansion every recurring event after the master is
+# invisible to MCP `list_events` window filters.
+rrule = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util", "macros"] }

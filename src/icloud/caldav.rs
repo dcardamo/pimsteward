@@ -320,63 +320,22 @@ fn extract_ical_uid(ics: &str) -> Option<String> {
     extract_ical_field(ics, "UID")
 }
 
-/// Extract a top-level iCalendar property value from `ical`. Handles
-/// RFC 5545 §3.1 line folding (CRLF or LF followed by space/tab) and
-/// parametered properties (e.g. `SUMMARY;LANGUAGE=en:`). Property name
-/// match is case-insensitive.
+/// Extract a `VEVENT`-scoped iCalendar property value from `ical`.
+/// Thin wrapper around [`crate::ical::vevent_field`] — kept here as a
+/// crate-local name so the rest of this file reads naturally. The
+/// underlying helper is `VEVENT`-scoped (skips `VTIMEZONE` blocks),
+/// parameter-aware (`DTSTART;TZID=America/Toronto:value`), and
+/// case-insensitive on the property name. See `src/ical.rs` for the
+/// full contract and the cross-provider parsing tests.
 ///
-/// **Lossy:** any property parameters (TZID, VALUE, LANGUAGE, …) are
-/// stripped — only the value-portion after the first `:` is returned.
-/// For `DTSTART;TZID=America/New_York:20270115T100000` the return is
-/// `"20270115T100000"` and the timezone is gone. Callers that need
-/// timezone fidelity must parse iCalendar with a real grammar — this
-/// helper exists to surface the most common derived fields cheaply for
-/// the LLM, not to round-trip events losslessly.
+/// **Lossy:** any property parameters (`TZID`, `VALUE`, `LANGUAGE`, …)
+/// are stripped — only the value-portion after the first `:` is
+/// returned. For `DTSTART;TZID=America/New_York:20270115T100000` the
+/// return is `"20270115T100000"` and the timezone is gone. Callers
+/// that need TZID fidelity must run a real iCalendar parse (the RRULE
+/// expander in `mcp::server` is fed full iCal blocks for that reason).
 fn extract_ical_field(ical: &str, name: &str) -> Option<String> {
-    // Step 1: unfold (RFC 5545 §3.1). Replace any CRLF + (space|tab) or
-    // bare LF + (space|tab) with empty — folding is purely cosmetic and
-    // the rest of the parser wants a single logical line per property.
-    let unfolded: String = {
-        let mut out = String::with_capacity(ical.len());
-        let mut chars = ical.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\r' && chars.peek() == Some(&'\n') {
-                chars.next(); // consume \n
-                if matches!(chars.peek(), Some(' ') | Some('\t')) {
-                    chars.next(); // consume continuation space/tab
-                    continue;
-                }
-                out.push('\r');
-                out.push('\n');
-            } else if c == '\n' {
-                if matches!(chars.peek(), Some(' ') | Some('\t')) {
-                    chars.next();
-                    continue;
-                }
-                out.push('\n');
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
-
-    // Step 2: walk lines. Match property name with optional parameters:
-    // either "NAME:" or "NAME;...:".
-    let upper_name = name.to_ascii_uppercase();
-    for line in unfolded.lines() {
-        // Find the first ':' that ends the property name+params.
-        let Some(colon) = line.find(':') else { continue };
-        let head = &line[..colon];
-        // Property name is `head` up to the first ';' (params delimiter).
-        let prop_name = head.split(';').next().unwrap_or(head);
-        if prop_name.eq_ignore_ascii_case(&upper_name) {
-            // Strip any trailing CR (in case the input had CRLF without
-            // splitting cleanly on `lines()`).
-            return Some(line[colon + 1..].trim_end_matches('\r').to_string());
-        }
-    }
-    None
+    crate::ical::vevent_field(ical, name)
 }
 
 // ─── Writer ─────────────────────────────────────────────────────────────
