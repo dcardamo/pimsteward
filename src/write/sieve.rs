@@ -381,6 +381,7 @@ fn remove_rule_from_content(content: &str, rule_name: &str) -> Option<String> {
     let rules = parse_sieve_rules(content);
     let target_idx = rules.iter().position(|r| r.name == rule_name)?;
     let (caps, _) = extract_requires(content);
+    let caps = filter_known_extensions(caps);
 
     let mut out = String::new();
     if !caps.is_empty() {
@@ -526,6 +527,7 @@ pub fn merge_sieve_with_rule(existing: &str, rule_text: &str, comment: Option<&s
             caps.push(cap);
         }
     }
+    let caps = filter_known_extensions(caps);
 
     let mut out = String::new();
     if !caps.is_empty() {
@@ -552,6 +554,51 @@ pub fn merge_sieve_with_rule(existing: &str, rule_text: &str, comment: Option<&s
         out.push('\n');
     }
     out
+}
+
+/// Sieve extensions advertised by Forward Email's ManageSieve server, per
+/// https://forwardemail.net/en/faq#do-you-support-sieve-email-filtering.
+///
+/// `require [...]` is an extension declaration — it must list only true
+/// extensions. RFC 5228 §3.2 says an unknown capability is an error and the
+/// runtime must not begin execution. Forward Email follows this correctly:
+/// scripts that require a non-extension (e.g. the base RFC 5228 action
+/// `discard`) are accepted by their validator but silently skipped at
+/// delivery, so mail falls through to default INBOX. We filter the merged
+/// require list against this allowlist on every rebuild so a stale `discard`
+/// (or any other non-extension) gets stripped automatically.
+pub const KNOWN_SIEVE_EXTENSIONS: &[&str] = &[
+    "fileinto",
+    "reject",
+    "ereject",
+    "vacation",
+    "vacation-seconds",
+    "imap4flags",
+    "envelope",
+    "body",
+    "variables",
+    "relational",
+    "comparator-i;ascii-numeric",
+    "copy",
+    "editheader",
+    "date",
+    "index",
+    "regex",
+    "enotify",
+    "environment",
+    "mailbox",
+    "special-use",
+    "duplicate",
+    "ihave",
+    "subaddress",
+];
+
+/// Drop any capability that isn't in `KNOWN_SIEVE_EXTENSIONS`. Order is
+/// preserved for the survivors.
+fn filter_known_extensions(caps: Vec<String>) -> Vec<String> {
+    caps.into_iter()
+        .filter(|c| KNOWN_SIEVE_EXTENSIONS.contains(&c.as_str()))
+        .collect()
 }
 
 /// Extract every `require [...]` capability list from a sieve script.
@@ -640,21 +687,43 @@ require ["fileinto", "discard"];"#,
 
 if header :contains "subject" "old" { fileinto "Trash"; }
 "#;
-        let rule = r#"require ["discard"];
+        let rule = r#"require ["envelope"];
 
-if header :contains "subject" "spam" { discard; }
+if envelope :is "to" "x@y.z" { fileinto "Junk"; }
 "#;
-        let merged = merge_sieve_with_rule(existing, rule, Some("spam rule"));
+        let merged = merge_sieve_with_rule(existing, rule, Some("env rule"));
         assert!(
-            merged.starts_with("require [\"fileinto\", \"discard\"];\n"),
+            merged.starts_with("require [\"fileinto\", \"envelope\"];\n"),
             "merged output should open with the unioned require: {merged}"
         );
         assert!(merged.contains("\"old\""));
-        assert!(merged.contains("\"spam\""));
-        assert!(merged.contains("# spam rule"));
+        assert!(merged.contains("\"x@y.z\""));
+        assert!(merged.contains("# env rule"));
         // The original require lines from each input should be gone.
         let body_after_first_require = &merged[merged.find("];").unwrap() + 2..];
         assert!(!body_after_first_require.contains("require ["));
+    }
+
+    #[test]
+    fn merge_drops_non_extension_capabilities_from_require() {
+        // `discard` is a base RFC 5228 action, not an extension. Forward
+        // Email's runtime silently refuses to execute scripts that require
+        // unknown caps, so we must never emit `discard` in require.
+        let merged = merge_sieve_with_rule(
+            r#"require ["fileinto", "discard"];
+
+if true { keep; }
+"#,
+            r#"if header :contains "subject" "spam" { discard; stop; }"#,
+            None,
+        );
+        assert!(
+            merged.starts_with("require [\"fileinto\"];\n"),
+            "discard must be filtered out of require: {merged}"
+        );
+        // The discard *action* in the rule body is preserved — only the
+        // bogus require entry is dropped.
+        assert!(merged.contains("discard;"));
     }
 
     #[test]
@@ -675,12 +744,12 @@ if header :contains "subject" "spam" { discard; }
     fn merge_handles_existing_without_requires() {
         let merged = merge_sieve_with_rule(
             r#"if true { keep; }"#,
-            r#"require ["discard"]; if false { discard; }"#,
+            r#"require ["fileinto"]; if false { fileinto "X"; }"#,
             None,
         );
-        assert!(merged.starts_with("require [\"discard\"];"));
+        assert!(merged.starts_with("require [\"fileinto\"];"));
         assert!(merged.contains("keep"));
-        assert!(merged.contains("discard"));
+        assert!(merged.contains("fileinto \"X\""));
     }
 
     #[test]
@@ -745,9 +814,11 @@ if header :contains "subject" "beta" { discard; stop; }
             after.contains("\"beta\""),
             "beta rule should remain: {after}"
         );
+        // `discard` is a base RFC 5228 action (not an extension) — even if
+        // a stale `require` listed it, the rebuild filters it out.
         assert!(
-            after.starts_with("require [\"fileinto\", \"discard\"];"),
-            "require declaration preserved: {after}"
+            after.starts_with("require [\"fileinto\"];"),
+            "require should keep only known extensions: {after}"
         );
     }
 
