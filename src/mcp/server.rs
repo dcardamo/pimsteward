@@ -3001,6 +3001,15 @@ fn parse_headers(text: &str) -> (serde_json::Map<String, serde_json::Value>, Opt
 /// (nested multipart/related, attachments, exact byte preservation)
 /// pass `include_raw: true` and parse the .eml themselves.
 fn extract_body_text(text: &str, content_type: Option<&str>) -> String {
+    extract_body_text_at_depth(text, content_type, 0)
+}
+
+// Cap MIME nesting recursion. Real-world mail tops out at 2-3 levels
+// (multipart/mixed > multipart/related > multipart/alternative); 8 is
+// generous and prevents pathological "MIME bombs" from blowing the stack.
+const MAX_MIME_DEPTH: u8 = 8;
+
+fn extract_body_text_at_depth(text: &str, content_type: Option<&str>, depth: u8) -> String {
     let body_start = match text.find("\r\n\r\n").map(|i| i + 4).or_else(|| text.find("\n\n").map(|i| i + 2)) {
         Some(i) => i,
         None => return String::new(),
@@ -3023,19 +3032,28 @@ fn extract_body_text(text: &str, content_type: Option<&str>) -> String {
         return decoded;
     }
 
+    if depth >= MAX_MIME_DEPTH {
+        return String::new();
+    }
+
     // Extract boundary="..." (or boundary=... with no quotes).
     let boundary = match ct.split(';').find_map(|kv| {
         let kv = kv.trim();
         kv.strip_prefix("boundary=").map(|b| b.trim_matches('"').to_string())
     }) {
         Some(b) if !b.is_empty() => b,
-        _ => return body.to_string(),
+        _ => return String::new(),
     };
     let delim = format!("--{boundary}");
 
     // Walk the parts. For each one, read its own Content-Type and
     // Content-Transfer-Encoding and decode the body. Prefer the first
-    // text/plain; remember the first text/html as a fallback.
+    // text/plain; remember the first text/html as a fallback. Nested
+    // multipart/* parts (common: multipart/related wrapping
+    // multipart/alternative + inline images) are walked recursively —
+    // without this, get_email returned the entire raw MIME blob
+    // including base64 image attachments, blowing the model's context
+    // window on the next chat turn.
     let mut plain: Option<String> = None;
     let mut html: Option<String> = None;
     for part in body.split(&delim).skip(1) {
@@ -3056,11 +3074,21 @@ fn extract_body_text(text: &str, content_type: Option<&str>) -> String {
         let part_headers = &part[..part_headers_end];
         let part_body = part[part_headers_end + offset..]
             .trim_end_matches(['\r', '\n', '-']);
-        let part_ct = find_header_value(part_headers, "content-type")
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        let part_ct_raw = find_header_value(part_headers, "content-type")
+            .unwrap_or_default();
+        let part_ct = part_ct_raw.to_ascii_lowercase();
         let part_cte = find_header_value(part_headers, "content-transfer-encoding");
-        if part_ct.starts_with("text/plain") && plain.is_none() {
+
+        if part_ct.starts_with("multipart/") {
+            // Recurse using a synthesized header block so the inner call
+            // sees this part's full Content-Type (with boundary) and
+            // body. The result is already extracted plain text.
+            let synthetic = format!("Content-Type: {part_ct_raw}\r\n\r\n{part_body}");
+            let nested = extract_body_text_at_depth(&synthetic, Some(&part_ct_raw), depth + 1);
+            if !nested.is_empty() && plain.is_none() {
+                plain = Some(nested);
+            }
+        } else if part_ct.starts_with("text/plain") && plain.is_none() {
             plain = Some(decode_transfer(part_body, part_cte.as_deref()));
         } else if part_ct.starts_with("text/html") && html.is_none() {
             html = Some(decode_transfer(part_body, part_cte.as_deref()));
@@ -3075,7 +3103,7 @@ fn extract_body_text(text: &str, content_type: Option<&str>) -> String {
     if let Some(h) = html {
         return strip_tags(&h);
     }
-    body.to_string()
+    String::new()
 }
 
 /// Look up a header's value (case-insensitive) in a raw header block,
@@ -4375,6 +4403,80 @@ mod tests {
         let out = extract_body_text(msg, Some("text/html; charset=utf-8"));
         assert!(out.contains("Total €42"), "got: {out:?}");
         assert!(!out.contains("<p>"));
+    }
+
+    #[test]
+    fn extract_body_text_recurses_into_multipart_related() {
+        // Real-world shape (RASC newsletter, 2026-05-04): outer
+        // multipart/related wraps an inner multipart/alternative
+        // followed by base64 inline images. Before the recursive fix,
+        // extract_body_text returned the entire raw MIME blob (1.6 MB
+        // of mostly base64 PNG data) which then blew past the model's
+        // context window on the next chat turn.
+        use base64::Engine;
+        let png_b64 = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 4096]);
+        let msg = format!(
+            "Content-Type: multipart/related; type=\"text/html\"; boundary=\"b1\"\r\n\r\n\
+             --b1\r\n\
+             Content-Type: multipart/alternative; boundary=\"b2\"\r\n\r\n\
+             --b2\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\r\n\
+             plain newsletter body\r\n\
+             --b2\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\r\n\
+             <p>html newsletter body</p>\r\n\
+             --b2--\r\n\
+             --b1\r\n\
+             Content-Type: image/png\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n\
+             {png_b64}\r\n\
+             --b1--\r\n"
+        );
+        let out = extract_body_text(&msg, Some("multipart/related; type=\"text/html\"; boundary=\"b1\""));
+        assert!(out.contains("plain newsletter body"), "got first 200: {:?}", &out[..out.len().min(200)]);
+        assert!(!out.contains("--b1"), "must not leak outer boundary: got {} bytes", out.len());
+        assert!(!out.contains("--b2"), "must not leak inner boundary: got {} bytes", out.len());
+        assert!(!out.contains(&png_b64), "must not leak base64 attachment");
+        assert!(out.len() < 200, "expected short text, got {} bytes", out.len());
+    }
+
+    #[test]
+    fn extract_body_text_recurses_html_only_inside_related() {
+        // multipart/related wrapping a single text/html (no alternative)
+        // plus an inline image. Should return stripped HTML, not raw MIME.
+        let msg = concat!(
+            "Content-Type: multipart/related; boundary=\"b\"\r\n\r\n",
+            "--b\r\n",
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "<p>Hello newsletter</p>\r\n",
+            "--b\r\n",
+            "Content-Type: image/png\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\n",
+            "AAAAAAAAAAAAAAAA\r\n",
+            "--b--\r\n",
+        );
+        let out = extract_body_text(msg, Some("multipart/related; boundary=\"b\""));
+        assert!(out.contains("Hello newsletter"), "got: {out:?}");
+        assert!(!out.contains("<p>"), "should strip tags");
+        assert!(!out.contains("AAAA"), "should not leak base64 attachment");
+    }
+
+    #[test]
+    fn extract_body_text_attachment_only_returns_empty_not_raw() {
+        // multipart/mixed with only an attachment, no text part. Pre-fix
+        // this returned the raw MIME body (the historical fallback);
+        // post-fix it returns empty so we never feed binary blobs back
+        // to the model.
+        let msg = concat!(
+            "Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n",
+            "--b\r\n",
+            "Content-Type: application/pdf\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\n",
+            "JVBERi0xLjQKJeLjz9MK\r\n",
+            "--b--\r\n",
+        );
+        let out = extract_body_text(msg, Some("multipart/mixed; boundary=\"b\""));
+        assert_eq!(out, "", "should return empty, not the raw blob: got {} bytes", out.len());
     }
 
     #[test]
