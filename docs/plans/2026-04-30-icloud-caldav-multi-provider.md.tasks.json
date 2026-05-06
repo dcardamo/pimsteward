@@ -4,72 +4,72 @@
     {
       "id": 1,
       "subject": "Task 1: Add Provider trait, Capabilities, registry skeleton",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Establish provider abstraction surface without using it. Pure addition.\n\n**Files:**\n- Create: src/provider/mod.rs\n- Modify: src/lib.rs\n\n**Verify:** `cargo test --lib provider::`\n\n```json:metadata\n{\"files\": [\"src/provider/mod.rs\", \"src/lib.rs\"], \"verifyCommand\": \"cargo test --lib provider::\", \"acceptanceCriteria\": [\"Provider trait defined\", \"Capabilities struct with helpers\", \"tests pass\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 2,
       "subject": "Task 2: Implement ForwardemailProvider wrapping existing code paths",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [1],
       "description": "**Goal:** Wrap existing forwardemail code in ForwardemailProvider; route daemon/MCP source construction through it.\n\n**Files:**\n- Create: src/provider/forwardemail.rs\n- Modify: src/provider/mod.rs, src/daemon.rs, src/mcp/server.rs\n\n**Verify:** `cargo test && cargo clippy -- -D warnings`\n\n```json:metadata\n{\"files\": [\"src/provider/forwardemail.rs\", \"src/provider/mod.rs\", \"src/daemon.rs\", \"src/mcp/server.rs\"], \"verifyCommand\": \"cargo test && cargo clippy -- -D warnings\", \"acceptanceCriteria\": [\"ForwardemailProvider implements Provider\", \"daemon dispatches through provider\", \"all tests still pass\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 3,
       "subject": "Task 3: Provider-aware config schema + capability/permission validation",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [2],
       "description": "**Goal:** Add `[provider.*]` namespaced config form. Reject permission keys for unsupported resources at startup.\n\n**Files:**\n- Modify: src/config.rs, src/permission.rs, src/daemon.rs, src/provider/forwardemail.rs\n\n**Verify:** `cargo test --lib config:: permission::`\n\n```json:metadata\n{\"files\": [\"src/config.rs\", \"src/permission.rs\", \"src/daemon.rs\", \"src/provider/forwardemail.rs\"], \"verifyCommand\": \"cargo test --lib config:: permission::\", \"acceptanceCriteria\": [\"namespaced + legacy parse\", \"both/neither errors\", \"permission validation works\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 4,
       "subject": "Task 4: RFC 6764 CalDAV discovery walk for iCloud",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [1],
       "description": "**Goal:** Walk well-known → principal → calendar-home-set → calendar collections.\n\n**Files:**\n- Create: src/icloud/mod.rs, src/icloud/discovery.rs\n- Modify: src/lib.rs\n- Test: tests/icloud_caldav_test.rs\n\n**Verify:** `cargo test --test icloud_caldav_test discovery::`\n\n```json:metadata\n{\"files\": [\"src/icloud/mod.rs\", \"src/icloud/discovery.rs\", \"src/lib.rs\", \"tests/icloud_caldav_test.rs\"], \"verifyCommand\": \"cargo test --test icloud_caldav_test discovery::\", \"acceptanceCriteria\": [\"3-step PROPFIND walk\", \"XML parsing tested\", \"DiscoveredCalendar populated\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 5,
       "subject": "Task 5: iCloud CalendarSource and CalendarWriter",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [4],
       "description": "**Goal:** Read+write paths for iCloud CalDAV with iCloud-specific quirks (UA, etag, 200/201 PUT).\n\n**Files:**\n- Create: src/icloud/caldav.rs\n- Possibly modify: src/source/traits.rs, src/error.rs\n- Test: tests/icloud_caldav_test.rs\n\n**Verify:** `cargo test --test icloud_caldav_test caldav::`\n\n```json:metadata\n{\"files\": [\"src/icloud/caldav.rs\", \"src/source/traits.rs\", \"src/error.rs\", \"tests/icloud_caldav_test.rs\"], \"verifyCommand\": \"cargo test --test icloud_caldav_test caldav::\", \"acceptanceCriteria\": [\"read path returns CalendarEvent\", \"write path with etag\", \"etag conflict structured error\", \"discovery cached\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 6,
       "subject": "Task 6: IcloudCaldavProvider + dispatch wire-up",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [3, 5],
       "description": "**Goal:** Hook iCloud source/writer behind a Provider impl. MCP tools and pull tasks honour capabilities.\n\n**Files:**\n- Create: src/provider/icloud_caldav.rs\n- Modify: src/provider/mod.rs, src/mcp/server.rs, src/daemon.rs\n\n**Verify:** `cargo test && cargo clippy -- -D warnings`\n\n```json:metadata\n{\"files\": [\"src/provider/icloud_caldav.rs\", \"src/provider/mod.rs\", \"src/mcp/server.rs\", \"src/daemon.rs\"], \"verifyCommand\": \"cargo test && cargo clippy -- -D warnings\", \"acceptanceCriteria\": [\"IcloudCaldavProvider impl\", \"dispatch routes to right impl\", \"tool registration filters by capability\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 7,
       "subject": "Task 7: iCloud calendar-name _test safety guard in safety.rs",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [1],
       "description": "**Goal:** Defense-in-depth guard preventing tests from writing to non-test iCloud calendars.\n\n**Files:**\n- Modify: src/safety.rs\n\n**Verify:** `cargo test --lib safety::`\n\n```json:metadata\n{\"files\": [\"src/safety.rs\"], \"verifyCommand\": \"cargo test --lib safety::\", \"acceptanceCriteria\": [\"panic on non-_test displayname\", \"panic on prod repo path\", \"allowlist env var supported\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 8,
       "subject": "Task 8: e2e suite against real iCloud pimsteward_test calendar",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [6, 7],
       "description": "**Goal:** Live e2e against the real pimsteward_test calendar. Opt-in env vars; never in CI; never commits secrets.\n\n**Files:**\n- Create: tests/icloud_e2e.rs\n- Modify: .gitignore\n\n**Verify:** `PIMSTEWARD_RUN_E2E_ICLOUD=1 PIMSTEWARD_TEST_ICLOUD_USERNAME_FILE=... PIMSTEWARD_TEST_ICLOUD_PASSWORD_FILE=... cargo nextest run --run-ignored all -- icloud_e2e`\n\n```json:metadata\n{\"files\": [\"tests/icloud_e2e.rs\", \".gitignore\"], \"verifyCommand\": \"PIMSTEWARD_RUN_E2E_ICLOUD=1 cargo nextest run --run-ignored all -- icloud_e2e\", \"acceptanceCriteria\": [\"opt-in via env vars\", \"safety guard called\", \"CRUD roundtrip green\", \"cleanup on panic\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 9,
       "subject": "Task 9: README + banner + CONTRIBUTING + CLAUDE.md multi-provider rewrite",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [8],
       "description": "**Goal:** Reframe project as multi-provider in user-facing docs. Forwardemail stays primary; iCloud is the partial-functionality example.\n\n**Files:**\n- Modify: README.md, CONTRIBUTING.md, CLAUDE.md, assets/banner.svg\n\n**Verify:** `git grep 'forwardemail-only' README.md` empty; `git grep 'for forwardemail.net' assets/banner.svg` empty.\n\n```json:metadata\n{\"files\": [\"README.md\", \"CONTRIBUTING.md\", \"CLAUDE.md\", \"assets/banner.svg\"], \"verifyCommand\": \"git grep -c 'forwardemail-only' README.md; git grep -c 'for forwardemail.net' assets/banner.svg\", \"acceptanceCriteria\": [\"multi-provider framing\", \"supported-providers matrix\", \"iCloud setup walkthrough\", \"no secrets\"], \"requiresUserVerification\": false}\n```"
     },
     {
       "id": 10,
       "subject": "Task 10: Example iCloud CalDAV daemon config",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [3],
       "description": "**Goal:** Complete, runnable example config for the iCloud daemon. No secrets — placeholder paths only.\n\n**Files:**\n- Create: examples/config-icloud-caldav.toml\n- Possibly modify: src/config.rs (test that loads the example)\n\n**Verify:** `cargo test --lib config::example_icloud`\n\n```json:metadata\n{\"files\": [\"examples/config-icloud-caldav.toml\", \"src/config.rs\"], \"verifyCommand\": \"cargo test --lib config::example_icloud\", \"acceptanceCriteria\": [\"loads cleanly\", \"every field commented\", \"no secrets\"], \"requiresUserVerification\": false}\n```"
     }
   ],
-  "lastUpdated": "2026-04-30T00:00:00Z"
+  "lastUpdated": "2026-04-30T00:00:01Z"
 }
