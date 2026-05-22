@@ -1,11 +1,12 @@
 //! Calendar feed assembly — pure functions that trim event history and
 //! merge many single-event `VCALENDAR`s into one subscribable feed.
 //!
-//! pimsteward stores each event as a verbatim single-event `VCALENDAR`
-//! (carrying its own `VTIMEZONE`). To publish a `.ics` feed a host-side
-//! builder fetches a calendar's events and folds them into one
-//! `VCALENDAR`: `VEVENT` blocks are preserved byte-for-byte (so `RRULE`
-//! and `VALARM` survive for the client to expand/alert on) and the
+//! pimsteward stores each event as a single-event `VCALENDAR` (carrying
+//! its own `VTIMEZONE`). To publish a `.ics` feed a host-side builder
+//! fetches a calendar's events and folds them into one `VCALENDAR`:
+//! `VEVENT` blocks are preserved as unfolded logical lines (RFC 5545 fold
+//! continuations are removed; clients accept long unfolded lines), so
+//! `RRULE` and `VALARM` survive for the client to expand/alert on. The
 //! repeated `VTIMEZONE` blocks are collapsed to one per `TZID`.
 //!
 //! Everything here is pure: no network, storage, or credentials. The
@@ -18,10 +19,11 @@ use chrono::{DateTime, NaiveDate, Utc};
 use std::collections::BTreeMap;
 
 /// Extract each top-level `BEGIN:<name> … END:<name>` block (inclusive),
-/// CRLF-joined. Inner sub-components (VALARM, STANDARD, DAYLIGHT) use
-/// distinct END tokens and are passed through as content, so a flat scan
-/// over unfolded logical lines correctly captures the whole block —
-/// nested children come along verbatim.
+/// CRLF-joined as unfolded logical lines (RFC 5545 fold continuations are
+/// removed; clients accept long unfolded lines). Inner sub-components
+/// (VALARM, STANDARD, DAYLIGHT) use distinct END tokens and are passed
+/// through as content, so a flat scan over unfolded logical lines
+/// correctly captures the whole block — nested children come along.
 fn extract_components(ical_text: &str, name: &str) -> Vec<String> {
     let begin = format!("BEGIN:{name}");
     let end = format!("END:{name}");
@@ -91,11 +93,15 @@ pub fn keep_for_feed(ev: &CalendarEvent, cutoff: DateTime<Utc>) -> bool {
 
 /// Merge per-event single-event `VCALENDAR`s into one feed `VCALENDAR`.
 ///
-/// Every `VEVENT` (with any nested `VALARM`) is copied through verbatim.
-/// `VTIMEZONE` blocks are de-duplicated by `TZID` — real stored events
-/// each carry a multi-decade `America/Toronto` definition, so without
-/// this the feed would repeat thousands of identical copies. Events with
-/// a missing or empty `ical` are skipped.
+/// Every `VEVENT` (with any nested `VALARM`) is preserved as unfolded
+/// logical lines (RFC 5545 fold continuations are removed; clients accept
+/// long unfolded lines). A single stored payload may contain more than one
+/// `VEVENT` (a recurring-series master plus `RECURRENCE-ID` overrides) —
+/// all of them are collected. `VTIMEZONE` blocks are de-duplicated by
+/// `TZID` — real stored events each carry a multi-decade
+/// `America/Toronto` definition, so without this the feed would repeat
+/// thousands of identical copies. Events with a missing or empty `ical`
+/// are skipped.
 pub fn merge_calendar(events: &[&CalendarEvent], cal_name: &str, prodid: &str) -> String {
     let mut tzs: BTreeMap<String, String> = BTreeMap::new();
     let mut vevents: Vec<String> = Vec::new();
@@ -235,5 +241,108 @@ mod tests {
         let out = build_feed(&events, cutoff, "Dan", "-//x//EN");
         assert!(out.contains("UID:n"));
         assert!(!out.contains("UID:o"));
+    }
+
+    /// A single stored `.ics` payload that contains a master VEVENT (with
+    /// RRULE) plus a RECURRENCE-ID override VEVENT (same UID) — both must
+    /// appear in the merged feed. `keep_for_feed` must keep the whole
+    /// payload because the FIRST VEVENT carries the RRULE.
+    #[test]
+    fn multi_vevent_payload_master_and_override_both_emitted() {
+        // Build a single VCALENDAR with one VTIMEZONE, one master VEVENT
+        // (with RRULE), and one override VEVENT (with RECURRENCE-ID).
+        let payload = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "VERSION:2.0\r\n",
+            "PRODID:-//x//EN\r\n",
+            "BEGIN:VTIMEZONE\r\n",
+            "TZID:America/Toronto\r\n",
+            "END:VTIMEZONE\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:series-1\r\n",
+            "DTSTART:20260101T090000\r\n",
+            "RRULE:FREQ=WEEKLY\r\n",
+            "SUMMARY:Weekly\r\n",
+            "END:VEVENT\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:series-1\r\n",
+            "RECURRENCE-ID:20260108T090000\r\n",
+            "DTSTART:20260108T100000\r\n",
+            "SUMMARY:Weekly (moved)\r\n",
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let e = ev(payload);
+
+        // keep_for_feed inspects the FIRST VEVENT only (master with RRULE)
+        // and must return true — the override VEVENTs must not be confused
+        // with separate non-recurring events.
+        let cutoff = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        assert!(
+            keep_for_feed(&e, cutoff),
+            "master-first multi-VEVENT payload must be kept (RRULE on master)"
+        );
+
+        // merge_calendar must emit BOTH VEVENTs and deduplicate the VTIMEZONE.
+        let refs = vec![&e];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        assert_eq!(
+            out.matches("BEGIN:VEVENT").count(),
+            2,
+            "both master and override VEVENT must appear in merged output"
+        );
+        assert!(
+            out.contains("RECURRENCE-ID:20260108T090000"),
+            "RECURRENCE-ID line must survive in merged output"
+        );
+        assert_eq!(
+            out.matches("BEGIN:VTIMEZONE").count(),
+            1,
+            "shared VTIMEZONE must appear exactly once"
+        );
+    }
+
+    /// RFC 5545 §3.1 fold continuations are stripped by `extract_components`
+    /// (it runs `unfold()` before collecting lines). A DESCRIPTION folded
+    /// across two physical lines must appear as one long unfolded line in
+    /// the merged feed — clients accept long unfolded lines.
+    #[test]
+    fn folded_description_is_unfolded_in_merged_output() {
+        // Physical fold: `\r\n ` is the continuation marker per RFC 5545.
+        // The space is part of the fold, NOT part of the value — unfold()
+        // strips both the CRLF and the leading space of the next line.
+        let folded_payload = concat!(
+            "BEGIN:VCALENDAR\r\n",
+            "VERSION:2.0\r\n",
+            "PRODID:-//x//EN\r\n",
+            "BEGIN:VTIMEZONE\r\n",
+            "TZID:America/Toronto\r\n",
+            "END:VTIMEZONE\r\n",
+            "BEGIN:VEVENT\r\n",
+            "UID:fold-test\r\n",
+            "DTSTART:20260601T090000\r\n",
+            "SUMMARY:Fold test\r\n",
+            "DESCRIPTION:first part\r\n",
+            " second part\r\n",      // RFC 5545 fold continuation
+            "END:VEVENT\r\n",
+            "END:VCALENDAR\r\n",
+        );
+        let e = ev(folded_payload);
+        let refs = vec![&e];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        // The two physical lines collapse to one unfolded logical line.
+        assert!(
+            out.contains("DESCRIPTION:first partsecond part"),
+            "folded DESCRIPTION must be unfolded in merged output (got: {:?})",
+            out.lines()
+                .find(|l| l.contains("DESCRIPTION"))
+                .unwrap_or("<not found>"),
+        );
+        // The fold marker (bare leading space on a continuation line) must
+        // not appear as a separate line in the output.
+        assert!(
+            !out.contains("\r\n second part"),
+            "fold continuation must not survive as a physical-fold line"
+        );
     }
 }
