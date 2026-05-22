@@ -1,0 +1,13 @@
+[package]
+name = "pimsteward-ical"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+
+[dev-dependencies]
+pretty_assertions = "1"

@@ -1,0 +1,13 @@
+[package]
+name = "ics-feedbuilder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Stub crate — filled in by Task 3 (host-side ICS feed builder). It is a
+# workspace member now only so the workspace resolves while the later
+# tasks land. Intentionally has no dependencies yet.
+
+[[bin]]
+name = "ics-feedbuilder"
+path = "src/main.rs"

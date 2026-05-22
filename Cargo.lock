@@ -1646,6 +1646,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ics-feedbuilder"
+version = "0.1.0"
+
+[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2193,6 +2197,7 @@ dependencies = [
  "hex",
  "insta",
  "mailparse",
+ "pimsteward-ical",
  "pretty_assertions",
  "quick-xml",
  "regex",
@@ -2218,6 +2223,16 @@ dependencies = [
  "tracing-subscriber",
  "webpki-roots 0.26.11",
  "wiremock",
+]
+
+[[package]]
+name = "pimsteward-ical"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pretty_assertions",
+ "serde",
+ "time",
 ]
 
 [[package]]

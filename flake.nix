@@ -32,6 +32,8 @@
       package = craneLib.buildPackage (commonArgs
         // {
           inherit cargoArtifacts;
+          pname = "pimsteward";
+          cargoExtraArgs = "-p pimsteward";
           doCheck = false; # tests run in `nix flake check` separately
         });
     in {

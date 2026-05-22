@@ -36,7 +36,7 @@
 /// `LF`) followed by a single space or tab is a line continuation and
 /// must be stripped. `VEVENT` extraction relies on logical lines, so
 /// we unfold up front and walk the result.
-fn unfold(ical: &str) -> String {
+pub fn unfold(ical: &str) -> String {
     let mut out = String::with_capacity(ical.len());
     let mut chars = ical.chars().peekable();
     while let Some(c) = chars.next() {
@@ -65,7 +65,7 @@ fn unfold(ical: &str) -> String {
 /// `None` if the line has no `:` (which makes it not a property).
 /// Strips parameters: `DTSTART;TZID=America/Toronto:value` returns
 /// `("DTSTART", "value")`.
-fn split_property(line: &str) -> Option<(&str, &str)> {
+pub fn split_property(line: &str) -> Option<(&str, &str)> {
     let line = line.trim_end_matches('\r');
     let colon = line.find(':')?;
     let head = &line[..colon];

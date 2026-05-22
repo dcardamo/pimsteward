@@ -5,7 +5,9 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod forwardemail;
-pub mod ical;
+// The iCal line-helpers now live in the dependency-light `pimsteward-ical`
+// crate. Re-export the module so existing `crate::ical::…` paths keep working.
+pub use pimsteward_ical::ical;
 pub mod icloud;
 pub mod index;
 pub mod mcp;
