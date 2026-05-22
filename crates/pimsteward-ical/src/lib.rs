@@ -6,6 +6,8 @@
 //! serde/chrono/time.
 
 mod event;
+pub mod feed;
 pub mod ical;
 
 pub use event::CalendarEvent;
+pub use feed::{build_feed, keep_for_feed, merge_calendar};
