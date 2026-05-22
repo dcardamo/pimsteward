@@ -43,6 +43,15 @@ pub fn write_if_changed(path: &Path, contents: &str) -> Result<bool> {
     use std::io::Write;
     tmp.write_all(contents.as_bytes())?;
     tmp.flush()?;
+    // Set mode 0640 before persist so Caddy (group member) can read the file.
+    // NamedTempFile::new_in creates 0600; persist() is a rename and preserves
+    // that mode. fchmod here is explicit and not affected by umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o640))?;
+    }
     // Atomic rename within the same directory.
     tmp.persist(path)
         .with_context(|| format!("persist temp file to {}", path.display()))?;
@@ -134,6 +143,15 @@ async fn main() -> Result<()> {
         .to_string();
 
     let events = fetch_events(&cfg, &bearer).await?;
+    // Guard: an empty result always indicates a misconfiguration or silent
+    // permission change. Refuse to overwrite a previously-good feed with an
+    // empty one — exit non-zero so the caller/timer sees the failure.
+    if events.is_empty() {
+        anyhow::bail!(
+            "list_events returned 0 events for calendar {}; refusing to publish an empty feed (leaving the existing file intact)",
+            cfg.calendar_id
+        );
+    }
     let cutoff = Utc::now() - Duration::days(cfg.history_days);
     let prodid = "-//hld.ca//ics-feedbuilder//EN";
     let feed = build_feed(&events, cutoff, &cfg.cal_name, prodid);
@@ -166,5 +184,12 @@ mod tests {
         assert_eq!(m1, m2, "mtime stable when unchanged");
         assert!(write_if_changed(&path, "B").unwrap(), "rewrite on change");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "B");
+        // Verify the feed file is group-readable so Caddy can serve it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "feed file must be group-readable for Caddy");
+        }
     }
 }
