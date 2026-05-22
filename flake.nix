@@ -22,6 +22,8 @@
 
       commonArgs = {
         inherit src;
+        pname = "pimsteward-workspace";
+        version = "0.1.0";
         strictDeps = true;
         buildInputs = with pkgs; [openssl sqlite];
         nativeBuildInputs = with pkgs; [pkg-config];
