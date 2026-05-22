@@ -45,6 +45,124 @@ fn extract_components(ical_text: &str, name: &str) -> Vec<String> {
     out
 }
 
+/// Windows/Exchange zone name → IANA. Exchange-origin calendars emit
+/// Windows TZIDs ("Eastern Standard Time") which strict RFC 5545 clients
+/// reject; map the common ones to IANA so the published feed is portable.
+/// Source: CLDR windowsZones, primary ("001") territory mapping.
+fn windows_to_iana(win: &str) -> Option<&'static str> {
+    Some(match win {
+        // North America (the zones this calendar actually uses + neighbours)
+        "Dateline Standard Time" => "Etc/GMT+12",
+        "Aleutian Standard Time" => "America/Adak",
+        "Hawaiian Standard Time" => "Pacific/Honolulu",
+        "Alaskan Standard Time" => "America/Anchorage",
+        "Pacific Standard Time (Mexico)" => "America/Tijuana",
+        "Pacific Standard Time" => "America/Los_Angeles",
+        "US Mountain Standard Time" => "America/Phoenix",
+        "Mountain Standard Time (Mexico)" => "America/Mazatlan",
+        "Mountain Standard Time" => "America/Denver",
+        "Central America Standard Time" => "America/Guatemala",
+        "Central Standard Time (Mexico)" => "America/Mexico_City",
+        "Central Standard Time" => "America/Chicago",
+        "Canada Central Standard Time" => "America/Regina",
+        "SA Pacific Standard Time" => "America/Bogota",
+        "Eastern Standard Time (Mexico)" => "America/Cancun",
+        "US Eastern Standard Time" => "America/Indiana/Indianapolis",
+        "Eastern Standard Time" => "America/New_York",
+        "Venezuela Standard Time" => "America/Caracas",
+        "Atlantic Standard Time" => "America/Halifax",
+        "Newfoundland Standard Time" => "America/St_Johns",
+        "SA Eastern Standard Time" => "America/Cayenne",
+        "Argentina Standard Time" => "America/Buenos_Aires",
+        "E. South America Standard Time" => "America/Sao_Paulo",
+        "Greenland Standard Time" => "America/Godthab",
+        "Pacific SA Standard Time" => "America/Santiago",
+        "SA Western Standard Time" => "America/La_Paz",
+        // Atlantic / Europe / Africa
+        "Azores Standard Time" => "Atlantic/Azores",
+        "Cape Verde Standard Time" => "Atlantic/Cape_Verde",
+        "UTC" => "Etc/UTC",
+        "GMT Standard Time" => "Europe/London",
+        "Greenwich Standard Time" => "Atlantic/Reykjavik",
+        "W. Europe Standard Time" => "Europe/Berlin",
+        "Central Europe Standard Time" => "Europe/Budapest",
+        "Romance Standard Time" => "Europe/Paris",
+        "Central European Standard Time" => "Europe/Warsaw",
+        "W. Central Africa Standard Time" => "Africa/Lagos",
+        "GTB Standard Time" => "Europe/Bucharest",
+        "FLE Standard Time" => "Europe/Kiev",
+        "E. Europe Standard Time" => "Europe/Chisinau",
+        "Egypt Standard Time" => "Africa/Cairo",
+        "South Africa Standard Time" => "Africa/Johannesburg",
+        "Israel Standard Time" => "Asia/Jerusalem",
+        "Russian Standard Time" => "Europe/Moscow",
+        "E. Africa Standard Time" => "Africa/Nairobi",
+        // Asia / Pacific
+        "Arabic Standard Time" => "Asia/Baghdad",
+        "Arab Standard Time" => "Asia/Riyadh",
+        "Iran Standard Time" => "Asia/Tehran",
+        "Arabian Standard Time" => "Asia/Dubai",
+        "Azerbaijan Standard Time" => "Asia/Baku",
+        "India Standard Time" => "Asia/Kolkata",
+        "Nepal Standard Time" => "Asia/Kathmandu",
+        "Central Asia Standard Time" => "Asia/Almaty",
+        "Bangladesh Standard Time" => "Asia/Dhaka",
+        "Myanmar Standard Time" => "Asia/Yangon",
+        "SE Asia Standard Time" => "Asia/Bangkok",
+        "China Standard Time" => "Asia/Shanghai",
+        "Singapore Standard Time" => "Asia/Singapore",
+        "Taipei Standard Time" => "Asia/Taipei",
+        "Tokyo Standard Time" => "Asia/Tokyo",
+        "Korea Standard Time" => "Asia/Seoul",
+        "W. Australia Standard Time" => "Australia/Perth",
+        "Cen. Australia Standard Time" => "Australia/Adelaide",
+        "AUS Central Standard Time" => "Australia/Darwin",
+        "E. Australia Standard Time" => "Australia/Brisbane",
+        "AUS Eastern Standard Time" => "Australia/Sydney",
+        "Tasmania Standard Time" => "Australia/Hobart",
+        "New Zealand Standard Time" => "Pacific/Auckland",
+        _ => return None,
+    })
+}
+
+/// Rewrite a single logical line's TZID (property `TZID:` or parameter
+/// `;TZID=`) from a Windows zone name to IANA. Preserves any trailing
+/// CRLF/LF. Lines without a known Windows TZID are returned unchanged.
+fn rewrite_tzid_line(line: &str) -> String {
+    let core = line.trim_end_matches(['\r', '\n']);
+    let suffix = &line[core.len()..];
+    // VTIMEZONE property form: the whole value after `TZID:`
+    if let Some(val) = core.strip_prefix("TZID:") {
+        if let Some(iana) = windows_to_iana(val) {
+            return format!("TZID:{iana}{suffix}");
+        }
+        return line.to_string();
+    }
+    // Parameter form: `...;TZID=<value>` where value ends at `;` or `:`.
+    // (Windows zone names contain spaces but never `;`/`:`.)
+    if let Some(pos) = core.find(";TZID=") {
+        let vstart = pos + ";TZID=".len();
+        let rel_end = core[vstart..]
+            .find([';', ':'])
+            .map(|i| vstart + i)
+            .unwrap_or(core.len());
+        if let Some(iana) = windows_to_iana(&core[vstart..rel_end]) {
+            return format!("{}{}{}{}", &core[..vstart], iana, &core[rel_end..], suffix);
+        }
+    }
+    line.to_string()
+}
+
+/// Rewrite all Windows TZIDs in an iCal payload to IANA. Operates on
+/// unfolded logical lines (so a TZID value isn't split across a fold).
+fn rewrite_windows_tzids(ical: &str) -> String {
+    let unfolded = unfold(ical);
+    unfolded
+        .split_inclusive('\n')
+        .map(rewrite_tzid_line)
+        .collect()
+}
+
 /// Plain (non-VEVENT-scoped) single-field value scan, params stripped.
 /// Used for `VTIMEZONE`'s `TZID`, which lives outside any `VEVENT` and so
 /// can't go through the VEVENT-scoped helpers in [`crate::ical`].
@@ -106,18 +224,22 @@ pub fn merge_calendar(events: &[&CalendarEvent], cal_name: &str, prodid: &str) -
     let mut tzs: BTreeMap<String, String> = BTreeMap::new();
     let mut vevents: Vec<String> = Vec::new();
     for ev in events {
-        let Some(ical_text) = ev.ical.as_deref() else {
+        let Some(raw) = ev.ical.as_deref() else {
             continue;
         };
-        if ical_text.trim().is_empty() {
+        if raw.trim().is_empty() {
             continue;
         }
-        for tz in extract_components(ical_text, "VTIMEZONE") {
+        // Rewrite Windows/Exchange TZIDs to IANA before extraction so the
+        // dedup key (the VTIMEZONE TZID) collapses Windows and IANA spellings
+        // of the same zone into one block.
+        let ical_text = rewrite_windows_tzids(raw);
+        for tz in extract_components(&ical_text, "VTIMEZONE") {
             if let Some(id) = scan_field(&tz, "TZID") {
                 tzs.entry(id).or_insert(tz);
             }
         }
-        vevents.extend(extract_components(ical_text, "VEVENT"));
+        vevents.extend(extract_components(&ical_text, "VEVENT"));
     }
     let mut out = String::new();
     out.push_str("BEGIN:VCALENDAR\r\n");
@@ -170,6 +292,24 @@ mod tests {
             uid = uid,
             dt = dtstart,
             extra = extra,
+        )
+    }
+
+    /// Build a single-event VCALENDAR whose VTIMEZONE carries `tzid` as its
+    /// `TZID:` property AND whose DTSTART carries it as a `;TZID=` parameter.
+    /// The VTIMEZONE keeps a STANDARD sub-component so we can assert the
+    /// embedded rules survive (only the label is rewritten).
+    fn single_tzid(uid: &str, tzid: &str, dtstart: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//EN\r\n\
+             BEGIN:VTIMEZONE\r\nTZID:{tzid}\r\n\
+             BEGIN:STANDARD\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nEND:STANDARD\r\n\
+             END:VTIMEZONE\r\n\
+             BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTART;TZID={tzid}:{dt}\r\nSUMMARY:{uid}\r\nEND:VEVENT\r\n\
+             END:VCALENDAR\r\n",
+            tzid = tzid,
+            uid = uid,
+            dt = dtstart,
         )
     }
 
@@ -344,5 +484,109 @@ mod tests {
             !out.contains("\r\n second part"),
             "fold continuation must not survive as a physical-fold line"
         );
+    }
+
+    /// Exchange-origin events carry Windows TZIDs in BOTH the VTIMEZONE
+    /// `TZID:` property and the `;TZID=` parameter on DTSTART. The merged
+    /// feed must rewrite both forms to IANA and leave no Windows name behind.
+    #[test]
+    fn windows_tzid_property_and_param_rewritten_to_iana() {
+        let e = ev(&single_tzid(
+            "exch-1",
+            "Eastern Standard Time",
+            "20260305T180000",
+        ));
+        let refs = vec![&e];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        // Property form (VTIMEZONE) rewritten.
+        assert!(
+            out.contains("TZID:America/New_York"),
+            "VTIMEZONE TZID property must be rewritten to IANA"
+        );
+        // Parameter form (DTSTART) rewritten.
+        assert!(
+            out.contains("DTSTART;TZID=America/New_York:20260305T180000"),
+            "DTSTART ;TZID= parameter must be rewritten to IANA"
+        );
+        // No Windows spelling survives anywhere.
+        assert!(
+            !out.contains("Eastern Standard Time"),
+            "no Windows zone name must remain in the merged output"
+        );
+        // Embedded STANDARD rules survive — only the label changed.
+        assert!(
+            out.contains("BEGIN:STANDARD") && out.contains("TZOFFSETTO:-0500"),
+            "embedded VTIMEZONE rules must be preserved"
+        );
+    }
+
+    #[test]
+    fn newfoundland_maps_to_st_johns() {
+        let e = ev(&single_tzid(
+            "nf-1",
+            "Newfoundland Standard Time",
+            "20260305T180000",
+        ));
+        let refs = vec![&e];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        assert!(out.contains("TZID:America/St_Johns"));
+        assert!(out.contains("DTSTART;TZID=America/St_Johns:20260305T180000"));
+        assert!(!out.contains("Newfoundland Standard Time"));
+    }
+
+    #[test]
+    fn iana_tzid_left_unchanged() {
+        let e = ev(&single_tzid("iana-1", "America/Toronto", "20260305T180000"));
+        let refs = vec![&e];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        assert!(out.contains("TZID:America/Toronto"));
+        assert!(out.contains("DTSTART;TZID=America/Toronto:20260305T180000"));
+        // Present exactly once (one VTIMEZONE, one DTSTART param).
+        assert_eq!(out.matches("TZID:America/Toronto").count(), 1);
+        assert_eq!(out.matches("BEGIN:VTIMEZONE").count(), 1);
+    }
+
+    #[test]
+    fn unknown_zone_left_unchanged() {
+        let e = ev(&single_tzid(
+            "narnia-1",
+            "Narnia Standard Time",
+            "20260305T180000",
+        ));
+        let refs = vec![&e];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        // Unknown name passes through verbatim — no panic, both forms intact.
+        assert!(out.contains("TZID:Narnia Standard Time"));
+        assert!(out.contains("DTSTART;TZID=Narnia Standard Time:20260305T180000"));
+    }
+
+    /// An event using `Eastern Standard Time` and another using the IANA
+    /// `America/New_York` are the same zone — after rewrite they share a
+    /// TZID and dedupe to ONE VTIMEZONE while both VEVENTs survive.
+    #[test]
+    fn windows_and_iana_same_zone_dedupe_to_one() {
+        let win = ev(&single_tzid(
+            "win-1",
+            "Eastern Standard Time",
+            "20260305T180000",
+        ));
+        let iana = ev(&single_tzid("iana-1", "America/New_York", "20260306T180000"));
+        let refs = vec![&win, &iana];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        assert_eq!(
+            out.matches("BEGIN:VTIMEZONE").count(),
+            1,
+            "Windows + IANA spellings of the same zone must collapse to one VTIMEZONE"
+        );
+        assert_eq!(
+            out.matches("BEGIN:VEVENT").count(),
+            2,
+            "both events must survive the merge"
+        );
+        assert!(
+            !out.contains("Eastern Standard Time"),
+            "no Windows zone name must remain after rewrite"
+        );
+        assert!(out.contains("TZID:America/New_York"));
     }
 }
