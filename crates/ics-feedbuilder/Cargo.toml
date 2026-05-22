@@ -4,10 +4,40 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Stub crate — filled in by Task 3 (host-side ICS feed builder). It is a
-# workspace member now only so the workspace resolves while the later
-# tasks land. Intentionally has no dependencies yet.
+# Host-side ICS feed builder. Runs OUTSIDE the pimsteward container as a
+# systemd timer, fetches the Dan calendar windowless over pimsteward's MCP
+# (Streamable HTTP), builds a subscribable feed via pimsteward-ical, and
+# writes it only when the content changed.
+#
+# SECURITY: depends ONLY on pimsteward-ical, never on the `pimsteward`
+# crate. That compiler-enforced isolation keeps email/credential/network
+# surface out of the host binary.
 
 [[bin]]
 name = "ics-feedbuilder"
 path = "src/main.rs"
+
+[dependencies]
+pimsteward-ical = { path = "../pimsteward-ical" }
+# `transport-streamable-http-client-reqwest` is the feature that actually
+# wires up the reqwest-backed Streamable HTTP CLIENT transport and exposes
+# `StreamableHttpClientTransport::from_config`. The bare `reqwest` feature
+# only flips reqwest's TLS backend and does NOT enable the transport.
+rmcp = { version = "1.3.0", features = [
+    "client",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["clock"] }
+sha2 = "0.10"
+hex = "0.4"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

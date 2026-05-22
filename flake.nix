@@ -38,8 +38,21 @@
           cargoExtraArgs = "-p pimsteward";
           doCheck = false; # tests run in `nix flake check` separately
         });
+
+      # Host-side ICS feed builder — consumed by the dotfiles flake as an
+      # input so a systemd timer can run it OUTSIDE the pimsteward container.
+      ics-feedbuilder = craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+          pname = "ics-feedbuilder";
+          cargoExtraArgs = "-p ics-feedbuilder";
+          doCheck = false;
+        });
     in {
-      packages.default = package;
+      packages = {
+        default = package;
+        inherit ics-feedbuilder;
+      };
 
       checks = {
         inherit package;
