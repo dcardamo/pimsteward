@@ -139,13 +139,18 @@ fn rewrite_tzid_line(line: &str) -> String {
         return line.to_string();
     }
     // Parameter form: `...;TZID=<value>` where value ends at `;` or `:`.
-    // (Windows zone names contain spaces but never `;`/`:`.)
-    if let Some(pos) = core.find(";TZID=") {
+    // (Windows zone names contain spaces but never `;`/`:`.) Only the
+    // property HEAD (before the first `:`) holds parameters — restrict the
+    // search there so a literal `;TZID=` inside a TEXT value (e.g. a
+    // DESCRIPTION) is never rewritten. Exchange emits TZID uppercase and
+    // unquoted, which is what this matches.
+    let head_end = core.find(':').unwrap_or(core.len());
+    if let Some(pos) = core[..head_end].find(";TZID=") {
         let vstart = pos + ";TZID=".len();
-        let rel_end = core[vstart..]
-            .find([';', ':'])
+        let rel_end = core[vstart..head_end]
+            .find(';')
             .map(|i| vstart + i)
-            .unwrap_or(core.len());
+            .unwrap_or(head_end);
         if let Some(iana) = windows_to_iana(&core[vstart..rel_end]) {
             return format!("{}{}{}{}", &core[..vstart], iana, &core[rel_end..], suffix);
         }
@@ -311,6 +316,24 @@ mod tests {
             uid = uid,
             dt = dtstart,
         )
+    }
+
+    #[test]
+    fn tzid_inside_a_text_value_is_not_rewritten() {
+        // A literal ";TZID=<zone>:" inside a DESCRIPTION value must be left
+        // alone — only the property head (before the first `:`) holds real
+        // TZID parameters.
+        let a = ev(&single(
+            "d",
+            "20260601T120000",
+            "DESCRIPTION:re ;TZID=Eastern Standard Time:see below\r\n",
+        ));
+        let refs = vec![&a];
+        let out = merge_calendar(&refs, "Dan", "-//x//EN");
+        assert!(
+            out.contains("DESCRIPTION:re ;TZID=Eastern Standard Time:see below"),
+            "TEXT value must not be rewritten:\n{out}"
+        );
     }
 
     #[test]
