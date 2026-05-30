@@ -3020,10 +3020,11 @@ fn extract_body_text_at_depth(text: &str, content_type: Option<&str>, depth: u8)
     // Top-level Content-Transfer-Encoding applies to single-part bodies.
     let top_cte = find_header_value(header_block, "content-transfer-encoding");
 
-    let ct = match content_type {
-        Some(s) => s.to_ascii_lowercase(),
+    let ct_raw = match content_type {
+        Some(s) => s,
         None => return decode_transfer(body, top_cte.as_deref()),
     };
+    let ct = ct_raw.to_ascii_lowercase();
     if !ct.starts_with("multipart/") {
         let decoded = decode_transfer(body, top_cte.as_deref());
         if ct.starts_with("text/html") {
@@ -3036,10 +3037,21 @@ fn extract_body_text_at_depth(text: &str, content_type: Option<&str>, depth: u8)
         return String::new();
     }
 
-    // Extract boundary="..." (or boundary=... with no quotes).
-    let boundary = match ct.split(';').find_map(|kv| {
+    // Extract boundary="..." (or boundary=... with no quotes) from the
+    // ORIGINAL-case Content-Type. MIME boundaries are case-sensitive when
+    // matched against the `--<boundary>` delimiter lines in the body, so
+    // reading the value out of a lowercased copy silently breaks any
+    // sender that uses an uppercase-bearing boundary (Porter/SparkPost).
+    // The parameter NAME is matched case-insensitively; only the VALUE's
+    // case is preserved.
+    let boundary = match ct_raw.split(';').find_map(|kv| {
         let kv = kv.trim();
-        kv.strip_prefix("boundary=").map(|b| b.trim_matches('"').to_string())
+        let eq = kv.find('=')?;
+        let (name, val) = kv.split_at(eq);
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        Some(val[1..].trim().trim_matches('"').to_string())
     }) {
         Some(b) if !b.is_empty() => b,
         _ => return String::new(),
@@ -4279,6 +4291,34 @@ mod tests {
         let out = extract_body_text(msg, Some("multipart/alternative; boundary=\"abc\""));
         assert!(out.contains("plain version"), "got: {out:?}");
         assert!(!out.contains("<p>"), "should not contain html tags");
+    }
+
+    #[test]
+    fn extract_body_text_mixed_case_boundary() {
+        // Regression: MIME boundaries are case-SENSITIVE when matched
+        // against the delimiter lines in the body, but the boundary was
+        // being read out of a lowercased copy of the Content-Type. A
+        // sender with an uppercase-bearing boundary (Porter/SparkPost:
+        // `_----X9A1bs2zxW9BNDL0IApb3w===_52/0F-21469-522FCF96`) then
+        // had its delimiter mismatched, yielding an empty body even
+        // though the full multipart was on disk.
+        let boundary = "_----X9A1bs2zxW9BNDL0IApb3w===_52/0F-21469-522FCF96";
+        let msg = format!(
+            "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n\
+             --{boundary}\r\n\
+             Content-Type: text/plain; charset=UTF-8\r\n\r\n\
+             your flight is confirmed\r\n\
+             --{boundary}\r\n\
+             Content-Type: text/html; charset=UTF-8\r\n\r\n\
+             <p>your flight is confirmed</p>\r\n\
+             --{boundary}--\r\n",
+        );
+        let ct = format!("multipart/alternative; boundary=\"{boundary}\"");
+        let out = extract_body_text(&msg, Some(&ct));
+        assert!(
+            out.contains("your flight is confirmed"),
+            "mixed-case boundary must still extract the body; got: {out:?}"
+        );
     }
 
     #[test]
