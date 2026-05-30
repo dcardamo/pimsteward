@@ -242,6 +242,76 @@ pub async fn sync_folders(
     Ok(summary)
 }
 
+/// Fetch one message by source id and write its `.eml`, `meta.json`, and
+/// attachment sidecar into `folder_dir`, then upsert it into the search
+/// index. Returns the derived canonical id. Shared by the changed-message
+/// loop and the missing-locally backfill loop in [`sync_one_folder`] so
+/// both paths produce byte-identical on-disk + index state.
+async fn fetch_and_write_message(
+    source: &dyn MailSource,
+    repo: &Repo,
+    index: Option<&SearchIndex>,
+    folder_path: &str,
+    folder_dir: &str,
+    id: &str,
+) -> PullResult<String> {
+    // Source-agnostic fetch: REST extracts `raw` from the JSON response;
+    // IMAP uses `UID FETCH BODY[]`. Both return raw RFC822 bytes.
+    let fetched = source.fetch_message(folder_path, id).await?;
+    let canonical = derive_canonical_id(&fetched);
+
+    let eml_path = format!("{folder_dir}/{canonical}.eml");
+    repo.write_file(&eml_path, &fetched.raw)?;
+
+    let mut meta = MessageMeta::from_fetched(&fetched);
+    meta.canonical_id = Some(canonical.clone());
+    let meta_path = format!("{folder_dir}/{canonical}.meta.json");
+    repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
+
+    // Attachment index: parse nodemailer.attachments[], write each blob to
+    // _attachments/<sha256>, and write the reference list as a sidecar.
+    // REST-only — IMAP's `extra` is None.
+    let attachments_sidecar = format!("{folder_dir}/{canonical}.attachments.json");
+    let attachments_sidecar_fs = repo.root().join(&attachments_sidecar);
+    match extract_attachments(&fetched, repo)? {
+        Some(refs) if !refs.is_empty() => {
+            repo.write_file(
+                &attachments_sidecar,
+                serde_json::to_vec_pretty(&refs)?.as_slice(),
+            )?;
+        }
+        _ => {
+            let _ = std::fs::remove_file(attachments_sidecar_fs);
+        }
+    }
+
+    // Update the search index alongside the on-disk write. Best-effort: a
+    // failed upsert logs and does not fail the pull. The .eml on disk is
+    // the source of truth; `pimsteward index rebuild` can always recover.
+    if let Some(idx) = index {
+        let facts = envelope::MetaFacts {
+            canonical_id: &canonical,
+            folder: folder_path,
+            source_id: &meta.id,
+            flags: &meta.flags,
+            internal_date: meta.internal_date.as_deref(),
+            size: meta.size,
+        };
+        match envelope::parse_eml(&fetched.raw, &facts) {
+            Ok(row) => {
+                if let Err(e) = idx.upsert_message(&row) {
+                    tracing::warn!(canonical = %canonical, error = %e, "index upsert failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(canonical = %canonical, error = %e, "index envelope parse failed");
+            }
+        }
+    }
+
+    Ok(canonical)
+}
+
 /// Sync a single folder into the repo: list messages, fetch any that
 /// changed, detect local deletions, update `_folder.json`, and commit
 /// the folder's changes under the supplied author. Shared between
@@ -304,15 +374,6 @@ async fn sync_one_folder(
             continue;
         }
 
-        // Source-agnostic fetch: REST extracts `raw` from the JSON
-        // response; IMAP uses `UID FETCH BODY[]`. Both return raw
-        // RFC822 bytes in FetchedMessage.raw.
-        let fetched = source.fetch_message(&f.path, &msg.id).await?;
-        let canonical = derive_canonical_id(&fetched);
-
-        let eml_path = format!("{folder_dir}/{canonical}.eml");
-        repo.write_file(&eml_path, &fetched.raw)?;
-
         // Remove any legacy file using the old source-specific id as
         // filename stem (migration from pre-canonical naming).
         if prev_canonical.is_none() {
@@ -331,52 +392,9 @@ async fn sync_one_folder(
             );
         }
 
-        let mut meta = MessageMeta::from_fetched(&fetched);
-        meta.canonical_id = Some(canonical.clone());
-        let meta_path = format!("{folder_dir}/{canonical}.meta.json");
-        repo.write_file(&meta_path, serde_json::to_vec_pretty(&meta)?.as_slice())?;
-
-        // Attachment index: parse nodemailer.attachments[], write each
-        // blob to _attachments/<sha256>, and write the reference list as
-        // a sidecar. REST-only — IMAP's `extra` is None.
-        let attachments_sidecar = format!("{folder_dir}/{canonical}.attachments.json");
-        let attachments_sidecar_fs = repo.root().join(&attachments_sidecar);
-        match extract_attachments(&fetched, repo)? {
-            Some(refs) if !refs.is_empty() => {
-                repo.write_file(
-                    &attachments_sidecar,
-                    serde_json::to_vec_pretty(&refs)?.as_slice(),
-                )?;
-            }
-            _ => {
-                let _ = std::fs::remove_file(attachments_sidecar_fs);
-            }
-        }
-
-        // Update the search index alongside the on-disk write.  Best-
-        // effort: a failed upsert logs and does not fail the pull.  The
-        // .eml on disk is the source of truth; `pimsteward index
-        // rebuild` can always reconstruct the index.
-        if let Some(idx) = index.as_ref() {
-            let facts = envelope::MetaFacts {
-                canonical_id: &canonical,
-                folder: &f.path,
-                source_id: &meta.id,
-                flags: &meta.flags,
-                internal_date: meta.internal_date.as_deref(),
-                size: meta.size,
-            };
-            match envelope::parse_eml(&fetched.raw, &facts) {
-                Ok(row) => {
-                    if let Err(e) = idx.upsert_message(&row) {
-                        tracing::warn!(canonical = %canonical, error = %e, "index upsert failed");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(canonical = %canonical, error = %e, "index envelope parse failed");
-                }
-            }
-        }
+        // Source-agnostic fetch + on-disk write + index upsert.
+        fetch_and_write_message(source, repo, index.as_ref(), &f.path, &folder_dir, &msg.id)
+            .await?;
 
         if prev.is_some() {
             folder_updated += 1;
@@ -393,6 +411,33 @@ async fn sync_one_folder(
         .iter()
         .map(|id| filename_safe(id))
         .collect();
+
+    // 3b. Backfill messages that exist remotely (in `all_ids`) but have
+    //     no local copy. With CONDSTORE/CHANGEDSINCE, `changed` only
+    //     carries messages whose modseq advanced past our stored
+    //     watermark — so a message that was present at the watermark but
+    //     later vanished locally (an earlier erroneous deletion, or a
+    //     pull that persisted `_folder.json`'s modseq without persisting
+    //     the `.eml`) would never reappear in `changed` and would be
+    //     stranded on the server forever, invisible to search. `all_ids`
+    //     is the authoritative remote set, so any id in it without a
+    //     local file must be fetched regardless of the modseq delta.
+    let changed_source_ids: HashSet<String> = list_result
+        .changed
+        .iter()
+        .map(|m| filename_safe(&m.id))
+        .collect();
+    for id in &list_result.all_ids {
+        let source_id = filename_safe(id);
+        // Skip messages we already have locally or just fetched above.
+        if source_to_canonical.contains_key(&source_id)
+            || changed_source_ids.contains(&source_id)
+        {
+            continue;
+        }
+        fetch_and_write_message(source, repo, index.as_ref(), &f.path, &folder_dir, id).await?;
+        folder_added += 1;
+    }
     for (canonical, meta) in &local_meta {
         let source_id = filename_safe(&meta.id);
         if !remote_source_ids.contains(&source_id) {
@@ -1350,5 +1395,131 @@ mod tests {
         assert_eq!(folder_safe("INBOX"), "INBOX");
         assert_eq!(folder_safe("Sent Mail"), "Sent Mail");
         assert_eq!(folder_safe("Archive/2024"), "Archive_2024");
+    }
+
+    // ── CHANGEDSINCE backfill of locally-missing messages ────────────
+    //
+    // Regression test for the May 2026 "folder looks empty in rocky"
+    // bug. A CONDSTORE source (IMAP) returns a message in `all_ids`
+    // (UID SEARCH ALL) but NOT in `changed` (FETCH ... CHANGEDSINCE
+    // <watermark>) once its modseq is at/below the stored watermark.
+    // If that message is also absent from the local tree — because an
+    // earlier pull deleted it (or persisted the folder modseq without
+    // its .eml) — the old sync_one_folder never re-fetched it, so it
+    // was stranded on the server forever. Whole folders (Archive/2016,
+    // Travel/<trip>, …) went empty on disk while still present remotely.
+    // sync_one_folder must backfill any all_ids entry missing locally.
+
+    /// Source that simulates CHANGEDSINCE: a message exists remotely
+    /// (in all_ids) but the delta `changed` list is empty.
+    struct ChangedsinceGapSource {
+        folders: Vec<Folder>,
+        /// (folder_path -> all_ids present remotely)
+        all_ids: Vec<String>,
+        fetch_calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MailSource for ChangedsinceGapSource {
+        fn tag(&self) -> &'static str {
+            "changedsince-gap"
+        }
+        async fn list_folders(&self) -> Result<Vec<Folder>, Error> {
+            Ok(self.folders.clone())
+        }
+        async fn list_messages(
+            &self,
+            _folder: &str,
+            _since: Option<i64>,
+            _uv: Option<i64>,
+        ) -> Result<ListResult, Error> {
+            // all_ids has the message, `changed` is empty — exactly what
+            // an IMAP FETCH CHANGEDSINCE returns for an unchanged message.
+            Ok(ListResult {
+                all_ids: self.all_ids.clone(),
+                changed: Vec::new(),
+                highest_modseq: Some(4),
+                uid_validity: Some(1),
+            })
+        }
+        async fn fetch_message(
+            &self,
+            _folder: &str,
+            id: &str,
+        ) -> Result<FetchedMessage, Error> {
+            self.fetch_calls.lock().unwrap().push(id.to_string());
+            let raw = format!(
+                "From: a@b.com\r\nMessage-ID: <{id}@x.com>\r\nSubject: hi\r\n\r\nbody"
+            )
+            .into_bytes();
+            let mut summary = blank_summary();
+            summary.id = id.to_string();
+            Ok(FetchedMessage {
+                summary,
+                raw,
+                extra: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn backfills_message_present_remotely_but_missing_locally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+
+        // Folder exists locally (empty on disk) — simulate a prior wipe.
+        let source = ChangedsinceGapSource {
+            folders: vec![folder_for("Travel/Vancouver")],
+            all_ids: vec!["imap-2".to_string()],
+            fetch_calls: Mutex::new(Vec::new()),
+        };
+
+        pull_mail(&source, &repo, "dan", "test", "test@example.com")
+            .await
+            .unwrap();
+
+        // The message must have been fetched and written despite being
+        // absent from `changed`.
+        assert_eq!(
+            source.fetch_calls.lock().unwrap().clone(),
+            vec!["imap-2".to_string()],
+            "the locally-missing message in all_ids must be backfilled"
+        );
+        let canonical = hash_to_canonical("<imap-2@x.com>");
+        let eml = repo
+            .root()
+            .join(format!("mail/Travel_Vancouver/{canonical}.eml"));
+        assert!(
+            eml.exists(),
+            "backfilled .eml should be on disk at {}",
+            eml.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_skips_messages_already_on_disk() {
+        // Idempotency: a second pull with the message already present
+        // locally must NOT re-fetch it (no wasted IMAP traffic / churn).
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(tmp.path()).unwrap();
+        let source = ChangedsinceGapSource {
+            folders: vec![folder_for("Travel/Vancouver")],
+            all_ids: vec!["imap-2".to_string()],
+            fetch_calls: Mutex::new(Vec::new()),
+        };
+
+        // First pull backfills it.
+        pull_mail(&source, &repo, "dan", "test", "test@example.com")
+            .await
+            .unwrap();
+        // Second pull must be a no-op for fetches.
+        source.fetch_calls.lock().unwrap().clear();
+        pull_mail(&source, &repo, "dan", "test", "test@example.com")
+            .await
+            .unwrap();
+        assert!(
+            source.fetch_calls.lock().unwrap().is_empty(),
+            "already-present message must not be re-fetched on the next pull"
+        );
     }
 }
