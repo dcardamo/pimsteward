@@ -8,6 +8,8 @@
 mod event;
 pub mod feed;
 pub mod ical;
+pub mod imip;
 
 pub use event::CalendarEvent;
 pub use feed::{build_feed, keep_for_feed, merge_calendar};
+pub use imip::{attendees, build_imip, organizer, IcalAddress};

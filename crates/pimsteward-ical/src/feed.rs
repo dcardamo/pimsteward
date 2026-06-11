@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// (VALARM, STANDARD, DAYLIGHT) use distinct END tokens and are passed
 /// through as content, so a flat scan over unfolded logical lines
 /// correctly captures the whole block — nested children come along.
-fn extract_components(ical_text: &str, name: &str) -> Vec<String> {
+pub(crate) fn extract_components(ical_text: &str, name: &str) -> Vec<String> {
     let begin = format!("BEGIN:{name}");
     let end = format!("END:{name}");
     let mut out = Vec::new();
@@ -171,7 +171,7 @@ fn rewrite_windows_tzids(ical: &str) -> String {
 /// Plain (non-VEVENT-scoped) single-field value scan, params stripped.
 /// Used for `VTIMEZONE`'s `TZID`, which lives outside any `VEVENT` and so
 /// can't go through the VEVENT-scoped helpers in [`crate::ical`].
-fn scan_field(block: &str, name: &str) -> Option<String> {
+pub(crate) fn scan_field(block: &str, name: &str) -> Option<String> {
     for raw in unfold(block).lines() {
         let line = raw.trim_end_matches('\r');
         let head = line.split(':').next().unwrap_or("");
