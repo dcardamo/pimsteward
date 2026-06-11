@@ -16,6 +16,7 @@ pub mod provider;
 pub mod pull;
 pub mod restore;
 pub mod safety;
+pub mod scheduling;
 pub mod source;
 pub mod store;
 pub mod write;
