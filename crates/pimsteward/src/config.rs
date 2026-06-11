@@ -57,6 +57,9 @@ pub struct Config {
     /// is preserved.
     #[serde(default)]
     pub mcp_profiles: Vec<McpProfile>,
+
+    #[serde(default)]
+    pub scheduling: SchedulingConfig,
 }
 
 impl Default for Config {
@@ -69,6 +72,7 @@ impl Default for Config {
             pull: PullConfig::default(),
             log_level: default_log_level(),
             mcp_profiles: Vec::new(),
+            scheduling: SchedulingConfig::default(),
         }
     }
 }
@@ -148,6 +152,31 @@ fn default_mail_interval() -> u64 {
 
 fn default_log_level() -> String {
     "info".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Organizer-side calendar scheduling (iMIP). When `enabled`, the daemon
+/// sends REQUEST/CANCEL messages for events the alias organizes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SchedulingConfig {
+    /// Master switch. Off by default — only the dan provider opts in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Debug tripwire: email the alias a summary on every send.
+    #[serde(default = "default_true")]
+    pub notify_on_send: bool,
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            notify_on_send: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -883,6 +912,43 @@ alias_password_file = "/tmp/p-ns"
             cfg.permissions.calendar.default_access(),
             Access::Read,
             "example permissions are flat-read by default; if this changes, update the comment in the example",
+        );
+    }
+
+    #[test]
+    fn scheduling_section_parses() {
+        // A config with [scheduling] enabled = true should parse with
+        // notify_on_send defaulting to true.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("sched.toml");
+        std::fs::write(
+            &p,
+            r#"
+[scheduling]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.scheduling.enabled, "enabled should be true from TOML");
+        assert!(
+            cfg.scheduling.notify_on_send,
+            "notify_on_send should default to true"
+        );
+    }
+
+    #[test]
+    fn scheduling_defaults_to_disabled() {
+        // Without a [scheduling] section the struct defaults: disabled, notify on.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::load(&dir.path().join("none.toml")).unwrap();
+        assert!(
+            !cfg.scheduling.enabled,
+            "scheduling must be disabled by default"
+        );
+        assert!(
+            cfg.scheduling.notify_on_send,
+            "notify_on_send must default to true"
         );
     }
 
