@@ -68,6 +68,9 @@ impl Ledger {
 
     /// Append a record to memory and flush the whole ledger to disk. The
     /// caller is responsible for committing via `Repo::commit_all`.
+    // The fields map 1:1 to a `SentRecord`; a wrapper struct would just move
+    // the argument list elsewhere without improving the call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         repo: &Repo,
