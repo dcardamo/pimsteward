@@ -93,6 +93,8 @@ pub fn build_imip(
         out.push_str(&tz);
     }
 
+    // Only the first VEVENT is emitted, so RECURRENCE-ID override instances of
+    // a recurring series are not included (acceptable for current scope).
     let vevent = extract_components(ics, "VEVENT")
         .into_iter()
         .next()
@@ -180,5 +182,59 @@ mod tests {
         let out = build_imip(SAMPLE, "CANCEL", 3, "dan@hld.ca", &["heather@hld.ca".into()]);
         assert!(out.contains("METHOD:CANCEL\r\n"));
         assert!(out.contains("SEQUENCE:3\r\n"));
+    }
+
+    #[test]
+    fn parses_cn_from_organizer_and_attendee() {
+        assert_eq!(organizer(SAMPLE).unwrap().cn, Some("Dan Cardamore".into()));
+        let a = attendees(SAMPLE);
+        assert_eq!(a[0].cn, Some("Heather".into()));
+    }
+
+    #[test]
+    fn falls_back_to_mailto_when_no_email_param() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:m-1\r\n\
+                   ORGANIZER;CN=Org:mailto:org@y.com\r\n\
+                   ATTENDEE;CN=X:mailto:x@y.com\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(organizer(ics).unwrap().email, "org@y.com");
+        let a = attendees(ics);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].email, "x@y.com");
+    }
+
+    #[test]
+    fn preserves_vtimezone_block() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                   BEGIN:VTIMEZONE\r\nTZID:America/Toronto\r\n\
+                   BEGIN:STANDARD\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nEND:STANDARD\r\n\
+                   END:VTIMEZONE\r\n\
+                   BEGIN:VEVENT\r\nUID:tz-1\r\nDTSTART;TZID=America/Toronto:20260701T190000\r\n\
+                   ORGANIZER;EMAIL=dan@hld.ca:mailto:dan@hld.ca\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let out = build_imip(ics, "REQUEST", 1, "dan@hld.ca", &["heather@hld.ca".into()]);
+        assert!(out.contains("BEGIN:VTIMEZONE\r\nTZID:America/Toronto\r\n"));
+        assert!(out.contains("BEGIN:STANDARD\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nEND:STANDARD\r\n"));
+        assert!(out.contains("END:VTIMEZONE\r\n"));
+    }
+
+    #[test]
+    fn missing_organizer_returns_none() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:no-org\r\n\
+                   DTSTART:20260701T190000\r\nSUMMARY:Solo\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(organizer(ics).is_none());
+    }
+
+    #[test]
+    fn reads_multiple_attendees() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:multi\r\n\
+                   ATTENDEE;CN=A;EMAIL=a@hld.ca:/a\r\n\
+                   ATTENDEE;CN=B;EMAIL=b@hld.ca:/b\r\n\
+                   END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let a = attendees(ics);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].email, "a@hld.ca");
+        assert_eq!(a[1].email, "b@hld.ca");
     }
 }
