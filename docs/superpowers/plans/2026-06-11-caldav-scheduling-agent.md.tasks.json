@@ -1,0 +1,73 @@
+{
+  "planPath": "docs/superpowers/plans/2026-06-11-caldav-scheduling-agent.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: iMIP payload builder + address parsing (pimsteward-ical)",
+      "status": "pending",
+      "description": "Pure iMIP REQUEST/CANCEL VCALENDAR builder + organizer/attendee parsing in pimsteward-ical. See plan Task 1.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward-ical/src/imip.rs\", \"crates/pimsteward-ical/src/feed.rs\", \"crates/pimsteward-ical/src/lib.rs\"], \"verifyCommand\": \"cargo test -p pimsteward-ical imip\", \"acceptanceCriteria\": [\"organizer(ics) resolves email\", \"attendees(ics) resolves emails\", \"build_imip emits normalized REQUEST/CANCEL VCALENDAR\", \"golden tests pass\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Scheduling config section",
+      "status": "pending",
+      "description": "Add [scheduling] config (enabled, notify_on_send) to Config. See plan Task 2.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/config.rs\"], \"verifyCommand\": \"cargo test -p pimsteward config\", \"acceptanceCriteria\": [\"SchedulingConfig field on Config\", \"defaults enabled=false notify_on_send=true\", \"parse test passes\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Scheduling model types + change feed (git diff)",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "Model types + change_feed diffing a pull commit vs parent. See plan Task 3.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/scheduling/mod.rs\", \"crates/pimsteward/src/scheduling/model.rs\", \"crates/pimsteward/src/scheduling/change_feed.rs\", \"crates/pimsteward/src/lib.rs\", \"crates/pimsteward/Cargo.toml\"], \"verifyCommand\": \"cargo test -p pimsteward scheduling::change_feed\", \"acceptanceCriteria\": [\"model types defined\", \"change_feed diffs commit vs parent\", \"non-ics paths ignored\", \"root commit yields all Added\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Watermark store + gate",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "Activation watermark + past-start gate. See plan Task 4.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/scheduling/watermark.rs\", \"crates/pimsteward/src/scheduling/mod.rs\"], \"verifyCommand\": \"cargo test -p pimsteward scheduling::watermark\", \"acceptanceCriteria\": [\"read_watermark\", \"ensure_watermark write-once\", \"is_past_start gates past non-recurring\", \"commit_is_after via merge-base\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Sent ledger (dedup + audit)",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "Append-only scheduling/sent.jsonl dedup + audit. See plan Task 5.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/scheduling/ledger.rs\", \"crates/pimsteward/src/scheduling/mod.rs\"], \"verifyCommand\": \"cargo test -p pimsteward scheduling::ledger\", \"acceptanceCriteria\": [\"load reads jsonl\", \"already_sent dedup\", \"record appends+flushes\", \"last_sequence max\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Planner — change → outbound iMIP messages",
+      "status": "pending",
+      "blockedBy": [1, 4],
+      "description": "Planner: organizer filter, recipient sets, significance differ. See plan Task 6.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/scheduling/plan.rs\", \"crates/pimsteward/src/scheduling/mod.rs\"], \"verifyCommand\": \"cargo test -p pimsteward scheduling::plan\", \"acceptanceCriteria\": [\"organizer filter\", \"added requests non-self\", \"significance differ\", \"removed\\u2192cancel\", \"deleted\\u2192cancel all\", \"self excluded\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: iMIP MIME sender on the forwardemail Client",
+      "status": "pending",
+      "description": "Client::send_imip multipart/alternative sender. See plan Task 7.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/forwardemail/writes.rs\"], \"verifyCommand\": \"cargo test -p pimsteward forwardemail::writes\", \"acceptanceCriteria\": [\"build_imip_mime two parts + method\", \"boundary opens/closes\", \"send_imip posts raw to /v1/emails\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Orchestrator — run scheduling for one pull commit",
+      "status": "pending",
+      "blockedBy": [4, 5, 6, 7],
+      "description": "run_scheduling: feed→gate→plan→sequence→ledger→send→notify. See plan Task 8.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/scheduling/mod.rs\"], \"verifyCommand\": \"cargo test -p pimsteward scheduling::\", \"acceptanceCriteria\": [\"watermark no-op + first-run set\", \"sequence rules\", \"ledger dedup\", \"notify per send\", \"returns count\", \"stub test green\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: Daemon wiring — run scheduler after each calendar pull",
+      "status": "pending",
+      "blockedBy": [2, 8],
+      "description": "ClientSender + post-pull scheduling hook, gated on config+capability. See plan Task 9.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/src/daemon.rs\", \"crates/pimsteward/src/forwardemail/writes.rs\"], \"verifyCommand\": \"cargo test -p pimsteward && cargo build -p pimsteward\", \"acceptanceCriteria\": [\"ClientSender impls Sender\", \"puller calls run_scheduling post-pull\", \"gated on enabled+client+send-cap\", \"build clean, tests pass\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: E2E acceptance gate — rocky@ invitee (real ForwardEmail)",
+      "status": "pending",
+      "blockedBy": [9],
+      "description": "USER-ORDERED GATE. Real-ForwardEmail e2e: create/update/delete with rocky@ invitee, assert REQUEST/REQUEST-update/CANCEL received. See plan Task 10.\n\n```json:metadata\n{\"files\": [\"crates/pimsteward/tests/e2e_scheduling.rs\"], \"verifyCommand\": \"cargo test -p pimsteward --test e2e_scheduling -- --ignored --nocapture\", \"acceptanceCriteria\": [\"REQUEST received in rocky@ INBOX on create\", \"updated REQUEST with higher SEQUENCE on time change\", \"CANCEL received on delete\", \"teardown removes event + test messages\"], \"userGate\": true, \"tags\": [\"user-gate\"], \"gateScope\": \"all\", \"modelTier\": \"standard\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-06-11T00:00:00Z"
+}
