@@ -217,11 +217,59 @@ impl Repo {
             .map_err(|e| Error::store(format!("git rev-parse: {}", e)))?;
         Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
     }
+
+    /// Run `git gc --auto`, holding `commit_lock` for its entire duration.
+    ///
+    /// This is the critical part: `git gc` repacks and prunes the object
+    /// store, and running it concurrently with a `git commit` (which writes
+    /// loose objects) can leave zero-byte/corrupt objects and a HEAD that
+    /// points at an unreadable commit. Every other mutation goes through
+    /// `commit_lock`, so gc MUST take the same lock or it races them. The
+    /// lock makes gc and commits mutually exclusive; gc is infrequent
+    /// (weekly) so the brief stall on in-flight commits is acceptable.
+    pub fn gc(&self) -> Result<(), Error> {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .map_err(|_| Error::store("commit_lock poisoned"))?;
+        let out = Command::new("git")
+            .args(["gc", "--auto"])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|e| Error::store(format!("git gc: {}", e)))?;
+        if !out.status.success() {
+            return Err(Error::store(format!(
+                "git gc --auto failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_runs_under_lock_and_preserves_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(dir.path()).unwrap();
+        repo.write_file("a.txt", b"x").unwrap();
+        let before = repo.commit_all("t", "t@t", "c1").unwrap().unwrap();
+        // gc must acquire commit_lock and complete cleanly...
+        repo.gc().unwrap();
+        // ...and the repo must still be intact afterwards.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), before);
+        // And the commit lock is released — a subsequent commit still works.
+        repo.write_file("b.txt", b"y").unwrap();
+        assert!(repo.commit_all("t", "t@t", "c2").unwrap().is_some());
+    }
 
     #[test]
     fn init_open_write_commit() {

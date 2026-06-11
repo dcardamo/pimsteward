@@ -634,26 +634,15 @@ fn spawn_gc_timer(repo: Arc<Repo>) -> tokio::task::JoinHandle<()> {
             );
             loop {
                 ticker.tick().await;
-                let root = repo.root().to_path_buf();
-                let result = tokio::task::spawn_blocking(move || {
-                    std::process::Command::new("git")
-                        .args(["gc", "--auto"])
-                        .current_dir(&root)
-                        .output()
-                })
-                .await;
+                // Run gc through Repo::gc so it holds `commit_lock` for the
+                // whole operation — otherwise gc races concurrent pull commits
+                // and can corrupt the object store (zero-byte objects, broken
+                // HEAD). gc is blocking, so do it on the blocking pool.
+                let repo = repo.clone();
+                let result = tokio::task::spawn_blocking(move || repo.gc()).await;
                 match result {
-                    Ok(Ok(out)) if out.status.success() => {
-                        tracing::info!("git gc --auto ok");
-                    }
-                    Ok(Ok(out)) => {
-                        tracing::warn!(
-                            status = ?out.status,
-                            stderr = %String::from_utf8_lossy(&out.stderr),
-                            "git gc --auto non-zero exit"
-                        );
-                    }
-                    Ok(Err(e)) => tracing::warn!(error = %e, "git gc --auto spawn failed"),
+                    Ok(Ok(())) => tracing::info!("git gc --auto ok"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "git gc --auto failed"),
                     Err(e) => tracing::warn!(error = %e, "git gc --auto join failed"),
                 }
             }
