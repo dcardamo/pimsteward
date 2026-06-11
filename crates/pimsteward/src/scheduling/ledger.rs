@@ -21,6 +21,8 @@ pub struct SentRecord {
     pub sequence: u32,
     pub recipient: String,
     pub method: String,
+    #[serde(default)]
+    pub content_hash: Option<String>,
     pub message_id: String,
     pub sent_at: String,
 }
@@ -53,6 +55,17 @@ impl Ledger {
         self.records.iter().filter(|r| r.uid == uid).map(|r| r.sequence).max()
     }
 
+    /// True iff a REQUEST with this exact content fingerprint was already
+    /// sent to this recipient for this uid (regardless of SEQUENCE).
+    pub fn already_sent_request(&self, uid: &str, recipient: &str, content_hash: &str) -> bool {
+        self.records.iter().any(|r| {
+            r.uid == uid
+                && r.recipient == recipient
+                && r.method == "REQUEST"
+                && r.content_hash.as_deref() == Some(content_hash)
+        })
+    }
+
     /// Append a record to memory and flush the whole ledger to disk. The
     /// caller is responsible for committing via `Repo::commit_all`.
     pub fn record(
@@ -63,12 +76,14 @@ impl Ledger {
         recipient: &str,
         method: Method,
         message_id: &str,
+        content_hash: Option<&str>,
     ) -> Result<(), Error> {
         self.records.push(SentRecord {
             uid: uid.to_string(),
             sequence,
             recipient: recipient.to_string(),
             method: method_str(method).to_string(),
+            content_hash: content_hash.map(|s| s.to_string()),
             message_id: message_id.to_string(),
             sent_at: chrono::Utc::now().to_rfc3339(),
         });
@@ -92,10 +107,12 @@ mod tests {
         let repo = Repo::open_or_init(dir.path()).unwrap();
         let mut led = Ledger::load(&repo).unwrap();
         assert!(!led.already_sent("u1", 0, "a@x", Method::Request));
-        led.record(&repo, "u1", 0, "a@x", Method::Request, "mid-1").unwrap();
+        led.record(&repo, "u1", 0, "a@x", Method::Request, "mid-1", Some("h0")).unwrap();
         assert!(led.already_sent("u1", 0, "a@x", Method::Request));
         assert!(!led.already_sent("u1", 1, "a@x", Method::Request));
-        led.record(&repo, "u1", 2, "a@x", Method::Cancel, "mid-2").unwrap();
+        assert!(led.already_sent_request("u1", "a@x", "h0"));
+        assert!(!led.already_sent_request("u1", "a@x", "h1"));
+        led.record(&repo, "u1", 2, "a@x", Method::Cancel, "mid-2", None).unwrap();
         assert_eq!(led.last_sequence("u1"), Some(2));
 
         let led2 = Ledger::load(&repo).unwrap();

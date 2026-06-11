@@ -5,10 +5,25 @@ use crate::scheduling::watermark::is_past_start;
 use chrono::{DateTime, Utc};
 use pimsteward_ical::imip;
 
-const SIGNIFICANT: &[&str] = &[
+pub(crate) const SIGNIFICANT: &[&str] = &[
     "DTSTART", "DTEND", "DURATION", "RRULE", "RDATE", "EXDATE",
     "RECURRENCE-ID", "SUMMARY", "LOCATION", "DESCRIPTION",
 ];
+
+/// A stable fingerprint of the scheduling-significant fields of an event,
+/// used to dedup REQUESTs by content rather than by SEQUENCE (clients don't
+/// always bump SEQUENCE on a significant edit).
+pub(crate) fn significant_fingerprint(ics: &str) -> String {
+    use pimsteward_ical::ical::vevent_field_all;
+    let mut s = String::new();
+    for name in SIGNIFICANT {
+        s.push_str(name);
+        s.push('=');
+        s.push_str(&vevent_field_all(ics, name).join("\u{1f}"));
+        s.push('\u{1e}');
+    }
+    s
+}
 
 fn non_self_attendees(ics: &str, organizer_self: &str) -> Vec<String> {
     imip::attendees(ics)
