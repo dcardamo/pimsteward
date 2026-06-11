@@ -384,26 +384,24 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
 
     if cfg.permissions.check_read(Resource::Calendar).is_ok() {
         if let Some(calendar_source) = provider.build_calendar_source()? {
-            // Wire scheduling only when enabled in config, the provider has a
-            // forwardemail send `Client`, and the alias is permitted to send
-            // email. Any gate failing leaves the puller scheduling-free.
+            // Wire scheduling only when enabled in config and the provider has
+            // a forwardemail send `Client`. `[scheduling] enabled` IS the
+            // authorization: it's an explicit per-provider opt-in, and the
+            // scheduler can only ever email actual attendees of events this
+            // alias organizes (enforced in the planner). It is deliberately
+            // NOT gated on the MCP `email_send` permission — that governs what
+            // AI callers may do via the send_email tool (kept denied for dan@),
+            // a different and broader trust domain than this constrained,
+            // daemon-internal iMIP send.
             let scheduling_ctx = if cfg.scheduling.enabled {
                 match fe_provider.as_ref() {
-                    Some(fe) if cfg.permissions.check_write(Resource::Email).is_ok() => {
-                        Some(Arc::new((
-                            ClientSender {
-                                client: fe.client().clone(),
-                                alias: alias.clone(),
-                            },
-                            cfg.scheduling.notify_on_send,
-                        )))
-                    }
-                    Some(_) => {
-                        tracing::warn!(
-                            "scheduling.enabled but alias lacks Email send capability; scheduling disabled"
-                        );
-                        None
-                    }
+                    Some(fe) => Some(Arc::new((
+                        ClientSender {
+                            client: fe.client().clone(),
+                            alias: alias.clone(),
+                        },
+                        cfg.scheduling.notify_on_send,
+                    ))),
                     None => {
                         tracing::warn!(
                             "scheduling.enabled but provider has no send client; scheduling disabled"
