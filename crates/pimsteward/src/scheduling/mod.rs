@@ -65,9 +65,19 @@ pub async fn run_scheduling(
                 let payload = build_payload(&outbound, organizer_self);
                 let (subject, text) = render(&outbound, organizer_self);
                 let method = method_word(outbound.method);
-                let mid = sender
+                // A single failed send must not abort the rest of the batch:
+                // log and move on. The send is NOT recorded, so it is retried
+                // the next time the event changes (no double-send, no crash).
+                let mid = match sender
                     .send_imip(recipient, &subject, &text, &payload, method)
-                    .await?;
+                    .await
+                {
+                    Ok(mid) => mid,
+                    Err(e) => {
+                        tracing::error!(error = %e, uid = %outbound.uid, recipient, method, "iMIP send failed; skipping");
+                        continue;
+                    }
+                };
                 let content_hash_opt = match outbound.method {
                     Method::Request => Some(hash.as_str()),
                     Method::Cancel => None,
@@ -81,7 +91,11 @@ pub async fn run_scheduling(
                         "Sent {method} for \"{}\" (uid {}, seq {}) to {recipient}.",
                         outbound.summary, outbound.uid, outbound.sequence
                     );
-                    sender.notify(&nsub, &nbody).await?;
+                    // The notify is a debug tripwire; its failure must never
+                    // abort a batch whose iMIP already went out and was recorded.
+                    if let Err(e) = sender.notify(&nsub, &nbody).await {
+                        tracing::warn!(error = %e, "scheduling notify failed (iMIP was sent)");
+                    }
                 }
             }
         }
