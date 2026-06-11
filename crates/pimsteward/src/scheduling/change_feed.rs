@@ -126,4 +126,34 @@ mod tests {
         assert!(matches!(changes[1].kind, ChangeKind::Deleted));  // b.ics
         assert!(matches!(changes[2].kind, ChangeKind::Added));    // c.ics
     }
+
+    /// open_or_init does NOT create an initial commit — only `git init` +
+    /// config.  So the first content commit is a genuine root (parentless)
+    /// commit and `change_feed` triggers the empty-tree SHA fallback:
+    ///   `rev-parse {sha}^` fails → parent = 4b825dc…
+    /// Diffing against the empty tree reports every file as Added, and
+    /// non-.ics files (e.g. .meta.json) are filtered out.
+    #[test]
+    fn root_commit_yields_all_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(dir.path()).unwrap();
+        let p = dir.path();
+
+        std::fs::create_dir_all(p.join("cal/events")).unwrap();
+        std::fs::write(p.join("cal/events/a.ics"), "BEGIN:VEVENT\nUID:a\nEND:VEVENT\n").unwrap();
+        std::fs::write(p.join("cal/events/notes.meta.json"), "{}").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-m", "root"]);
+
+        let sha = String::from_utf8(
+            Command::new("git").current_dir(p).args(["rev-parse", "HEAD"]).output().unwrap().stdout
+        ).unwrap().trim().to_string();
+
+        let changes = change_feed(&repo, &sha).unwrap();
+        // Only the .ics is reported (the .meta.json is ignored), as Added.
+        assert_eq!(changes.len(), 1);
+        assert!(matches!(changes[0].kind, ChangeKind::Added));
+        assert_eq!(changes[0].uid, "a");
+        assert!(changes[0].old_ics.is_none());
+    }
 }
