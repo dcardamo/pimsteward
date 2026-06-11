@@ -335,4 +335,99 @@ impl Client {
     pub async fn delete_message(&self, id: &str) -> Result<(), Error> {
         self.delete_path(&format!("/v1/messages/{id}")).await
     }
+
+    /// Send an iMIP scheduling message (REQUEST/CANCEL) to a single recipient,
+    /// From: the authenticated alias. Returns the `/v1/emails` JSON response.
+    pub async fn send_imip(
+        &self,
+        to: &str,
+        subject: &str,
+        text_body: &str,
+        calendar_payload: &str,
+        method: &str,
+    ) -> Result<serde_json::Value, Error> {
+        let raw = build_imip_mime(
+            self.alias_user(),
+            to,
+            subject,
+            text_body,
+            calendar_payload,
+            method,
+        );
+        let body = json!({ "from": self.alias_user(), "raw": raw });
+        self.post_json("/v1/emails", &body).await
+    }
+}
+
+/// Build a multipart/alternative iMIP message: a human-readable text/plain
+/// part plus a text/calendar part carrying the iTIP method. Deterministic
+/// boundary derived from the calendar payload so tests are stable and we add
+/// no new RNG dependency.
+pub(crate) fn build_imip_mime(
+    from: &str,
+    to: &str,
+    subject: &str,
+    text_body: &str,
+    calendar_payload: &str,
+    method: &str,
+) -> String {
+    let boundary = format!("pimsteward-{:016x}", fnv1a(calendar_payload.as_bytes()));
+    let mut m = String::new();
+    m.push_str(&format!("From: {from}\r\n"));
+    m.push_str(&format!("To: {to}\r\n"));
+    m.push_str(&format!("Subject: {subject}\r\n"));
+    m.push_str("MIME-Version: 1.0\r\n");
+    m.push_str(&format!(
+        "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n"
+    ));
+
+    m.push_str(&format!("--{boundary}\r\n"));
+    m.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    m.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+    m.push_str(text_body);
+    m.push_str("\r\n\r\n");
+
+    m.push_str(&format!("--{boundary}\r\n"));
+    m.push_str(&format!(
+        "Content-Type: text/calendar; method={method}; charset=utf-8\r\n"
+    ));
+    m.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+    m.push_str(calendar_payload);
+    m.push_str("\r\n");
+
+    m.push_str(&format!("--{boundary}--\r\n"));
+    m
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imip_mime_has_both_parts_and_method() {
+        let cal = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nEND:VCALENDAR\r\n";
+        let raw = build_imip_mime(
+            "dan@hld.ca", "heather@hld.ca", "Invitation: Lunch",
+            "You're invited to Lunch", cal, "REQUEST",
+        );
+        assert!(raw.contains("From: dan@hld.ca\r\n"));
+        assert!(raw.contains("To: heather@hld.ca\r\n"));
+        assert!(raw.contains("Subject: Invitation: Lunch\r\n"));
+        assert!(raw.contains("Content-Type: multipart/alternative;"));
+        assert!(raw.contains("Content-Type: text/plain; charset=utf-8"));
+        assert!(raw.contains("Content-Type: text/calendar; method=REQUEST; charset=utf-8"));
+        assert!(raw.contains("BEGIN:VCALENDAR"));
+        let b = raw.split("boundary=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        assert!(raw.contains(&format!("--{b}\r\n")));
+        assert!(raw.contains(&format!("--{b}--")));
+    }
 }
