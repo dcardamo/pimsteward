@@ -29,6 +29,33 @@ pub fn ensure_watermark(repo: &Repo, head_sha: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Set the activation watermark to the repo's current HEAD, if not already
+/// set. Called once at daemon startup when scheduling is enabled, so that
+/// every event that already exists is fenced off immediately and the very
+/// next calendar change is eligible — without consuming the first change as
+/// the baseline. No-op if the repo has no commits yet (the first pull's
+/// `run_scheduling` fallback will set it instead).
+pub fn ensure_watermark_at_head(repo: &Repo) -> Result<(), Error> {
+    if read_watermark(repo).is_some() {
+        return Ok(());
+    }
+    let out = Command::new("git")
+        .current_dir(repo.root())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| Error::config(format!("git rev-parse HEAD: {e}")))?;
+    if !out.status.success() {
+        // No HEAD yet (empty repo) — leave the watermark unset; it will be
+        // established by the first commit-producing pull.
+        return Ok(());
+    }
+    let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if head.is_empty() {
+        return Ok(());
+    }
+    ensure_watermark(repo, &head)
+}
+
 /// True iff `commit_sha` is strictly newer than `watermark` (a descendant).
 pub fn commit_is_after(repo: &Repo, watermark: &str, commit_sha: &str) -> bool {
     if watermark == commit_sha {
@@ -90,6 +117,29 @@ mod tests {
         let head2 = repo.empty_commit("t", "t@t", "head2").unwrap();
         ensure_watermark(&repo, &head2).unwrap();
         assert_eq!(read_watermark(&repo).as_deref(), Some(head.as_str()));
+    }
+
+    #[test]
+    fn at_head_sets_to_current_head_then_is_write_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(dir.path()).unwrap();
+        repo.empty_commit("t", "t@t", "root").unwrap();
+        let head = repo.empty_commit("t", "t@t", "head").unwrap();
+        ensure_watermark_at_head(&repo).unwrap();
+        assert_eq!(read_watermark(&repo).as_deref(), Some(head.as_str()));
+        // A later commit must not move the (write-once) watermark.
+        repo.empty_commit("t", "t@t", "later").unwrap();
+        ensure_watermark_at_head(&repo).unwrap();
+        assert_eq!(read_watermark(&repo).as_deref(), Some(head.as_str()));
+    }
+
+    #[test]
+    fn at_head_on_empty_repo_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(dir.path()).unwrap();
+        // No commits yet → no HEAD → watermark left unset (no error).
+        ensure_watermark_at_head(&repo).unwrap();
+        assert_eq!(read_watermark(&repo), None);
     }
 
     #[test]

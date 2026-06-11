@@ -412,6 +412,15 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
             } else {
                 None
             };
+            // Establish the activation watermark at the current HEAD right now,
+            // so every pre-existing event is fenced off immediately and the
+            // very next calendar change is eligible — rather than consuming the
+            // first change as the baseline.
+            if scheduling_ctx.is_some() {
+                if let Err(e) = crate::scheduling::watermark::ensure_watermark_at_head(&repo) {
+                    tracing::error!(error = %e, "failed to set scheduling activation watermark");
+                }
+            }
             handles.push(spawn_calendar_puller(
                 Duration::from_secs(cfg.pull.calendar_interval_seconds),
                 calendar_source,
