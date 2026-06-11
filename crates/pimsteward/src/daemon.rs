@@ -9,8 +9,10 @@
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::forwardemail::writes::NewMessage;
 use crate::forwardemail::Client;
 use crate::mcp::PimstewardServer;
+use crate::scheduling::Sender;
 use crate::permission::{Permissions, Resource};
 use crate::provider::{
     forwardemail::ForwardemailProvider, icloud_caldav::IcloudCaldavProvider, Provider,
@@ -20,6 +22,7 @@ use crate::source::{
     imap::idle_loop, CalendarSource, ContactsSource, MailSource,
 };
 use crate::store::Repo;
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -381,11 +384,42 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
 
     if cfg.permissions.check_read(Resource::Calendar).is_ok() {
         if let Some(calendar_source) = provider.build_calendar_source()? {
+            // Wire scheduling only when enabled in config, the provider has a
+            // forwardemail send `Client`, and the alias is permitted to send
+            // email. Any gate failing leaves the puller scheduling-free.
+            let scheduling_ctx = if cfg.scheduling.enabled {
+                match fe_provider.as_ref() {
+                    Some(fe) if cfg.permissions.check_write(Resource::Email).is_ok() => {
+                        Some(Arc::new((
+                            ClientSender {
+                                client: fe.client().clone(),
+                                alias: alias.clone(),
+                            },
+                            cfg.scheduling.notify_on_send,
+                        )))
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            "scheduling.enabled but alias lacks Email send capability; scheduling disabled"
+                        );
+                        None
+                    }
+                    None => {
+                        tracing::warn!(
+                            "scheduling.enabled but provider has no send client; scheduling disabled"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             handles.push(spawn_calendar_puller(
                 Duration::from_secs(cfg.pull.calendar_interval_seconds),
                 calendar_source,
                 repo.clone(),
                 alias.clone(),
+                scheduling_ctx,
             ));
         } else {
             tracing::warn!(
@@ -656,11 +690,51 @@ fn spawn_contacts_puller(
     )
 }
 
+/// Adapts the forwardemail REST `Client` to the `scheduling::Sender` trait so
+/// the scheduling engine can send iMIP messages and owner notifications without
+/// depending on the forwardemail module directly.
+struct ClientSender {
+    client: Client,
+    alias: String,
+}
+
+#[async_trait]
+impl Sender for ClientSender {
+    async fn send_imip(
+        &self, to: &str, subject: &str, text_body: &str, payload: &str, method: &str,
+    ) -> Result<String, Error> {
+        let v = self
+            .client
+            .send_imip(to, subject, text_body, payload, method)
+            .await?;
+        Ok(v.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string())
+    }
+
+    async fn notify(&self, subject: &str, body: &str) -> Result<(), Error> {
+        let msg = NewMessage {
+            folder: String::new(),
+            to: vec![self.alias.clone()],
+            cc: vec![],
+            bcc: vec![],
+            subject: subject.to_string(),
+            text: Some(body.to_string()),
+            html: None,
+            in_reply_to: None,
+            references: vec![],
+        };
+        self.client.send_email(&msg).await?;
+        Ok(())
+    }
+}
+
 fn spawn_calendar_puller(
     period: Duration,
     source: Arc<dyn CalendarSource>,
     repo: Arc<Repo>,
     alias: String,
+    // (sender, notify_on_send). When `None`, scheduling is disabled and the
+    // puller behaves exactly as it did before scheduling was wired in.
+    scheduling_ctx: Option<Arc<(ClientSender, bool)>>,
 ) -> tokio::task::JoinHandle<()> {
     let span = tracing::info_span!("puller", resource = "calendar");
     tokio::spawn(
@@ -681,9 +755,31 @@ fn spawn_calendar_puller(
                     "pull@pimsteward.local",
                 )
                 .await;
-                match result {
-                    Ok(s) => tracing::info!(summary = %s, "pull ok"),
-                    Err(e) => tracing::error!(error = %e, "pull failed"),
+                // Borrow `result` so we can both log it and pull the
+                // commit_sha out for scheduling without moving the summary.
+                let commit_sha = match &result {
+                    Ok(s) => {
+                        tracing::info!(summary = %s, "pull ok");
+                        s.commit_sha.clone()
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "pull failed");
+                        None
+                    }
+                };
+                // Only run scheduling when wired (ctx present) and the pull
+                // actually produced a commit.
+                if let (Some(ctx), Some(sha)) = (&scheduling_ctx, commit_sha) {
+                    let now = chrono::Utc::now();
+                    match crate::scheduling::run_scheduling(
+                        &repo, &sha, &ctx.0, &alias, ctx.1, now,
+                    )
+                    .await
+                    {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(sent = n, "scheduling sent iMIP messages"),
+                        Err(e) => tracing::error!(error = %e, "scheduling failed"),
+                    }
                 }
             }
         }

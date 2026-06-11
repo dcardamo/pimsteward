@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// (VALARM, STANDARD, DAYLIGHT) use distinct END tokens and are passed
 /// through as content, so a flat scan over unfolded logical lines
 /// correctly captures the whole block — nested children come along.
-fn extract_components(ical_text: &str, name: &str) -> Vec<String> {
+pub(crate) fn extract_components(ical_text: &str, name: &str) -> Vec<String> {
     let begin = format!("BEGIN:{name}");
     let end = format!("END:{name}");
     let mut out = Vec::new();

@@ -69,3 +69,6 @@ insta = { version = "1", features = ["json", "yaml"] }
 wiremock = "0.6"
 tempfile = "3"
 pretty_assertions = "1"
+# Also a dev-dependency so integration tests can resolve organizer/attendees
+# via the same imip address parser the production scheduler uses.
+pimsteward-ical = { path = "../pimsteward-ical" }
