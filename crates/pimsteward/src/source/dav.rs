@@ -25,8 +25,29 @@
 //! `D:` and `d:` prefixes across endpoints.
 
 use crate::error::Error;
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use std::time::Duration;
+
+/// Conditional-request precondition for a PUT/DELETE against a DAV object.
+/// CalDAV/CardDAV write idempotency and optimistic concurrency both hinge
+/// on `If-Match` / `If-None-Match`, so the shared client takes this as an
+/// explicit argument rather than letting each caller hand-roll headers.
+#[derive(Debug, Clone)]
+pub enum DavPrecondition {
+    /// No conditional header — unconditional overwrite/delete.
+    None,
+    /// `If-None-Match: *` — succeed only if the object does NOT already
+    /// exist. Used for create-only PUTs.
+    IfNoneMatch,
+    /// `If-Match: <etag>` — succeed only if the object's current etag
+    /// matches. Used for optimistic-concurrency update/delete.
+    IfMatch(String),
+}
+
+/// Outcome of a successful PUT/DELETE: the object's new etag, if the server
+/// returned one. CalDAV/CardDAV servers may omit `ETag` on PUT (the caller
+/// then re-reads via REPORT to learn the etag).
+pub type DavWriteResult = Option<String>;
 
 #[derive(Debug, Clone)]
 pub struct DavConfig {
@@ -70,6 +91,110 @@ impl DavClient {
         self.send_dav(method, path, depth, body).await
     }
 
+    /// PUT raw `body` bytes to `href` with the given content type. `href`
+    /// may be an absolute URL (`https://…`) — used when the caller already
+    /// holds a full collection URL — or a server-relative path that gets
+    /// joined onto `config.base_url`. `precondition` maps to the
+    /// `If-Match` / `If-None-Match` header for create-only or
+    /// optimistic-concurrency writes.
+    ///
+    /// 200 and 201 both count as success (some DAV servers return `200 OK`
+    /// where `201 Created` would be strictly correct). 412 surfaces as the
+    /// structured [`Error::PreconditionFailed`] carrying the server's
+    /// current etag (if provided) so callers can re-read and retry.
+    pub async fn put_object(
+        &self,
+        href: &str,
+        body: &[u8],
+        content_type: &str,
+        precondition: DavPrecondition,
+    ) -> Result<DavWriteResult, Error> {
+        let url = self.resolve(href);
+        let mut req = self
+            .http
+            .put(&url)
+            .basic_auth(&self.config.user, Some(&self.config.password))
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body.to_vec());
+        req = match &precondition {
+            DavPrecondition::None => req,
+            DavPrecondition::IfNoneMatch => req.header(reqwest::header::IF_NONE_MATCH, "*"),
+            DavPrecondition::IfMatch(etag) => req.header(reqwest::header::IF_MATCH, etag.as_str()),
+        };
+        let resp = req.send().await?;
+        let status = resp.status();
+        if status == StatusCode::PRECONDITION_FAILED {
+            return Err(Error::precondition_failed(etag_header(&resp)));
+        }
+        if !status.is_success() {
+            let bytes = resp.bytes().await?;
+            return Err(Error::Api {
+                status: status.as_u16(),
+                message: format!(
+                    "PUT {url}: {}",
+                    String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ),
+            });
+        }
+        Ok(etag_header(&resp))
+    }
+
+    /// DELETE the object at `href`. `precondition` maps to `If-Match` for
+    /// optimistic-concurrency deletes. 404/410 are treated as success — the
+    /// object is already gone, which is what the caller wanted (idempotent
+    /// delete). 412 surfaces as [`Error::PreconditionFailed`].
+    pub async fn delete_object(
+        &self,
+        href: &str,
+        precondition: DavPrecondition,
+    ) -> Result<(), Error> {
+        let url = self.resolve(href);
+        let mut req = self
+            .http
+            .delete(&url)
+            .basic_auth(&self.config.user, Some(&self.config.password));
+        req = match &precondition {
+            DavPrecondition::None | DavPrecondition::IfNoneMatch => req,
+            DavPrecondition::IfMatch(etag) => req.header(reqwest::header::IF_MATCH, etag.as_str()),
+        };
+        let resp = req.send().await?;
+        let status = resp.status();
+        if status == StatusCode::PRECONDITION_FAILED {
+            return Err(Error::precondition_failed(etag_header(&resp)));
+        }
+        if status.is_success()
+            || status == StatusCode::NOT_FOUND
+            || status == StatusCode::GONE
+        {
+            return Ok(());
+        }
+        let bytes = resp.bytes().await?;
+        Err(Error::Api {
+            status: status.as_u16(),
+            message: format!(
+                "DELETE {url}: {}",
+                String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            ),
+        })
+    }
+
+    /// Resolve a possibly-relative href against `base_url`. An href that
+    /// already carries a scheme is used verbatim; otherwise it's appended
+    /// to the base URL (matching `send_dav`'s `{base}{path}` convention).
+    fn resolve(&self, href: &str) -> String {
+        if href.starts_with("http://") || href.starts_with("https://") {
+            href.to_string()
+        } else {
+            format!("{}{}", self.config.base_url, href)
+        }
+    }
+
     async fn send_dav(
         &self,
         method: Method,
@@ -109,6 +234,15 @@ impl DavClient {
 
 fn method_name(status: &reqwest::StatusCode) -> String {
     format!("{}", status.as_u16())
+}
+
+/// Pull the `ETag` response header off a PUT/DELETE response, if present and
+/// decodable as UTF-8.
+fn etag_header(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// A parsed multistatus DAV response. Each element corresponds to one

@@ -25,8 +25,8 @@ pub mod imap;
 pub mod rest;
 pub mod traits;
 
-pub use caldav::DavCalendarSource;
-pub use carddav::DavContactsSource;
+pub use caldav::{DavCalendarSource, DavCalendarWriter};
+pub use carddav::{DavContactsSource, DavContactsWriter};
 pub use imap::ImapMailSource;
 pub use rest::{RestCalendarSource, RestCalendarWriter, RestContactsSource, RestMailSource};
 pub use traits::{
