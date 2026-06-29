@@ -17,6 +17,7 @@ use crate::source::{CalendarSource, CalendarWriter, ContactsSource, MailSource, 
 
 pub mod forwardemail;
 pub mod icloud_caldav;
+pub mod stalwart;
 
 /// Resource axes a provider may support. Distinct from
 /// [`crate::permission::Resource`] — that enum gates user-granted access on

@@ -318,12 +318,16 @@ pub(crate) fn build_provider_handles(cfg: &Config) -> Result<ProviderHandles, Er
             let ic: Arc<dyn Provider> = Arc::new(IcloudCaldavProvider::new(cfg)?);
             Ok((ic, None))
         }
-        // The Stalwart provider impl + daemon wiring lands in a later task;
-        // config selection already recognizes [provider.stalwart], so until
-        // then fail loudly rather than silently behaving like another backend.
-        crate::config::ProviderKind::Stalwart => Err(Error::config(
-            "stalwart provider is configured but not yet implemented in this build",
-        )),
+        // Stalwart, like iCloud, is a type-erased `dyn Provider` — it does
+        // not need the forwardemail-specific `Arc<ForwardemailProvider>`
+        // second handle (its sieve/SMTP surfaces are exposed via inherent
+        // accessors, not the forwardemail REST `Client`), so `fe_provider`
+        // is `None`.
+        crate::config::ProviderKind::Stalwart => {
+            let st: Arc<dyn Provider> =
+                Arc::new(crate::provider::stalwart::StalwartProvider::new(cfg)?);
+            Ok((st, None))
+        }
     }
 }
 

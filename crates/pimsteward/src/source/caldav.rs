@@ -20,12 +20,22 @@ use async_trait::async_trait;
 pub struct DavCalendarSource {
     client: DavClient,
     user: String,
+    /// When set, the configured base URL already points directly at a single
+    /// calendar **collection** (e.g. Stalwart's
+    /// `https://host:8443/dav/cal/dan%40example.test/default`) rather than a server
+    /// root under which `/dav/<user>/` discovery applies. In that mode both
+    /// `list_calendars` and `list_events` operate on this URL directly — the
+    /// `/dav/<user>/...` discovery paths (which assume the forwardemail layout)
+    /// are skipped, fixing the 404 that discovery produced against servers
+    /// whose collection URL doesn't follow that convention.
+    collection_url: Option<String>,
 }
 
 impl std::fmt::Debug for DavCalendarSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DavCalendarSource")
             .field("user", &self.user)
+            .field("collection_url", &self.collection_url)
             .finish_non_exhaustive()
     }
 }
@@ -42,7 +52,35 @@ impl DavCalendarSource {
             user: user.clone(),
             password: password.into(),
         })?;
-        Ok(Self { client, user })
+        Ok(Self {
+            client,
+            user,
+            collection_url: None,
+        })
+    }
+
+    /// Construct a source that reads a **specific, pre-configured calendar
+    /// collection URL** directly, bypassing forwardemail-style
+    /// `/dav/<user>/` discovery. Used by providers (Stalwart) whose config
+    /// supplies the exact collection URL. `collection_url` is both the
+    /// `DavClient` base and the REPORT/PROPFIND target.
+    pub fn with_collection_url(
+        collection_url: impl Into<String>,
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let user = user.into();
+        let collection_url = collection_url.into();
+        let client = DavClient::new(DavConfig {
+            base_url: collection_url.clone(),
+            user: user.clone(),
+            password: password.into(),
+        })?;
+        Ok(Self {
+            client,
+            user,
+            collection_url: Some(collection_url),
+        })
     }
 
     /// Build the URL path for the alias's DAV home on forwardemail.
@@ -58,6 +96,24 @@ impl CalendarSource for DavCalendarSource {
     }
 
     async fn list_calendars(&self) -> Result<Vec<Calendar>, Error> {
+        // Pre-configured collection mode (Stalwart): the configured URL IS
+        // the calendar collection, so there is nothing to discover. Report a
+        // single calendar whose `id` is that collection URL — `list_events`
+        // and the writer both treat `calendar_id` as the collection URL, so
+        // this keeps the whole read/write path pointed at the right place
+        // without a `/dav/<user>/` PROPFIND that 404s on Stalwart.
+        if let Some(collection) = &self.collection_url {
+            return Ok(vec![Calendar {
+                id: collection.clone(),
+                name: String::new(),
+                description: String::new(),
+                color: String::new(),
+                timezone: String::new(),
+                order: None,
+                created_at: None,
+                updated_at: None,
+            }]);
+        }
         // PROPFIND depth=1 on /dav/<user>/ — returns the home collection
         // plus one response per calendar collection beneath it.
         let body = r#"<?xml version="1.0"?>
@@ -126,7 +182,15 @@ impl CalendarSource for DavCalendarSource {
 
         let mut out = Vec::new();
         for cal_id in calendar_ids {
-            let path = format!("/dav/{}/{}/", self.user, cal_id);
+            // In collection mode the DavClient's base_url already IS the
+            // collection URL and `cal_id` equals it, so REPORT the base
+            // directly (empty path → `send_dav` requests `{base}` verbatim).
+            // In discovery mode derive the forwardemail per-calendar path.
+            let path = if self.collection_url.is_some() {
+                String::new()
+            } else {
+                format!("/dav/{}/{}/", self.user, cal_id)
+            };
             let ms = self.client.report(&path, 1, body).await?;
             for r in ms.responses {
                 let Some(ical) = r.calendar_data else {
@@ -374,6 +438,20 @@ fn synthesize_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn collection_mode_list_calendars_returns_configured_url_no_network() {
+        // Regression guard for the discovery bug: in collection mode
+        // `list_calendars` must return exactly the configured collection URL
+        // as the single calendar id WITHOUT any network round trip (no
+        // `/dav/<user>/` PROPFIND). The bogus host would fail if a request
+        // were attempted, so reaching the assertion proves it stayed local.
+        let collection = "https://saturn.invalid:8443/dav/cal/dan%40example.test/default";
+        let src = DavCalendarSource::with_collection_url(collection, "dan@example.test", "pw").unwrap();
+        let cals = src.list_calendars().await.unwrap();
+        assert_eq!(cals.len(), 1);
+        assert_eq!(cals[0].id, collection);
+    }
 
     #[test]
     fn caldav_object_href_is_deterministic() {

@@ -19,12 +19,20 @@ use async_trait::async_trait;
 pub struct DavContactsSource {
     client: DavClient,
     user: String,
+    /// When set, the configured base URL already points directly at a single
+    /// addressbook **collection** (e.g. Stalwart's
+    /// `https://host:8443/dav/card/dan%40example.test/default`). In that mode
+    /// `list_contacts` REPORTs this URL directly instead of running a
+    /// `/dav/<user>/addressbooks/` PROPFIND discovery that 404s on servers
+    /// not following the forwardemail layout.
+    collection_url: Option<String>,
 }
 
 impl std::fmt::Debug for DavContactsSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DavContactsSource")
             .field("user", &self.user)
+            .field("collection_url", &self.collection_url)
             .finish_non_exhaustive()
     }
 }
@@ -41,7 +49,34 @@ impl DavContactsSource {
             user: user.clone(),
             password: password.into(),
         })?;
-        Ok(Self { client, user })
+        Ok(Self {
+            client,
+            user,
+            collection_url: None,
+        })
+    }
+
+    /// Construct a source that reads a **specific, pre-configured addressbook
+    /// collection URL** directly, bypassing forwardemail-style discovery.
+    /// Used by the Stalwart provider, whose config supplies the exact
+    /// collection URL.
+    pub fn with_collection_url(
+        collection_url: impl Into<String>,
+        user: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let user = user.into();
+        let collection_url = collection_url.into();
+        let client = DavClient::new(DavConfig {
+            base_url: collection_url.clone(),
+            user: user.clone(),
+            password: password.into(),
+        })?;
+        Ok(Self {
+            client,
+            user,
+            collection_url: Some(collection_url),
+        })
     }
 
     /// PROPFIND path for discovering all addressbooks.
@@ -125,6 +160,14 @@ impl ContactsSource for DavContactsSource {
     }
 
     async fn list_contacts(&self) -> Result<Vec<Contact>, Error> {
+        // Pre-configured collection mode (Stalwart): REPORT the configured
+        // addressbook URL directly. The DavClient base_url IS that URL, so
+        // an empty-path REPORT (via `list_contacts_in` with `""`) targets it
+        // verbatim, skipping the `/dav/<user>/addressbooks/` discovery that
+        // 404s on Stalwart.
+        if self.collection_url.is_some() {
+            return self.list_contacts_in("").await;
+        }
         let books = self.discover_addressbooks().await?;
         let mut all = Vec::new();
         for href in &books {
