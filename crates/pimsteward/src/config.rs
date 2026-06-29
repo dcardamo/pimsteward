@@ -367,12 +367,107 @@ fn default_icloud_user_agent() -> String {
     "pimsteward (iCloud CalDAV)".into()
 }
 
+/// Stalwart provider configuration — a self-hosted, standards-compliant
+/// mail (IMAP/SMTP) + CalDAV + CardDAV server. Hosts/URLs default to empty
+/// or loopback because they're set per-instance (e.g. in the nix module);
+/// credentials live in files like the other providers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StalwartConfig {
+    /// File containing the alias email (basic-auth username).
+    pub alias_user_file: Option<PathBuf>,
+
+    /// File containing the account password (basic-auth password).
+    pub alias_password_file: Option<PathBuf>,
+
+    /// IMAP host.
+    #[serde(default = "default_stalwart_imap_host")]
+    pub imap_host: String,
+
+    /// IMAP port (STARTTLS).
+    #[serde(default = "default_stalwart_imap_port")]
+    pub imap_port: u16,
+
+    /// CalDAV base URL (no trailing slash).
+    #[serde(default = "default_stalwart_caldav_base_url")]
+    pub caldav_base_url: String,
+
+    /// CardDAV base URL (no trailing slash).
+    #[serde(default = "default_stalwart_carddav_base_url")]
+    pub carddav_base_url: String,
+
+    /// ManageSieve host for sieve script activation (RFC 5804).
+    #[serde(default = "default_stalwart_managesieve_host")]
+    pub managesieve_host: String,
+
+    /// ManageSieve port (IANA-assigned 4190).
+    #[serde(default = "default_stalwart_managesieve_port")]
+    pub managesieve_port: u16,
+
+    /// SMTP submission host for outbound mail.
+    #[serde(default = "default_stalwart_smtp_host")]
+    pub smtp_host: String,
+
+    /// SMTP submission port (STARTTLS).
+    #[serde(default = "default_stalwart_smtp_port")]
+    pub smtp_port: u16,
+}
+
+fn default_stalwart_imap_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_stalwart_imap_port() -> u16 {
+    143
+}
+
+fn default_stalwart_caldav_base_url() -> String {
+    String::new()
+}
+
+fn default_stalwart_carddav_base_url() -> String {
+    String::new()
+}
+
+fn default_stalwart_managesieve_host() -> String {
+    String::new()
+}
+
+fn default_stalwart_managesieve_port() -> u16 {
+    4190
+}
+
+fn default_stalwart_smtp_host() -> String {
+    String::new()
+}
+
+fn default_stalwart_smtp_port() -> u16 {
+    587
+}
+
+impl Default for StalwartConfig {
+    fn default() -> Self {
+        Self {
+            alias_user_file: None,
+            alias_password_file: None,
+            imap_host: default_stalwart_imap_host(),
+            imap_port: default_stalwart_imap_port(),
+            caldav_base_url: default_stalwart_caldav_base_url(),
+            carddav_base_url: default_stalwart_carddav_base_url(),
+            managesieve_host: default_stalwart_managesieve_host(),
+            managesieve_port: default_stalwart_managesieve_port(),
+            smtp_host: default_stalwart_smtp_host(),
+            smtp_port: default_stalwart_smtp_port(),
+        }
+    }
+}
+
 /// Namespaced provider config holder. Exactly one variant must be set —
 /// validated by [`Config::active_provider_kind`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderConfigs {
     pub forwardemail: Option<ForwardemailConfig>,
     pub icloud_caldav: Option<IcloudCaldavConfig>,
+    pub stalwart: Option<StalwartConfig>,
 }
 
 /// Which provider this config selects. Determined at startup by
@@ -381,6 +476,7 @@ pub struct ProviderConfigs {
 pub enum ProviderKind {
     Forwardemail,
     IcloudCaldav,
+    Stalwart,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,24 +537,52 @@ impl Config {
         // `#[serde(default)]` shouldn't impersonate a real provider.
         let has_legacy_fe = self.forwardemail.alias_user_file.is_some()
             || self.forwardemail.alias_password_file.is_some();
+        let has_namespaced_st = self
+            .provider
+            .stalwart
+            .as_ref()
+            .map(|st| st.alias_user_file.is_some() || st.alias_password_file.is_some())
+            .unwrap_or(false);
 
-        match (has_namespaced_fe, has_legacy_fe, has_namespaced_ic) {
-            (true, true, _) => Err(Error::config(
+        // Legacy and namespaced forwardemail are mutually exclusive forms of
+        // the *same* provider — catch the mid-migration footgun before the
+        // cross-provider exclusivity check below.
+        if has_namespaced_fe && has_legacy_fe {
+            return Err(Error::config(
                 "config has both legacy [forwardemail] and namespaced \
                  [provider.forwardemail] credentials; pick one form (the \
                  namespaced form is preferred for new configs)",
+            ));
+        }
+
+        let has_forwardemail = has_namespaced_fe || has_legacy_fe;
+
+        // Exactly one of the three providers may be configured.
+        let count =
+            [has_forwardemail, has_namespaced_ic, has_namespaced_st]
+                .iter()
+                .filter(|&&set| set)
+                .count();
+        match count {
+            0 => Err(Error::config(
+                "no provider configured: set [provider.forwardemail], \
+                 [provider.icloud_caldav], or [provider.stalwart] (and \
+                 provide credential files)",
             )),
-            (true, false, true) | (false, true, true) => Err(Error::config(
-                "config has both a forwardemail credential and an \
-                 icloud_caldav config; pick one — pimsteward runs one \
+            1 => {
+                if has_forwardemail {
+                    Ok(ProviderKind::Forwardemail)
+                } else if has_namespaced_ic {
+                    Ok(ProviderKind::IcloudCaldav)
+                } else {
+                    Ok(ProviderKind::Stalwart)
+                }
+            }
+            _ => Err(Error::config(
+                "config has more than one provider configured (forwardemail, \
+                 icloud_caldav, stalwart); pick one — pimsteward runs one \
                  provider per daemon",
             )),
-            (false, false, false) => Err(Error::config(
-                "no provider configured: set [provider.forwardemail] or \
-                 [provider.icloud_caldav] (and provide credential files)",
-            )),
-            (true, false, false) | (false, true, false) => Ok(ProviderKind::Forwardemail),
-            (false, false, true) => Ok(ProviderKind::IcloudCaldav),
         }
     }
 
@@ -794,7 +918,11 @@ password_file = "/tmp/p"
         .unwrap();
         let cfg = Config::load(&p).unwrap();
         let err = cfg.active_provider_kind().unwrap_err();
-        assert!(err.to_string().contains("both"), "{}", err);
+        assert!(
+            err.to_string().contains("more than one provider"),
+            "{}",
+            err
+        );
     }
 
     #[test]
@@ -868,6 +996,83 @@ alias_password_file = "/tmp/p-ns"
         let msg = err.to_string();
         assert!(msg.contains("both legacy"), "{}", msg);
         assert!(msg.contains("namespaced"), "{}", msg);
+    }
+
+    #[test]
+    fn provider_kind_stalwart_namespaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.stalwart]
+alias_user_file = "/tmp/u"
+alias_password_file = "/tmp/p"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.active_provider_kind().unwrap(), ProviderKind::Stalwart);
+    }
+
+    #[test]
+    fn provider_kind_empty_namespaced_stalwart_section_is_unconfigured() {
+        // Symmetric guard: an empty `[provider.stalwart]` header with no
+        // credential fields is "not configured".
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.stalwart]
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        let err = cfg.active_provider_kind().unwrap_err();
+        assert!(err.to_string().contains("no provider"), "{}", err);
+    }
+
+    #[test]
+    fn provider_kind_stalwart_plus_forwardemail_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.stalwart]
+alias_user_file = "/tmp/su"
+alias_password_file = "/tmp/sp"
+
+[provider.forwardemail]
+alias_user_file = "/tmp/fu"
+alias_password_file = "/tmp/fp"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.active_provider_kind().is_err());
+    }
+
+    #[test]
+    fn provider_kind_stalwart_plus_icloud_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+[provider.stalwart]
+alias_user_file = "/tmp/su"
+alias_password_file = "/tmp/sp"
+
+[provider.icloud_caldav]
+username_file = "/tmp/u"
+password_file = "/tmp/p"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.active_provider_kind().is_err());
     }
 
     #[test]

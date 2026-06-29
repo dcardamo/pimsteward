@@ -151,7 +151,7 @@ impl CalendarSource for DavCalendarSource {
                 // forwardemail CalDAV path opaque to MCP `list_events`
                 // window filters: every event had `start_date == None`,
                 // every windowed query returned the empty list, and the
-                // dan@hld.ca calendar appeared empty in the daily brief
+                // dan@example.test calendar appeared empty in the daily brief
                 // even when it had events. The shared `vevent_field`
                 // helper is `VEVENT`-scoped (Fastmail puts `VTIMEZONE`
                 // first, so an unscoped grep would otherwise return
@@ -230,7 +230,7 @@ mod tests {
     /// Direct shape check for the `Fastmail` payload layout (VTIMEZONE
     /// before VEVENT, parametered DTSTART with TZID). The previous
     /// `list_events` impl hardcoded `start_date: None`, which made every
-    /// dan@hld.ca calendar event invisible to MCP window filters. The
+    /// dan@example.test calendar event invisible to MCP window filters. The
     /// fields below must round-trip out of `vevent_field` so the
     /// `CalendarEvent` returned by the caldav source carries usable
     /// dates.

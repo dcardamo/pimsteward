@@ -310,8 +310,8 @@ const MULTI_ACCOUNT_HINT: &str = "Multiple calendar accounts may be exposed via 
 ///
 /// The provider name (`forwardemail` / `icloud` / etc.) is part of
 /// the tag because aliases collide in practice — Dan's Apple ID is
-/// his Fastmail address `dan@hld.ca`, so both daemons would render
-/// `[account: dan-hld.ca]` without the provider suffix and the LLM
+/// his Fastmail address `dan@example.test`, so both daemons would render
+/// `[account: dan-example.test]` without the provider suffix and the LLM
 /// would still see two indistinguishable tools.
 fn stamp_account_context(
     mut t: rmcp::model::Tool,
@@ -2749,11 +2749,11 @@ impl ServerHandler for PimstewardServer {
         // their tool names, schemas, or descriptions.
         //
         // Then rewrite each tool's description to include the account
-        // alias (`[account: dan@hld.ca]` / `[account: icloud]` / etc.).
+        // alias (`[account: dan@example.test]` / `[account: icloud]` / etc.).
         // The static `#[tool(description = "...")]` annotation is the
         // same string regardless of which alias the daemon serves, but
         // operators commonly run multiple pimsteward instances side by
-        // side — Dan runs one against forwardemail.net for `dan@hld.ca`
+        // side — Dan runs one against forwardemail.net for `dan@example.test`
         // and another against iCloud CalDAV for the Family calendar.
         // Without an account prefix, an MCP client offering both
         // servers' tools to an LLM sees two `list_calendars` /
@@ -4559,7 +4559,7 @@ mod tests {
     #[test]
     fn parse_headers_retains_authentication_results() {
         let msg = concat!(
-            "From: dan@hld.ca\r\n",
+            "From: dan@example.test\r\n",
             "Authentication-Results: forwardemail.net;\r\n",
             "  spf=pass smtp.mailfrom=hld.ca;\r\n",
             "  dkim=pass header.i=@hld.ca;\r\n",
@@ -4585,7 +4585,7 @@ mod tests {
         // makes gate behavior depend on hop ordering, which is outside
         // the sender's control, so both must land in the output.
         let msg = concat!(
-            "From: dan@hld.ca\r\n",
+            "From: dan@example.test\r\n",
             "Authentication-Results: hop1; spf=pass\r\n",
             "Authentication-Results: hop2; dkim=pass\r\n",
             "ARC-Authentication-Results: i=1; arc.saturn; dmarc=pass\r\n",
@@ -4735,7 +4735,7 @@ mod tests {
     // ── Tool description account-context stamping ────────────────────
     //
     // Tools' static `#[tool(description = "...")]` text is identical
-    // across daemons that serve different aliases (e.g. dan@hld.ca
+    // across daemons that serve different aliases (e.g. dan@example.test
     // and a parallel iCloud daemon). When an MCP client offers both
     // servers' tool sets to an LLM, the model can't tell two
     // identically-described `list_calendars` tools apart and silently
@@ -4763,12 +4763,12 @@ mod tests {
     fn stamp_account_context_prepends_alias_and_provider_to_every_description() {
         let stamped = stamp_account_context(
             fake_tool("get_email", Some("Fetch a single email by canonical id.")),
-            "dan@hld.ca",
+            "dan@example.test",
             "forwardemail",
         );
         let desc = stamped.description.as_deref().unwrap_or_default();
         assert!(
-            desc.starts_with("[account: dan@hld.ca @ forwardemail] "),
+            desc.starts_with("[account: dan@example.test @ forwardemail] "),
             "expected leading account+provider tag, got: {desc:?}",
         );
         // Original text is preserved verbatim after the prefix.
@@ -4778,17 +4778,17 @@ mod tests {
     #[test]
     fn stamp_account_context_distinguishes_same_alias_across_providers() {
         // Concrete regression: Dan's Apple ID is his Fastmail address,
-        // so both daemons render `[account: dan-hld.ca]` without the
+        // so both daemons render `[account: dan-example.test]` without the
         // provider suffix. The composite tag must give the LLM enough
         // to tell them apart.
         let fe = stamp_account_context(
             fake_tool("list_events", Some("body")),
-            "dan-hld.ca",
+            "dan-example.test",
             "forwardemail",
         );
         let icloud = stamp_account_context(
             fake_tool("list_events", Some("body")),
-            "dan-hld.ca",
+            "dan-example.test",
             "icloud",
         );
         let fe_desc = fe.description.as_deref().unwrap_or_default();
@@ -4814,11 +4814,11 @@ mod tests {
     fn stamp_account_context_appends_multi_account_hint_to_calendar_listing_tools() {
         // The two tools where namespace ambiguity actually bites end
         // users (Dan's daily-brief regression: list_events on iCloud
-        // returned by the model that called dan@hld.ca's list_events).
+        // returned by the model that called dan@example.test's list_events).
         for name in ["list_calendars", "list_events"] {
             let stamped = stamp_account_context(
                 fake_tool(name, Some("Static stub.")),
-                "dan@hld.ca",
+                "dan@example.test",
                 "forwardemail",
             );
             let desc = stamped.description.as_deref().unwrap_or_default();
@@ -4838,7 +4838,7 @@ mod tests {
         for name in ["search_email", "list_folders", "list_contacts", "create_draft", "history"] {
             let stamped = stamp_account_context(
                 fake_tool(name, Some("Static stub.")),
-                "dan@hld.ca",
+                "dan@example.test",
                 "forwardemail",
             );
             let desc = stamped.description.as_deref().unwrap_or_default();
@@ -4847,7 +4847,7 @@ mod tests {
                 "{name} must NOT carry the calendar multi-account directive: {desc:?}",
             );
             // But the account tag is still present everywhere.
-            assert!(desc.starts_with("[account: dan@hld.ca @ forwardemail] "));
+            assert!(desc.starts_with("[account: dan@example.test @ forwardemail] "));
         }
     }
 

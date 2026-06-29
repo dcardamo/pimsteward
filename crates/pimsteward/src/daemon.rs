@@ -318,6 +318,12 @@ pub(crate) fn build_provider_handles(cfg: &Config) -> Result<ProviderHandles, Er
             let ic: Arc<dyn Provider> = Arc::new(IcloudCaldavProvider::new(cfg)?);
             Ok((ic, None))
         }
+        // The Stalwart provider impl + daemon wiring lands in a later task;
+        // config selection already recognizes [provider.stalwart], so until
+        // then fail loudly rather than silently behaving like another backend.
+        crate::config::ProviderKind::Stalwart => Err(Error::config(
+            "stalwart provider is configured but not yet implemented in this build",
+        )),
     }
 }
 
