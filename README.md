@@ -13,10 +13,13 @@
 > **pimsteward** is a **permission-aware MCP mediator and git-backed audit log
 > for your personal data** — sitting between an AI assistant and your PIM
 > backend(s) so every read is policy-checked and every write is captured as a
-> reversible commit. [forwardemail.net](https://forwardemail.net) is the
-> primary, fully-supported provider (mail, calendar, contacts, sieve, send);
-> standards-based providers like iCloud over CalDAV are supported for the
-> subset of capabilities they actually expose.
+> reversible commit. It speaks to your data through a **pluggable provider
+> layer**: the same MCP/git core drives [forwardemail.net](https://forwardemail.net)
+> (REST or IMAP/CalDAV/CardDAV — mail, calendar, contacts, sieve, send),
+> [Stalwart](https://stalw.art) (self-hosted IMAP + CalDAV + CardDAV +
+> ManageSieve + SMTP), and iCloud (CalDAV calendar). Each provider exposes
+> only the capabilities its protocols actually support; the mediation, audit,
+> and restore guarantees are identical across all of them.
 
 ---
 
@@ -46,22 +49,56 @@ pimsteward runs as a single daemon per provider. Each daemon owns its own
 credentials, its own git repo, and its own MCP endpoint. Add as many as
 you have accounts; they don't share state.
 
-| Provider          | Mail | Calendar | Contacts | Sieve | Send |
-| ----------------- | :--: | :------: | :------: | :---: | :--: |
-| forwardemail.net  |  ✅  |   ✅     |   ✅     |  ✅   |  ✅  |
-| iCloud (CalDAV)   |  —   |   ✅     |   —      |  —    |  —   |
+| Provider          | Mail | Calendar | Contacts | Sieve | Send | Transport                                     |
+| ----------------- | :--: | :------: | :------: | :---: | :--: | --------------------------------------------- |
+| forwardemail.net  |  ✅  |   ✅     |   ✅     |  ✅   |  ✅  | REST, or IMAP / CalDAV / CardDAV / ManageSieve |
+| Stalwart          |  ✅  |   ✅     |   ✅     |  ✅   |  ✅  | IMAP + CalDAV + CardDAV + ManageSieve + SMTP   |
+| iCloud (CalDAV)   |  —   |   ✅     |   —      |  —    |  —   | CalDAV                                         |
 
-New providers are added when there's a real, testable account. Fastmail/JMAP,
-Gmail, generic IMAP-only providers are out of scope until then.
+Each provider is its own daemon with its own credentials, git repo, and MCP
+endpoint — exactly one provider per daemon. New providers are added when
+there's a real, testable account. Fastmail/JMAP, Gmail, and generic
+IMAP-only providers are out of scope until then.
 
 ---
 
-## Why forwardemail (the primary target)
+## Provider architecture
 
-This section is about why [forwardemail.net](https://forwardemail.net) is the
-fully-supported provider — not about pimsteward as a whole. Other providers
-(e.g. iCloud over CalDAV) plug into the same MCP/git core but only for the
-capabilities their protocols expose.
+pimsteward's core — the MCP server, the permission gate, the git audit log,
+and the restore engine — is provider-agnostic. A thin **provider layer**
+adapts a concrete backend (its auth, its wire protocols, its capability set)
+onto that core. Adding a backend means writing a provider, not touching the
+mediation logic.
+
+Three providers ship today:
+
+- **[forwardemail.net](https://forwardemail.net)** — the most complete
+  backend: mail, calendar, contacts, sieve, and send. Each resource can be
+  pulled over the first-class REST API *or* over the standards-based
+  IMAP/CalDAV/CardDAV interfaces (selectable per resource), with ManageSieve
+  for sieve activation. See [Why forwardemail](#why-forwardemail-a-strong-default)
+  below for why it's a strong default.
+- **[Stalwart](https://stalw.art)** — a self-hosted, standards-compliant
+  server giving you the same full surface (mail, calendar, contacts, sieve,
+  send) over IMAP + CalDAV + CardDAV + ManageSieve + SMTP, with your data on
+  your own hardware. pimsteward connects to it **by hostname with valid TLS**.
+- **iCloud** — calendar over CalDAV only; iCloud's other surfaces aren't
+  exposed to third-party clients.
+
+The capability columns in the table above come straight from each provider's
+adapter: a provider only registers the MCP tools its backend actually
+supports, so the iCloud daemon never advertises a `send_email` tool the
+protocol can't fulfil.
+
+---
+
+## Why forwardemail (a strong default)
+
+forwardemail is the most fully-featured of the supported providers, and a
+good default if you don't already self-host. This section is about why — it's
+not a claim that pimsteward is forwardemail-specific; Stalwart gives you the
+same surface self-hosted, and any standards-based provider plugs into the
+same MCP/git core for the capabilities its protocols expose.
 
 A mediator like this needs a backend with a real programmatic surface,
 stable resource ids, and credentials that can be scoped to a single mailbox —
@@ -205,8 +242,8 @@ reversible, everything is attributable.**
 ## Architecture
 
 pimsteward runs as a **single daemon** (`pimsteward daemon --port 8100`) that
-owns your forwardemail credentials and sits between the AI assistant and the
-service. The daemon does two things in one process:
+owns one provider's credentials and sits between the AI assistant and the
+backend. The daemon does two things in one process:
 
 1. **Pull loops** — IMAP IDLE + CalDAV + CardDAV for real-time backup
 2. **MCP HTTP server** — Streamable HTTP / SSE endpoint for AI clients
@@ -637,11 +674,16 @@ faith.
 
 ### The rest of the config
 
+Exactly **one provider** is configured per daemon, under its own
+`[provider.<name>]` section. Pick whichever backend that daemon mediates:
+
 ```toml
 # /etc/pimsteward/config.toml
 log_level = "info"
 
-[forwardemail]
+# ── Provider: Forward Email ──────────────────────────────────────────────
+# (the legacy top-level [forwardemail] block is still accepted as a shim)
+[provider.forwardemail]
 api_base            = "https://api.forwardemail.net"
 alias_user_file     = "/run/pimsteward-secrets/forwardemail-alias-user"
 alias_password_file = "/run/pimsteward-secrets/forwardemail-alias-password"
@@ -668,6 +710,59 @@ calendar_interval_seconds = 300
 contacts_interval_seconds = 900
 sieve_interval_seconds    = 3600
 ```
+
+### `[provider.stalwart]` — self-hosted full stack
+
+For a Stalwart daemon, drop the `[provider.forwardemail]` block and use
+`[provider.stalwart]` instead (everything else — `[storage]`, `[pull]`,
+`[permissions]` — is identical). Stalwart speaks all four standards
+protocols, so this provider always pulls over IMAP/CalDAV/CardDAV and sends
+over SMTP; there's no REST-vs-DAV switch. pimsteward connects to it **by
+hostname with a valid TLS certificate** — point the hosts/URLs at your
+instance's real name, not loopback.
+
+```toml
+[provider.stalwart]
+# Credentials live in files, like every other provider.
+alias_user_file     = "/run/pimsteward-secrets/stalwart-alias-user"
+alias_password_file = "/run/pimsteward-secrets/stalwart-alias-password"
+
+# Mail (IMAP, STARTTLS).
+imap_host = "mail.example.com"
+imap_port = 143
+
+# Calendar + contacts (CalDAV / CardDAV base URLs, no trailing slash).
+caldav_base_url  = "https://mail.example.com/dav/cal"
+carddav_base_url = "https://mail.example.com/dav/card"
+
+# Sieve activation (ManageSieve, RFC 5804).
+managesieve_host = "mail.example.com"
+managesieve_port = 4190
+
+# Outbound mail (SMTP submission, STARTTLS).
+smtp_host = "mail.example.com"
+smtp_port = 587
+```
+
+| Field                 | Purpose                                                   |
+| --------------------- | -------------------------------------------------------- |
+| `alias_user_file`     | File holding the alias email (basic-auth username)        |
+| `alias_password_file` | File holding the account password (basic-auth password)  |
+| `imap_host`           | IMAP host for the mail pull loop                          |
+| `imap_port`           | IMAP port (STARTTLS; default 143)                         |
+| `caldav_base_url`     | CalDAV base URL for calendars (no trailing slash)         |
+| `carddav_base_url`    | CardDAV base URL for contacts (no trailing slash)         |
+| `managesieve_host`    | ManageSieve host for sieve script activation             |
+| `managesieve_port`    | ManageSieve port (IANA-assigned 4190)                    |
+| `smtp_host`           | SMTP submission host for outbound mail                    |
+| `smtp_port`           | SMTP submission port (STARTTLS; default 587)             |
+
+### `[provider.icloud_caldav]` — calendar only
+
+The iCloud daemon mediates calendar over CalDAV and nothing else. See
+[`examples/config-icloud-caldav.toml`](examples/config-icloud-caldav.toml)
+for the full shape (discovery URL, Apple-ID app-specific password files,
+and a `[permissions]` block scoped to `calendar` only).
 
 There is no `[mcp]` section: the daemon serves MCP over HTTP when you pass
 `--port` (e.g. `pimsteward daemon --port 8100`). AI clients connect via URL

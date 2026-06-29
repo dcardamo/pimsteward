@@ -1,8 +1,9 @@
 # pimsteward — Design
 
-_A permission-aware MCP mediator for [forwardemail.net](https://forwardemail.net)
-personal data (mail, calendar, contacts, sieve filters), with time-travel
-backup built in._
+_A permission-aware MCP mediator for your personal data (mail, calendar,
+contacts, sieve filters) across pluggable providers —
+[forwardemail.net](https://forwardemail.net), [Stalwart](https://stalw.art),
+and iCloud (CalDAV) — with time-travel backup built in._
 
 This document explains **what pimsteward is, why it works the way it does,
 and what it deliberately isn't**. For the deeper implementation plan and
