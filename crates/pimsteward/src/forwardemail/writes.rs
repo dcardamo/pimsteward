@@ -216,34 +216,7 @@ impl Client {
         msg: &NewMessage,
     ) -> Result<serde_json::Value, Error> {
         let from = self.alias_user();
-        let mut headers = format!("From: {from}\r\n");
-        headers.push_str(&format!("To: {}\r\n", msg.to.join(", ")));
-        if !msg.cc.is_empty() {
-            headers.push_str(&format!("Cc: {}\r\n", msg.cc.join(", ")));
-        }
-        headers.push_str(&format!("Subject: {}\r\n", msg.subject));
-
-        if let Some(ref irt) = msg.in_reply_to {
-            headers.push_str(&format!("In-Reply-To: {irt}\r\n"));
-        }
-        // References = provided chain + in_reply_to (if not already present)
-        let mut refs = msg.references.clone();
-        if let Some(ref irt) = msg.in_reply_to {
-            if !refs.contains(irt) {
-                refs.push(irt.clone());
-            }
-        }
-        if !refs.is_empty() {
-            headers.push_str(&format!("References: {}\r\n", refs.join(" ")));
-        }
-        headers.push_str("MIME-Version: 1.0\r\n");
-        headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-        headers.push_str("Content-Transfer-Encoding: 8bit\r\n");
-        headers.push_str("\r\n");
-
-        let text = msg.text.as_deref().unwrap_or("");
-        let raw = format!("{headers}{text}");
-
+        let raw = build_plain_rfc822(from, msg);
         let body = json!({
             "from": from,
             "raw": raw,
@@ -263,31 +236,7 @@ impl Client {
         // If threading headers are present, use raw append so
         // In-Reply-To/References are preserved in the stored message.
         if msg.in_reply_to.is_some() || !msg.references.is_empty() {
-            let from = self.alias_user();
-            let mut headers = format!("From: {from}\r\n");
-            headers.push_str(&format!("To: {}\r\n", msg.to.join(", ")));
-            if !msg.cc.is_empty() {
-                headers.push_str(&format!("Cc: {}\r\n", msg.cc.join(", ")));
-            }
-            headers.push_str(&format!("Subject: {}\r\n", msg.subject));
-            if let Some(ref irt) = msg.in_reply_to {
-                headers.push_str(&format!("In-Reply-To: {irt}\r\n"));
-            }
-            let mut refs = msg.references.clone();
-            if let Some(ref irt) = msg.in_reply_to {
-                if !refs.contains(irt) {
-                    refs.push(irt.clone());
-                }
-            }
-            if !refs.is_empty() {
-                headers.push_str(&format!("References: {}\r\n", refs.join(" ")));
-            }
-            headers.push_str("MIME-Version: 1.0\r\n");
-            headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-            headers.push_str("Content-Transfer-Encoding: 8bit\r\n");
-            headers.push_str("\r\n");
-            let text = msg.text.as_deref().unwrap_or("");
-            let raw = format!("{headers}{text}");
+            let raw = build_plain_rfc822(self.alias_user(), msg);
             return self.append_raw_message(&msg.folder, raw.as_bytes()).await;
         }
 
@@ -356,6 +305,80 @@ impl Client {
         );
         let body = json!({ "from": self.alias_user(), "raw": raw });
         self.post_json("/v1/emails", &body).await
+    }
+}
+
+/// Build a complete RFC822 message (headers + body) from a [`NewMessage`].
+///
+/// Shared by every code path that needs raw bytes rather than the
+/// structured forwardemail JSON: the forwardemail `raw` send/append
+/// (threaded messages) AND the generic SMTP-submission sender used by the
+/// Stalwart provider, which has no REST surface and must hand the SMTP
+/// server a full message. Centralizing it here keeps header construction
+/// (threading, MIME) identical across providers.
+///
+/// `from` is the envelope/header sender (the authenticated alias). The
+/// body is emitted as `text/plain; charset=utf-8` when only text is
+/// present, `text/html` when only html is present, and
+/// `multipart/alternative` when both are present.
+pub(crate) fn build_plain_rfc822(from: &str, msg: &NewMessage) -> String {
+    let mut headers = format!("From: {from}\r\n");
+    headers.push_str(&format!("To: {}\r\n", msg.to.join(", ")));
+    if !msg.cc.is_empty() {
+        headers.push_str(&format!("Cc: {}\r\n", msg.cc.join(", ")));
+    }
+    headers.push_str(&format!("Subject: {}\r\n", msg.subject));
+
+    if let Some(ref irt) = msg.in_reply_to {
+        headers.push_str(&format!("In-Reply-To: {irt}\r\n"));
+    }
+    // References = provided chain + in_reply_to (if not already present).
+    let mut refs = msg.references.clone();
+    if let Some(ref irt) = msg.in_reply_to {
+        if !refs.contains(irt) {
+            refs.push(irt.clone());
+        }
+    }
+    if !refs.is_empty() {
+        headers.push_str(&format!("References: {}\r\n", refs.join(" ")));
+    }
+    headers.push_str("MIME-Version: 1.0\r\n");
+
+    let text = msg.text.as_deref();
+    let html = msg.html.as_deref();
+    match (text, html) {
+        (Some(t), Some(h)) => {
+            // Deterministic boundary derived from the body so the output is
+            // stable for tests without pulling in an RNG dependency.
+            let boundary = format!("pimsteward-{:016x}", fnv1a(t.as_bytes()) ^ fnv1a(h.as_bytes()));
+            headers.push_str(&format!(
+                "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n"
+            ));
+            let mut m = headers;
+            m.push_str(&format!("--{boundary}\r\n"));
+            m.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+            m.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+            m.push_str(t);
+            m.push_str("\r\n\r\n");
+            m.push_str(&format!("--{boundary}\r\n"));
+            m.push_str("Content-Type: text/html; charset=utf-8\r\n");
+            m.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+            m.push_str(h);
+            m.push_str("\r\n\r\n");
+            m.push_str(&format!("--{boundary}--\r\n"));
+            m
+        }
+        (_, Some(h)) => {
+            headers.push_str("Content-Type: text/html; charset=utf-8\r\n");
+            headers.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+            format!("{headers}{h}")
+        }
+        // Text-only, or neither (empty body) — emit a plain text part.
+        (t, None) => {
+            headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+            headers.push_str("Content-Transfer-Encoding: 8bit\r\n\r\n");
+            format!("{headers}{}", t.unwrap_or(""))
+        }
     }
 }
 

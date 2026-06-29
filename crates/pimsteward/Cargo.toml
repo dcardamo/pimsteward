@@ -39,6 +39,12 @@ subtle = "2"
 tokio-util = "0.7"
 schemars = "1"
 async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+# Async SMTP-submission client (STARTTLS + AUTH PLAIN) for providers with no
+# REST send surface (Stalwart). default-features off so it uses the same
+# rustls `ring` backend + tls12 as the rest of the crate — NOT the default
+# `aws_lc_rs`/dkim/hickory stack. We hand it pre-built RFC822 bytes via
+# `smtp::message::Message`, so no `builder`/`parser` features are needed.
+mail-send = { version = "0.6", default-features = false, features = ["ring", "tls12"] }
 socket2 = "0.5"
 futures-util = "0.3.32"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

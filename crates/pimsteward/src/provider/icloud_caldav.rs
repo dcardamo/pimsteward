@@ -134,6 +134,10 @@ impl Provider for IcloudCaldavProvider {
     fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error> {
         Ok(None)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]

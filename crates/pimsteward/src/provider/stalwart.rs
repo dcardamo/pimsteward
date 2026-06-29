@@ -256,6 +256,10 @@ impl Provider for StalwartProvider {
     fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error> {
         Ok(Some(self.contacts_source.clone()))
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]

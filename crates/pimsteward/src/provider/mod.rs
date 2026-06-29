@@ -120,6 +120,15 @@ pub trait Provider: Send + Sync {
     fn build_calendar_source(&self) -> Result<Option<Arc<dyn CalendarSource>>, Error>;
     fn build_calendar_writer(&self) -> Result<Option<Arc<dyn CalendarWriter>>, Error>;
     fn build_contacts_source(&self) -> Result<Option<Arc<dyn ContactsSource>>, Error>;
+
+    /// Upcast to `&dyn Any` so the daemon can recover the concrete provider
+    /// type for surfaces that live on inherent accessors rather than the
+    /// trait — e.g. [`StalwartProvider::smtp_config`] /
+    /// `managesieve_config`, which expose SMTP submission + ManageSieve and
+    /// have no equivalent on the forwardemail or iCloud providers. This is
+    /// the only place the daemon needs the concrete type; everything else
+    /// dispatches through the trait.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 // Construction lives in `daemon::build_provider_handles`. The previous

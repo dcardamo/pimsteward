@@ -368,28 +368,48 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
     }
 
     if cfg.permissions.check_read(Resource::Sieve).is_ok() && provider.capabilities().sieve {
-        // Sieve pull is forwardemail-specific (uses the REST `Client`).
-        // Capability-gated above: a non-forwardemail provider returns
-        // `false` for `sieve`, so we never reach the unwrap below.
-        let fe = fe_provider
-            .as_ref()
-            .expect("provider.capabilities().sieve true but no forwardemail provider");
-        let client = fe.client().clone();
-        let h = spawn_puller(
-            "sieve",
-            Duration::from_secs(cfg.pull.sieve_interval_seconds),
-            client,
-            repo.clone(),
-            alias.clone(),
-            |c, r, a| {
-                Box::pin(async move {
-                    pull::sieve::pull_sieve(&c, &r, &a, "pimsteward-pull", "pull@pimsteward.local")
-                        .await
-                        .map(|s| s.to_string())
-                })
-            },
-        );
-        handles.push(h);
+        // The sieve *backup pull* reads full script content, which only the
+        // forwardemail REST `Client` exposes — the ManageSieve client
+        // (`forwardemail/managesieve.rs`) speaks LIST/SETACTIVE, not
+        // GETSCRIPT, so it can't snapshot script bodies. Route the pull
+        // through the active provider: forwardemail gets the REST puller;
+        // any other sieve-capable provider (Stalwart) skips the content
+        // backup with a clear log rather than panicking. Sieve *activation*
+        // for Stalwart still works — it's wired separately through the MCP
+        // layer's ManageSieve config (see `managesieve_config`).
+        match fe_provider.as_ref() {
+            Some(fe) => {
+                let client = fe.client().clone();
+                let h = spawn_puller(
+                    "sieve",
+                    Duration::from_secs(cfg.pull.sieve_interval_seconds),
+                    client,
+                    repo.clone(),
+                    alias.clone(),
+                    |c, r, a| {
+                        Box::pin(async move {
+                            pull::sieve::pull_sieve(
+                                &c,
+                                &r,
+                                &a,
+                                "pimsteward-pull",
+                                "pull@pimsteward.local",
+                            )
+                            .await
+                            .map(|s| s.to_string())
+                        })
+                    },
+                );
+                handles.push(h);
+            }
+            None => {
+                tracing::info!(
+                    provider = provider.name(),
+                    "sieve capability present but no REST client; skipping sieve content \
+                     backup pull (activation still available via ManageSieve)",
+                );
+            }
+        }
     }
 
     if cfg.permissions.check_read(Resource::Calendar).is_ok() {
@@ -404,17 +424,14 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
             // a different and broader trust domain than this constrained,
             // daemon-internal iMIP send.
             let scheduling_ctx = if cfg.scheduling.enabled {
-                match fe_provider.as_ref() {
-                    Some(fe) => Some(Arc::new((
-                        ClientSender {
-                            client: fe.client().clone(),
-                            alias: alias.clone(),
-                        },
-                        cfg.scheduling.notify_on_send,
-                    ))),
+                match build_scheduling_sender(&provider, fe_provider.as_ref(), &alias) {
+                    Some(sender) => {
+                        Some(Arc::new((sender, cfg.scheduling.notify_on_send)))
+                    }
                     None => {
                         tracing::warn!(
-                            "scheduling.enabled but provider has no send client; scheduling disabled"
+                            provider = provider.name(),
+                            "scheduling.enabled but provider has no send transport; scheduling disabled"
                         );
                         None
                     }
@@ -696,6 +713,44 @@ fn spawn_contacts_puller(
     )
 }
 
+/// Build the scheduling [`Sender`] for the active provider, or `None` if the
+/// provider has no outbound transport.
+///
+/// Send routing is **provider-driven**, not forwardemail-assumed:
+///   * forwardemail → [`ClientSender`] wrapping the REST `Client`
+///     (`POST /v1/emails`), unchanged from before.
+///   * Stalwart → [`SmtpSender`] over STARTTLS submission (`:587`, AUTH),
+///     built from the provider's [`StalwartProvider::smtp_config`]. Sent
+///     mail relays out through Forward Email (Stalwart's configured relay).
+///   * any other provider (e.g. iCloud CalDAV, which has no send surface)
+///     → `None`, so the caller disables scheduling cleanly.
+///
+/// Returning a boxed trait object keeps the calendar puller's scheduling
+/// path identical across providers.
+fn build_scheduling_sender(
+    provider: &Arc<dyn Provider>,
+    fe_provider: Option<&Arc<ForwardemailProvider>>,
+    alias: &str,
+) -> Option<Box<dyn Sender>> {
+    // forwardemail: REST send via the shared `Client`.
+    if let Some(fe) = fe_provider {
+        return Some(Box::new(ClientSender {
+            client: fe.client().clone(),
+            alias: alias.to_string(),
+        }));
+    }
+    // Stalwart: SMTP submission. Downcast the type-erased provider to read
+    // its inherent `smtp_config()` accessor (the SMTP endpoint isn't part of
+    // the `Provider` trait, which only covers the five `build_*` resources).
+    if let Some(st) = provider
+        .as_any()
+        .downcast_ref::<crate::provider::stalwart::StalwartProvider>()
+    {
+        return Some(Box::new(crate::smtp::SmtpSender::new(st.smtp_config())));
+    }
+    None
+}
+
 /// Adapts the forwardemail REST `Client` to the `scheduling::Sender` trait so
 /// the scheduling engine can send iMIP messages and owner notifications without
 /// depending on the forwardemail module directly.
@@ -739,8 +794,10 @@ fn spawn_calendar_puller(
     repo: Arc<Repo>,
     alias: String,
     // (sender, notify_on_send). When `None`, scheduling is disabled and the
-    // puller behaves exactly as it did before scheduling was wired in.
-    scheduling_ctx: Option<Arc<(ClientSender, bool)>>,
+    // puller behaves exactly as it did before scheduling was wired in. The
+    // sender is a trait object so the same puller drives forwardemail's REST
+    // [`ClientSender`] and the generic [`SmtpSender`] (Stalwart) alike.
+    scheduling_ctx: Option<Arc<(Box<dyn Sender>, bool)>>,
 ) -> tokio::task::JoinHandle<()> {
     let span = tracing::info_span!("puller", resource = "calendar");
     tokio::spawn(
@@ -778,7 +835,7 @@ fn spawn_calendar_puller(
                 if let (Some(ctx), Some(sha)) = (&scheduling_ctx, commit_sha) {
                     let now = chrono::Utc::now();
                     match crate::scheduling::run_scheduling(
-                        &repo, &sha, &ctx.0, &alias, ctx.1, now,
+                        &repo, &sha, ctx.0.as_ref(), &alias, ctx.1, now,
                     )
                     .await
                     {
@@ -1052,6 +1109,114 @@ mod tests {
             1,
             "iCloud dyn_provider is the only handle"
         );
+    }
+
+    /// Build a `Config` with a `[provider.stalwart]` block backed by temp
+    /// credential files so `StalwartProvider::new` succeeds offline.
+    fn stalwart_config_with_temp_creds(dir: &tempfile::TempDir) -> Config {
+        use crate::config::StalwartConfig;
+        let u = dir.path().join("u");
+        let p = dir.path().join("p");
+        std::fs::write(&u, "dan@example.test").unwrap();
+        std::fs::write(&p, "pw").unwrap();
+        Config {
+            provider: ProviderConfigs {
+                stalwart: Some(StalwartConfig {
+                    alias_user_file: Some(u),
+                    alias_password_file: Some(p),
+                    caldav_base_url: "https://h:8443/dav/cal/u/default".into(),
+                    carddav_base_url: "https://h:8443/dav/card/u/default".into(),
+                    smtp_host: "stalwart.example.test".into(),
+                    smtp_port: 587,
+                    managesieve_host: "stalwart.example.test".into(),
+                    managesieve_port: 4190,
+                    ..StalwartConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    /// Regression: the Stalwart daemon path must build its handles WITHOUT a
+    /// forwardemail handle. The old sieve gate did
+    /// `fe_provider.expect(...)`, which would panic here because Stalwart
+    /// reports `capabilities().sieve == true` yet returns `fe == None`. This
+    /// asserts the precondition the panic depended on (sieve-capable +
+    /// fe-absent) so the daemon's `match fe_provider` gate is the thing under
+    /// test rather than an unreachable arm.
+    #[test]
+    fn stalwart_handles_have_no_fe_but_advertise_sieve() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = stalwart_config_with_temp_creds(&dir);
+        let (provider, fe) = build_provider_handles(&cfg).expect("stalwart config builds");
+        assert!(fe.is_none(), "stalwart must not return an fe handle");
+        assert!(
+            provider.capabilities().sieve,
+            "stalwart advertises sieve — this is exactly the config that used to panic"
+        );
+    }
+
+    /// Send dispatch is provider-driven: Stalwart selects the SMTP-submission
+    /// sender (NOT the forwardemail REST `Client`), and the chosen sender's
+    /// From address is the configured alias. If a regression reverted send to
+    /// `fe_provider.expect(...)`/REST-only, `build_scheduling_sender` would
+    /// return `None` for Stalwart (no fe handle) and this fails.
+    #[test]
+    fn scheduling_sender_for_stalwart_is_smtp() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = stalwart_config_with_temp_creds(&dir);
+        let (provider, fe) = build_provider_handles(&cfg).unwrap();
+        // The Stalwart arm must yield a sender (proves send does NOT take the
+        // fe-only path, which would return None here).
+        let sender = build_scheduling_sender(&provider, fe.as_ref(), provider.alias());
+        assert!(sender.is_some(), "stalwart must yield an SMTP scheduling sender");
+        // And it resolves the SMTP endpoint from the provider's inherent
+        // smtp_config — the same construction `build_scheduling_sender` uses.
+        let st = provider
+            .as_any()
+            .downcast_ref::<crate::provider::stalwart::StalwartProvider>()
+            .expect("provider is stalwart");
+        let direct = crate::smtp::SmtpSender::new(st.smtp_config());
+        assert_eq!(direct.from_address(), "dan@example.test");
+        assert_eq!(st.smtp_config().host, "stalwart.example.test");
+        assert_eq!(st.smtp_config().port, 587);
+    }
+
+    /// forwardemail send routing is unchanged: it still yields a sender
+    /// (the REST-backed `ClientSender`).
+    #[test]
+    fn scheduling_sender_for_forwardemail_is_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = forwardemail_config_with_temp_creds(&dir);
+        let (provider, fe) = build_provider_handles(&cfg).unwrap();
+        let sender = build_scheduling_sender(&provider, fe.as_ref(), provider.alias());
+        assert!(sender.is_some(), "forwardemail must yield a scheduling sender");
+    }
+
+    /// iCloud has no outbound transport → no scheduling sender (clean
+    /// disable, never a panic).
+    #[test]
+    fn scheduling_sender_for_icloud_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let u = dir.path().join("u");
+        let p = dir.path().join("p");
+        std::fs::write(&u, "alice@icloud.com").unwrap();
+        std::fs::write(&p, "app-spec-pass").unwrap();
+        let cfg = Config {
+            provider: ProviderConfigs {
+                icloud_caldav: Some(crate::config::IcloudCaldavConfig {
+                    username_file: Some(u),
+                    password_file: Some(p),
+                    ..crate::config::IcloudCaldavConfig::default()
+                }),
+                ..ProviderConfigs::default()
+            },
+            ..Config::default()
+        };
+        let (provider, fe) = build_provider_handles(&cfg).unwrap();
+        let sender = build_scheduling_sender(&provider, fe.as_ref(), provider.alias());
+        assert!(sender.is_none(), "iCloud has no send transport");
     }
 }
 

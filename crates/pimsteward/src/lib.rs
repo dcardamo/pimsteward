@@ -17,6 +17,7 @@ pub mod pull;
 pub mod restore;
 pub mod safety;
 pub mod scheduling;
+pub mod smtp;
 pub mod source;
 pub mod store;
 pub mod write;
