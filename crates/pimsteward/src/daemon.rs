@@ -177,6 +177,18 @@ async fn spawn_mcp_http_listener(
                     None => (None, None),
                 };
 
+                // SMTP-submission sender for the `send_email` tool. Built only
+                // for Stalwart (which has no REST send surface) by downcasting
+                // the type-erased provider and reading its inherent
+                // `smtp_config()` — the SAME as_any/smtp_config pattern
+                // `build_scheduling_sender` uses for the daemon's scheduling
+                // send. forwardemail and iCloud get `None`: forwardemail sends
+                // through the REST `client`, iCloud has no send transport.
+                let smtp_sender = provider
+                    .as_any()
+                    .downcast_ref::<crate::provider::stalwart::StalwartProvider>()
+                    .map(|st| Arc::new(crate::smtp::SmtpSender::new(st.smtp_config())));
+
                 let repo =
                     Repo::open_or_init(&cfg.storage.repo_path).map_err(std::io::Error::other)?;
                 let search_index = Arc::new(
@@ -197,6 +209,7 @@ async fn spawn_mcp_http_listener(
                     calendar_writer,
                     managesieve,
                     search_index,
+                    smtp_sender,
                 ))
             },
             Default::default(),

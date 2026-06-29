@@ -508,6 +508,12 @@ struct Inner {
     /// `crate::index` and `docs/specs/2026-04-20-local-search-index-
     /// design.md` for layout and invariants.
     search_index: Arc<crate::index::SearchIndex>,
+    /// SMTP-submission sender for the `send_email` tool. `Some` for providers
+    /// that send via SMTP submission (Stalwart) and `None` for forwardemail
+    /// (which sends through the REST `client`) and iCloud (no send surface).
+    /// The send tool branches on this vs `client`; permission checks run
+    /// identically before the branch in both cases.
+    smtp_sender: Option<Arc<crate::smtp::SmtpSender>>,
 }
 
 /// ManageSieve connection parameters, passed through from Config.
@@ -543,6 +549,7 @@ impl PimstewardServer {
         calendar_writer: Arc<dyn CalendarWriter>,
         managesieve: Option<ManageSieveConfig>,
         search_index: Arc<crate::index::SearchIndex>,
+        smtp_sender: Option<Arc<crate::smtp::SmtpSender>>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -559,6 +566,7 @@ impl PimstewardServer {
                 calendar_writer,
                 managesieve,
                 search_index,
+                smtp_sender,
             }),
             tool_router: Self::tool_router(),
         }
@@ -1841,7 +1849,6 @@ impl PimstewardServer {
             ));
         }
 
-        let client = self.require_client()?;
         let mail_source = self.require_mail_source()?;
         let attr = self.attribution(None, Some(p.reason));
         let msg = crate::forwardemail::writes::NewMessage {
@@ -1858,16 +1865,36 @@ impl PimstewardServer {
             in_reply_to: p.in_reply_to,
             references: p.references,
         };
-        let result = crate::write::mail::send_email(
-            client,
-            mail_source.as_ref(),
-            &self.inner.repo,
-            &self.inner.alias,
-            &attr,
-            &msg,
-        )
-        .await
-        .map_err(|e| self.api_error(e))?;
+        // Transport branch — policy is already enforced above
+        // (`check_email_send` + structural validation), so the choice here
+        // is purely "how is it sent", never "may it be sent". Stalwart sends
+        // via SMTP submission; forwardemail via its REST bridge; any provider
+        // with neither (iCloud) falls through to `require_client`'s
+        // "unsupported by provider" error.
+        let result = if let Some(smtp) = self.inner.smtp_sender.as_ref() {
+            crate::write::mail::send_email_smtp(
+                smtp,
+                mail_source.as_ref(),
+                &self.inner.repo,
+                &self.inner.alias,
+                &attr,
+                &msg,
+            )
+            .await
+            .map_err(|e| self.api_error(e))?
+        } else {
+            let client = self.require_client()?;
+            crate::write::mail::send_email(
+                client,
+                mail_source.as_ref(),
+                &self.inner.repo,
+                &self.inner.alias,
+                &attr,
+                &msg,
+            )
+            .await
+            .map_err(|e| self.api_error(e))?
+        };
         let id = result
             .get("id")
             .and_then(|v| v.as_str())
@@ -4683,8 +4710,156 @@ mod tests {
             calendar_writer,
             None,
             search_index,
+            None,
         );
         (server, dir)
+    }
+
+    /// Build a `PimstewardServer` shaped like a Stalwart daemon: an IMAP
+    /// mail source (constructed, never connected) plus an `SmtpSender` for
+    /// the send path, and `client: None` (Stalwart has no REST surface).
+    /// The SMTP endpoint points at a closed localhost port so the live send
+    /// attempt fails fast with a transport error — which is the proof we
+    /// want: the call routed THROUGH the SMTP sender (not the
+    /// "unsupported by provider" early-out that `client: None` would
+    /// otherwise trigger on the REST path).
+    fn stalwart_shaped_server() -> (PimstewardServer, tempfile::TempDir) {
+        use crate::icloud::caldav::{IcloudCalendarSource, IcloudCalendarWriter};
+        use crate::permission::{Access, CalendarPermission, EmailPermission, SendPermission};
+        use crate::source::imap::{ImapConfig, ImapMailSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::store::Repo::open_or_init(dir.path()).unwrap();
+        let perms = Permissions {
+            email: EmailPermission::Flat(Access::ReadWrite),
+            email_send: SendPermission::Allowed,
+            calendar: CalendarPermission::Flat(Access::ReadWrite),
+            contacts: Access::ReadWrite,
+            sieve: Access::ReadWrite,
+        };
+        let imap = Arc::new(ImapMailSource::new(ImapConfig {
+            host: "127.0.0.1".into(),
+            port: 1,
+            user: "dan@example.test".into(),
+            password: "p".into(),
+        }));
+        let mail_source: Arc<dyn MailSource> = imap.clone();
+        let mail_writer: Arc<dyn MailWriter> = imap;
+        let calendar_source: Arc<dyn CalendarSource> = Arc::new(
+            IcloudCalendarSource::new(
+                "https://caldav.icloud.com/".into(),
+                "test-ua".into(),
+                "u@example.com".into(),
+                "p".into(),
+            )
+            .unwrap(),
+        );
+        let calendar_writer: Arc<dyn CalendarWriter> = Arc::new(
+            IcloudCalendarWriter::new(
+                "https://caldav.icloud.com/".into(),
+                "test-ua".into(),
+                "u@example.com".into(),
+                "p".into(),
+            )
+            .unwrap(),
+        );
+        let search_index = Arc::new(crate::index::SearchIndex::open(dir.path()).unwrap());
+        // SMTP sender pointing at a closed port — send will attempt and fail
+        // at transport, never short-circuit with "unsupported by provider".
+        let smtp_sender = Some(Arc::new(crate::smtp::SmtpSender::new(
+            crate::provider::stalwart::StalwartEndpoint {
+                host: "127.0.0.1".into(),
+                port: 1,
+                user: "dan@example.test".into(),
+                password: "p".into(),
+            },
+        )));
+        let server = PimstewardServer::new(
+            None, // client: None — Stalwart has no REST surface
+            repo,
+            perms,
+            "dan-example.test".to_string(),
+            "stalwart",
+            "test".to_string(),
+            Some(mail_source),
+            Some(mail_writer),
+            None,
+            calendar_source,
+            calendar_writer,
+            None,
+            search_index,
+            smtp_sender,
+        );
+        (server, dir)
+    }
+
+    fn valid_send_params() -> SendEmailParams {
+        SendEmailParams {
+            to: vec!["dan@example.test".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "unit-test send routing".into(),
+            text: Some("body".into()),
+            html: None,
+            in_reply_to: None,
+            references: vec![],
+            reason: "unit test: assert send transport routing".into(),
+        }
+    }
+
+    /// Stalwart send routes through the `SmtpSender`, NOT the
+    /// "unsupported by provider" early-out. With `client: None` the old
+    /// code would `require_client()` and bail with
+    /// UNSUPPORTED_BY_PROVIDER_CODE before ever sending. After the fix the
+    /// call reaches the SMTP transport and fails at connect (closed port)
+    /// — an internal/api error, decisively NOT the unsupported code. That a
+    /// real transport attempt happened is the proof the SMTP path was taken.
+    #[tokio::test]
+    async fn stalwart_send_email_routes_through_smtp_not_unsupported() {
+        let (s, _dir) = stalwart_shaped_server();
+        let err = s
+            .send_email(Parameters(valid_send_params()))
+            .await
+            .expect_err("send to a closed SMTP port must fail at transport");
+        assert_ne!(
+            err.code, UNSUPPORTED_BY_PROVIDER_CODE,
+            "Stalwart must route send through the SMTP sender, not the \
+             unsupported-by-provider early-out: {}",
+            err.message
+        );
+        // Permission was allowed, so it must NOT be a permission denial either.
+        assert_ne!(err.code, PERMISSION_DENIED_CODE, "{}", err.message);
+    }
+
+    /// A provider with neither a REST client nor an SMTP sender (the iCloud
+    /// shape) still rejects send with "unsupported by provider" — the
+    /// transport branch falls through to `require_client`.
+    #[tokio::test]
+    async fn icloud_shaped_server_rejects_send_email() {
+        let (s, _dir) = icloud_shaped_server();
+        let err = s
+            .send_email(Parameters(valid_send_params()))
+            .await
+            .expect_err("send must fail with no transport");
+        assert_eq!(err.code, UNSUPPORTED_BY_PROVIDER_CODE, "{}", err.message);
+    }
+
+    /// Send still enforces `email_send` BEFORE any transport branch: a
+    /// Stalwart-shaped server with send DENIED rejects with the permission
+    /// code and never reaches the SMTP sender. Guards the security boundary
+    /// — the permission matrix is provider-independent.
+    #[tokio::test]
+    async fn stalwart_send_email_denied_without_send_permission() {
+        use crate::permission::SendPermission;
+        let (mut s, _dir) = stalwart_shaped_server();
+        // Flip email_send to denied; everything else unchanged.
+        let inner = Arc::get_mut(&mut s.inner).expect("sole owner in test");
+        inner.permissions.email_send = SendPermission::Denied;
+        let err = s
+            .send_email(Parameters(valid_send_params()))
+            .await
+            .expect_err("send must be denied without email_send permission");
+        assert_eq!(err.code, PERMISSION_DENIED_CODE, "{}", err.message);
     }
 
     #[tokio::test]

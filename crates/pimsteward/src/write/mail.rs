@@ -7,6 +7,7 @@
 use crate::error::Error;
 use crate::forwardemail::Client;
 use crate::pull::mail::sync_folders;
+use crate::smtp::SmtpSender;
 use crate::source::{MailSource, MailWriter};
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
@@ -138,8 +139,49 @@ pub async fn send_email(
     attribution: &Attribution,
     msg: &crate::forwardemail::writes::NewMessage,
 ) -> Result<serde_json::Value, Error> {
-    let body_hash = body_sha256(msg);
     let result = client.send_email(msg).await?;
+    audit_and_refresh_send(source, repo, alias, attribution, msg, result).await
+}
+
+/// Send an email via SMTP submission (Stalwart) and record the same audit
+/// commit `send_email` records for the REST path.
+///
+/// This is the transport-divergent twin of [`send_email`]: forwardemail
+/// posts to its REST `/v1/emails` bridge, Stalwart speaks SMTP submission
+/// on :587. Message construction ([`build_plain_rfc822`], threading, MIME)
+/// is shared via [`SmtpSender::send_message`] → `build_plain_rfc822`, the
+/// exact same builder the REST path's `Client::send_email` uses, so the two
+/// transports are byte-identical on the wire. The audit trailer, body hash,
+/// and post-send Sent-folder refresh are identical — only the transport
+/// differs, never the policy or the record.
+///
+/// [`build_plain_rfc822`]: crate::forwardemail::writes::build_plain_rfc822
+pub async fn send_email_smtp(
+    sender: &SmtpSender,
+    source: &dyn MailSource,
+    repo: &Repo,
+    alias: &str,
+    attribution: &Attribution,
+    msg: &crate::forwardemail::writes::NewMessage,
+) -> Result<serde_json::Value, Error> {
+    let result = sender.send_message(msg).await?;
+    audit_and_refresh_send(source, repo, alias, attribution, msg, result).await
+}
+
+/// Shared audit-commit + Sent-folder refresh for both send transports. The
+/// `result` is the transport's response value (`{"id": ...}` shape) — REST
+/// returns the forwardemail email id, SMTP submission synthesizes
+/// `"smtp-submitted"`. Splitting this out keeps the audit trailer, body
+/// hash, and refresh policy identical regardless of which transport sent.
+async fn audit_and_refresh_send(
+    source: &dyn MailSource,
+    repo: &Repo,
+    alias: &str,
+    attribution: &Attribution,
+    msg: &crate::forwardemail::writes::NewMessage,
+    result: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let body_hash = body_sha256(msg);
     let returned_id = result
         .get("id")
         .and_then(|v| v.as_str())
@@ -261,4 +303,85 @@ pub async fn refresh(
         repo.empty_commit(&attribution.caller, &attribution.caller_email, &msg)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::stalwart::StalwartEndpoint;
+    use crate::source::imap::{ImapConfig, ImapMailSource};
+
+    /// LIVE e2e for the MCP send path's SMTP transport: drives
+    /// [`send_email_smtp`] — the exact write function the `send_email` MCP
+    /// tool calls for the Stalwart provider — against the real Stalwart
+    /// server. Sends dan@→dan@ (external destination → Stalwart relays out
+    /// via Forward Email) and records the same audit commit the REST path
+    /// records. Asserts the SMTP transaction was accepted (`Ok` only on a
+    /// 2xx after DATA) and that the audit/refresh path produced a result
+    /// shaped like the REST path (`{"transport":"smtp"}`).
+    ///
+    /// Gated on `STALWART_LIVE_SEND=1`; reads the alias password from
+    /// `~/.config/secrets/stalwart-password` (or `STALWART_LIVE_PASSWORD`).
+    /// Run on saturn. Skips cleanly without the env var. TLS is validated
+    /// normally (connect by hostname).
+    #[tokio::test]
+    async fn live_send_email_smtp_through_write_path() {
+        if std::env::var("STALWART_LIVE_SEND").as_deref() != Ok("1") {
+            eprintln!("skipping: set STALWART_LIVE_SEND=1 to run the live MCP-send e2e");
+            return;
+        }
+        let host =
+            std::env::var("STALWART_LIVE_HOST").unwrap_or_else(|_| "stalwart.example.test".into());
+        let user = std::env::var("STALWART_LIVE_USER").unwrap_or_else(|_| "dan@example.test".into());
+        let password = std::env::var("STALWART_LIVE_PASSWORD").ok().unwrap_or_else(|| {
+            let home = std::env::var("HOME").expect("HOME");
+            std::fs::read_to_string(format!("{home}/.config/secrets/stalwart-password"))
+                .expect("read stalwart-password")
+                .trim()
+                .to_string()
+        });
+        // IMAP for the post-send Sent refresh. On saturn Stalwart binds IMAP
+        // tailscale-only; default to localhost:143 (STARTTLS) where this runs.
+        let imap_host = std::env::var("STALWART_LIVE_IMAP_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let imap_port: u16 = std::env::var("STALWART_LIVE_IMAP_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(143);
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(dir.path()).unwrap();
+        let source = ImapMailSource::new(ImapConfig {
+            host: imap_host,
+            port: imap_port,
+            user: user.clone(),
+            password: password.clone(),
+        });
+        let sender = SmtpSender::new(StalwartEndpoint {
+            host,
+            port: 587,
+            user: user.clone(),
+            password,
+        });
+        let attr = Attribution::new("test".to_string(), Some("live MCP-send e2e".to_string()));
+        let stamp = chrono::Utc::now().to_rfc3339();
+        let msg = crate::forwardemail::writes::NewMessage {
+            folder: "Sent".to_string(),
+            to: vec![user.clone()],
+            cc: vec![],
+            bcc: vec![],
+            subject: format!("pimsteward MCP-send e2e {stamp}"),
+            text: Some(format!(
+                "Live MCP send_email→SMTP path test from pimsteward at {stamp}. \
+                 External destination → Stalwart relays out via Forward Email."
+            )),
+            html: None,
+            in_reply_to: None,
+            references: vec![],
+        };
+        let result = send_email_smtp(&sender, &source, &repo, "dan-example.test", &attr, &msg)
+            .await
+            .expect("live MCP send_email_smtp must succeed (250 queued)");
+        assert_eq!(result["transport"], "smtp", "{result}");
+        eprintln!("live MCP send accepted + audited: {result}");
+    }
 }
