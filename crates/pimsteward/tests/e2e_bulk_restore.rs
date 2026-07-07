@@ -51,6 +51,7 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     let good_sieve = r#"require ["fileinto"]; fileinto "Archive";"#;
     let sieve_script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -94,7 +95,7 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     .await
     .ok();
     let _ = pull_sieve(
-        &ctx.client,
+        &ctx.sieve_backend(),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",
@@ -129,10 +130,11 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     let bad_sieve = r#"require ["fileinto"]; fileinto "Junk";"#;
     write::sieve::update_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &sieve_script.id,
+        &sieve_name,
         bad_sieve,
     )
     .await
@@ -259,10 +261,11 @@ async fn bulk_restore_contacts_sieve_and_calendar() {
     .await;
     let _ = write::sieve::delete_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &sieve_script.id,
+        &sieve_name,
     )
     .await;
     let _ = ctx.client.delete_calendar_event(&event.id).await;

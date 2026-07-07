@@ -503,7 +503,14 @@ struct Inner {
     calendar_writer: Arc<dyn CalendarWriter>,
     /// ManageSieve connection info for sieve script activation.
     /// Forwardemail-specific; `None` on iCloud.
+    #[allow(dead_code)]
     managesieve: Option<ManageSieveConfig>,
+    /// Sieve script backend (CRUD + activation). `Some` for providers
+    /// that surface sieve (forwardemail via REST+ManageSieve, Stalwart
+    /// via ManageSieve+STARTTLS); `None` on iCloud. The `list_sieve_rules`
+    /// / `add_sieve_rule` / `remove_sieve_rule` tools gate on this and
+    /// return "unsupported by provider" when absent.
+    sieve_backend: Option<Arc<dyn crate::source::traits::SieveBackend>>,
     /// Local search index (SQLite + FTS5) backing `search_email`.  See
     /// `crate::index` and `docs/specs/2026-04-20-local-search-index-
     /// design.md` for layout and invariants.
@@ -548,6 +555,7 @@ impl PimstewardServer {
         calendar_source: Arc<dyn CalendarSource>,
         calendar_writer: Arc<dyn CalendarWriter>,
         managesieve: Option<ManageSieveConfig>,
+        sieve_backend: Option<Arc<dyn crate::source::traits::SieveBackend>>,
         search_index: Arc<crate::index::SearchIndex>,
         smtp_sender: Option<Arc<crate::smtp::SmtpSender>>,
     ) -> Self {
@@ -565,6 +573,7 @@ impl PimstewardServer {
                 calendar_source,
                 calendar_writer,
                 managesieve,
+                sieve_backend,
                 search_index,
                 smtp_sender,
             }),
@@ -602,9 +611,11 @@ impl PimstewardServer {
             .ok_or_else(unsupported_by_provider)
     }
 
-    fn require_managesieve(&self) -> Result<&ManageSieveConfig, McpError> {
+    fn require_sieve_backend(
+        &self,
+    ) -> Result<&Arc<dyn crate::source::traits::SieveBackend>, McpError> {
         self.inner
-            .managesieve
+            .sieve_backend
             .as_ref()
             .ok_or_else(unsupported_by_provider)
     }
@@ -1499,27 +1510,13 @@ impl PimstewardServer {
     )]
     async fn list_sieve_rules(&self, _p: Parameters<EmptyParams>) -> Result<String, McpError> {
         self.check(Resource::Sieve)?;
-        let ms = self.require_managesieve()?;
-        let client = self.require_client()?;
-        let active_name = crate::forwardemail::managesieve::get_active_script(
-            &ms.host, ms.port, &ms.user, &ms.password,
-        )
-        .await
-        .map_err(|e| self.api_error(e))?;
+        let backend = self.require_sieve_backend()?;
+        let active_name = backend.get_active().await.map_err(|e| self.api_error(e))?;
         let Some(active_name) = active_name else {
             return Ok("[]".to_string());
         };
-
-        let scripts = client
-            .list_sieve_scripts()
-            .await
-            .map_err(|e| self.api_error(e))?;
-        let Some(active) = scripts.into_iter().find(|s| s.name == active_name) else {
-            return Ok("[]".to_string());
-        };
-
-        let full = client
-            .get_sieve_script(&active.id)
+        let full = backend
+            .get_script(&active_name)
             .await
             .map_err(|e| self.api_error(e))?;
         let content = full.content.unwrap_or_default();
@@ -1638,15 +1635,15 @@ impl PimstewardServer {
         Parameters(p): Parameters<AddSieveRuleParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Sieve)?;
-        let client = self.require_client()?;
-        let ms = self.require_managesieve()?;
+        let backend = self.require_sieve_backend()?;
+        let mail_source = self.require_mail_source()?;
         let attr = self.attribution(None, p.reason);
         let updated = crate::write::sieve::add_sieve_rule(
-            client,
+            backend.as_ref(),
+            mail_source.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            ms,
             &p.rule,
             p.comment.as_deref(),
         )
@@ -1665,15 +1662,13 @@ impl PimstewardServer {
         Parameters(p): Parameters<RemoveSieveRuleParams>,
     ) -> Result<String, McpError> {
         self.check_write(Resource::Sieve)?;
-        let client = self.require_client()?;
-        let ms = self.require_managesieve()?;
+        let backend = self.require_sieve_backend()?;
         let attr = self.attribution(None, p.reason);
         let updated = crate::write::sieve::remove_sieve_rule(
-            client,
+            backend.as_ref(),
             &self.inner.repo,
             &self.inner.alias,
             &attr,
-            ms,
             &p.name,
         )
         .await
@@ -4709,6 +4704,7 @@ mod tests {
             calendar_source,
             calendar_writer,
             None,
+            None,
             search_index,
             None,
         );
@@ -4786,6 +4782,7 @@ mod tests {
             None,
             calendar_source,
             calendar_writer,
+            None,
             None,
             search_index,
             smtp_sender,

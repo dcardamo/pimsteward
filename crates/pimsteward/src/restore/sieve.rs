@@ -132,14 +132,23 @@ pub async fn apply_sieve(
         }
     }
 
-    let _ = pull_sieve(
-        client,
-        repo,
-        alias,
-        &attribution.caller,
-        &attribution.caller_email,
-    )
-    .await?;
+    let _ = {
+        let ms = crate::mcp::ManageSieveConfig {
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+        };
+        let backend = crate::source::sieve::ForwardemailSieveBackend::new(client.clone(), ms);
+        pull_sieve(
+            &backend,
+            repo,
+            alias,
+            &attribution.caller,
+            &attribution.caller_email,
+        )
+        .await
+    };
     let audit = WriteAudit {
         attribution,
         tool: "restore_sieve",

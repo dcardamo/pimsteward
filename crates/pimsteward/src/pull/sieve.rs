@@ -2,25 +2,25 @@
 //! are small, few, and sha256 of the content is good enough for diff.
 
 use crate::error::Error;
-use crate::forwardemail::Client;
 use crate::pull::{filename_safe, PullResult, PullSummary};
+use crate::source::traits::SieveBackend;
 use crate::store::Repo;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 pub async fn pull_sieve(
-    client: &Client,
+    backend: &dyn SieveBackend,
     repo: &Repo,
     alias: &str,
     author_name: &str,
     author_email: &str,
 ) -> PullResult<PullSummary> {
-    let list = client.list_sieve_scripts().await?;
+    let list = backend.list_scripts().await?;
 
     // list endpoint may not include `content`; fetch each individually.
     let mut full = Vec::with_capacity(list.len());
     for s in &list {
-        let one = client.get_sieve_script(&s.id).await?;
+        let one = backend.get_script(&s.name).await?;
         full.push(one);
     }
 
@@ -52,10 +52,7 @@ pub async fn pull_sieve(
                 "name": s.name,
                 "is_active": s.is_active,
                 "is_valid": s.is_valid,
-                "required_capabilities": s.required_capabilities,
-                "security_warnings": s.security_warnings,
                 "validation_errors": s.validation_errors,
-                "updated_at": s.updated_at,
                 "sha256": hash,
             });
             let meta_path = format!("{subdir}/{name}.meta.json");

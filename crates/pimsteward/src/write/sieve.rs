@@ -1,83 +1,85 @@
 //! Sieve script write operations.
 
 use crate::error::Error;
-use crate::forwardemail::managesieve;
-use crate::forwardemail::sieve::SieveScript;
 use crate::forwardemail::Client;
 use crate::pull::sieve::pull_sieve;
+use crate::source::traits::{MailSource, SieveBackend, SieveScriptMeta};
 use crate::store::Repo;
 use crate::write::audit::{Attribution, WriteAudit};
 use regex::Regex;
 
+/// Install a new sieve script by name (FE REST create). Thin FE-specific
+/// wrapper kept for the e2e tests; production code uses the
+/// [`SieveBackend`] trait via [`add_sieve_rule`] / [`remove_sieve_rule`].
 pub async fn install_sieve_script(
     client: &Client,
+    ms: &crate::mcp::ManageSieveConfig,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
     name: &str,
     content: &str,
-) -> Result<SieveScript, Error> {
-    let created = client.create_sieve_script(name, content).await?;
-    // Early warning: surface server-side validation issues before committing.
-    if !created.is_valid {
-        return Err(Error::Api {
-            status: 422,
-            message: format!(
-                "sieve script '{name}' was accepted by forwardemail but flagged as invalid: {:?}",
-                created.validation_errors
-            ),
-        });
-    }
+) -> Result<SieveScriptMeta, Error> {
+    let backend = crate::source::sieve::ForwardemailSieveBackend::new(client.clone(), ms.clone());
+    let created = backend.put_script(name, content).await?;
     let audit = WriteAudit {
         attribution,
         tool: "install_sieve_script",
         resource: "sieve",
-        resource_id: created.id.clone(),
+        resource_id: created.name.clone(),
         args: serde_json::json!({"name": name, "content_bytes": content.len()}),
         summary: format!("sieve: install {name}"),
     };
-    refresh(client, repo, alias, attribution, &audit).await?;
+    refresh(&backend, repo, alias, attribution, &audit).await?;
     Ok(created)
 }
 
+/// Update an existing sieve script's content (FE REST update by name).
+/// Thin FE-specific wrapper kept for the e2e tests.
 pub async fn update_sieve_script(
     client: &Client,
+    ms: &crate::mcp::ManageSieveConfig,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
-    id: &str,
+    name: &str,
     content: &str,
-) -> Result<SieveScript, Error> {
-    let updated = client.update_sieve_script(id, content).await?;
+) -> Result<SieveScriptMeta, Error> {
+    let backend = crate::source::sieve::ForwardemailSieveBackend::new(client.clone(), ms.clone());
+    let updated = backend.put_script(name, content).await?;
     let audit = WriteAudit {
         attribution,
         tool: "update_sieve_script",
         resource: "sieve",
-        resource_id: id.to_string(),
+        resource_id: updated.name.clone(),
         args: serde_json::json!({"content_bytes": content.len()}),
-        summary: format!("sieve: update {id}"),
+        summary: format!("sieve: update {name}"),
     };
-    refresh(client, repo, alias, attribution, &audit).await?;
+    refresh(&backend, repo, alias, attribution, &audit).await?;
     Ok(updated)
 }
 
+/// Delete a sieve script by name (FE REST delete). Thin FE-specific
+/// wrapper kept for the e2e tests.
 pub async fn delete_sieve_script(
     client: &Client,
+    ms: &crate::mcp::ManageSieveConfig,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
-    id: &str,
+    name: &str,
 ) -> Result<(), Error> {
-    client.delete_sieve_script(id).await?;
+    let backend = crate::source::sieve::ForwardemailSieveBackend::new(client.clone(), ms.clone());
+    backend.delete_script(name).await?;
     let audit = WriteAudit {
         attribution,
         tool: "delete_sieve_script",
         resource: "sieve",
-        resource_id: id.to_string(),
+        resource_id: name.to_string(),
         args: serde_json::json!({}),
-        summary: format!("sieve: delete {id}"),
+        summary: format!("sieve: delete {name}"),
     };
-    refresh(client, repo, alias, attribution, &audit).await?;
+    refresh(&backend, repo, alias, attribution, &audit).await?;
     Ok(())
 }
 
@@ -98,19 +100,19 @@ pub const CANONICAL_SCRIPT_NAME: &str = "main";
 /// merges `require [...]` capabilities, appends the rule body, and
 /// updates in place.
 pub async fn add_sieve_rule(
-    client: &Client,
+    backend: &dyn SieveBackend,
+    mail_source: &dyn MailSource,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
-    ms: &crate::mcp::ManageSieveConfig,
     rule_text: &str,
     comment: Option<&str>,
-) -> Result<SieveScript, Error> {
+) -> Result<SieveScriptMeta, Error> {
     // Validate every fileinto target in the new rule against the alias's
     // real folder list. Auto-correct case-only mismatches; reject anything
     // else with a helpful error so the caller can ask a clarifying
     // question instead of silently filing mail into a non-existent folder.
-    let folders = client.list_folders().await?;
+    let folders = mail_source.list_folders().await?;
     let folder_paths: Vec<String> = folders.into_iter().map(|f| f.path).collect();
     let rule_text_owned = match validate_fileinto_targets(rule_text, &folder_paths) {
         Ok(t) => t,
@@ -123,7 +125,7 @@ pub async fn add_sieve_rule(
     };
     let rule_text = rule_text_owned.as_str();
 
-    let active = resolve_or_bootstrap_active(client, ms, rule_text).await?;
+    let active = resolve_or_bootstrap_active(backend, rule_text).await?;
 
     // If we just bootstrapped, the script's content already contains the
     // rule — nothing to append. Audit + commit and return.
@@ -132,7 +134,7 @@ pub async fn add_sieve_rule(
             attribution,
             tool: "add_sieve_rule",
             resource: "sieve",
-            resource_id: active.script.id.clone(),
+            resource_id: active.script.name.clone(),
             args: serde_json::json!({
                 "rule_bytes": rule_text.len(),
                 "merged_bytes": rule_text.len(),
@@ -142,40 +144,29 @@ pub async fn add_sieve_rule(
             }),
             summary: format!("sieve: bootstrap {} with first rule", active.script.name),
         };
-        refresh(client, repo, alias, attribution, &audit).await?;
+        refresh(backend, repo, alias, attribution, &audit).await?;
         return Ok(active.script);
     }
 
     // Existing active script — fetch content, append, update.
-    let full = client.get_sieve_script(&active.script.id).await?;
+    let full = backend.get_script(&active.script.name).await?;
     let existing = full.content.unwrap_or_default();
     let merged = merge_sieve_with_rule(&existing, rule_text, comment);
-    let updated = client
-        .update_sieve_script(&active.script.id, &merged)
-        .await?;
-    if !updated.is_valid {
-        return Err(Error::Api {
-            status: 422,
-            message: format!(
-                "merged sieve script accepted by forwardemail but flagged as invalid: {:?}",
-                updated.validation_errors
-            ),
-        });
-    }
+    let updated = backend.put_script(&active.script.name, &merged).await?;
     let audit = WriteAudit {
         attribution,
         tool: "add_sieve_rule",
         resource: "sieve",
-        resource_id: active.script.id.clone(),
+        resource_id: updated.name.clone(),
         args: serde_json::json!({
             "rule_bytes": rule_text.len(),
             "merged_bytes": merged.len(),
             "comment": comment,
-            "active_script": active.script.name,
+            "active_script": updated.name,
         }),
         summary: format!("sieve: add rule to {}", active.script.name),
     };
-    refresh(client, repo, alias, attribution, &audit).await?;
+    refresh(backend, repo, alias, attribution, &audit).await?;
     Ok(updated)
 }
 
@@ -184,31 +175,18 @@ pub async fn add_sieve_rule(
 /// a rule prefixed with `# RASCals mailing list ...`). Errors with HTTP
 /// 404 if no rule with that name is found.
 pub async fn remove_sieve_rule(
-    client: &Client,
+    backend: &dyn SieveBackend,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
-    ms: &crate::mcp::ManageSieveConfig,
     rule_name: &str,
-) -> Result<SieveScript, Error> {
-    let active_name = managesieve::get_active_script(&ms.host, ms.port, &ms.user, &ms.password)
-        .await?
-        .ok_or_else(|| Error::Api {
-            status: 404,
-            message: "no active sieve script — nothing to remove".to_string(),
-        })?;
+) -> Result<SieveScriptMeta, Error> {
+    let active_name = backend.get_active().await?.ok_or_else(|| Error::Api {
+        status: 404,
+        message: "no active sieve script — nothing to remove".to_string(),
+    })?;
 
-    let scripts = client.list_sieve_scripts().await?;
-    let active = scripts
-        .into_iter()
-        .find(|s| s.name == active_name)
-        .ok_or_else(|| Error::Api {
-            status: 500,
-            message: format!(
-                "ManageSieve reports active script '{active_name}' but it is not in the REST list"
-            ),
-        })?;
-    let full = client.get_sieve_script(&active.id).await?;
+    let full = backend.get_script(&active_name).await?;
     let existing = full.content.unwrap_or_default();
 
     let new_content = remove_rule_from_content(&existing, rule_name).ok_or_else(|| Error::Api {
@@ -216,21 +194,12 @@ pub async fn remove_sieve_rule(
         message: format!("no rule named '{rule_name}' in active sieve script '{active_name}'"),
     })?;
 
-    let updated = client.update_sieve_script(&active.id, &new_content).await?;
-    if !updated.is_valid {
-        return Err(Error::Api {
-            status: 422,
-            message: format!(
-                "sieve script after rule removal accepted by forwardemail but flagged as invalid: {:?}",
-                updated.validation_errors
-            ),
-        });
-    }
+    let updated = backend.put_script(&active_name, &new_content).await?;
     let audit = WriteAudit {
         attribution,
         tool: "remove_sieve_rule",
         resource: "sieve",
-        resource_id: active.id.clone(),
+        resource_id: updated.name.clone(),
         args: serde_json::json!({
             "rule_name": rule_name,
             "active_script": active_name,
@@ -238,12 +207,12 @@ pub async fn remove_sieve_rule(
         }),
         summary: format!("sieve: remove rule '{rule_name}' from {active_name}"),
     };
-    refresh(client, repo, alias, attribution, &audit).await?;
+    refresh(backend, repo, alias, attribution, &audit).await?;
     Ok(updated)
 }
 
 struct ResolvedActive {
-    script: SieveScript,
+    script: SieveScriptMeta,
     /// True if we just created + activated this script in this call.
     bootstrapped: bool,
 }
@@ -252,27 +221,15 @@ struct ResolvedActive {
 /// script + activate it if no script is currently active.
 ///
 /// On the bootstrap path we install `main` with `bootstrap_content` as
-/// its body — the caller's rule text — and activate it via ManageSieve.
+/// its body — the caller's rule text — and activate it via the backend.
 async fn resolve_or_bootstrap_active(
-    client: &Client,
-    ms: &crate::mcp::ManageSieveConfig,
+    backend: &dyn SieveBackend,
     bootstrap_content: &str,
 ) -> Result<ResolvedActive, Error> {
-    if let Some(active_name) =
-        managesieve::get_active_script(&ms.host, ms.port, &ms.user, &ms.password).await?
-    {
-        let scripts = client.list_sieve_scripts().await?;
-        let active = scripts
-            .into_iter()
-            .find(|s| s.name == active_name)
-            .ok_or_else(|| Error::Api {
-                status: 500,
-                message: format!(
-                "ManageSieve reports active script '{active_name}' but it is not in the REST list"
-            ),
-            })?;
+    if let Some(active_name) = backend.get_active().await? {
+        let script = backend.get_script(&active_name).await?;
         return Ok(ResolvedActive {
-            script: active,
+            script,
             bootstrapped: false,
         });
     }
@@ -287,38 +244,10 @@ async fn resolve_or_bootstrap_active(
     };
 
     // If a `main` script already exists (perhaps deactivated), update
-    // it; otherwise create. This avoids the "Sieve script with that name
-    // already exists" 422 from forwardemail.
-    let scripts = client.list_sieve_scripts().await?;
-    let script = if let Some(existing) = scripts
-        .into_iter()
-        .find(|s| s.name == CANONICAL_SCRIPT_NAME)
-    {
-        client
-            .update_sieve_script(&existing.id, &normalized)
-            .await?
-    } else {
-        client
-            .create_sieve_script(CANONICAL_SCRIPT_NAME, &normalized)
-            .await?
-    };
-    if !script.is_valid {
-        return Err(Error::Api {
-            status: 422,
-            message: format!(
-                "bootstrap sieve script accepted by forwardemail but flagged as invalid: {:?}",
-                script.validation_errors
-            ),
-        });
-    }
-    managesieve::activate_script(
-        &ms.host,
-        ms.port,
-        &ms.user,
-        &ms.password,
-        CANONICAL_SCRIPT_NAME,
-    )
-    .await?;
+    // it; otherwise create. The SieveBackend::put_script is an upsert
+    // by name, so this is one call.
+    let script = backend.put_script(CANONICAL_SCRIPT_NAME, &normalized).await?;
+    backend.activate_script(CANONICAL_SCRIPT_NAME).await?;
     Ok(ResolvedActive {
         script,
         bootstrapped: true,
@@ -628,14 +557,14 @@ fn extract_requires(s: &str) -> (Vec<String>, String) {
 }
 
 async fn refresh(
-    client: &Client,
+    backend: &dyn SieveBackend,
     repo: &Repo,
     alias: &str,
     attribution: &Attribution,
     audit: &WriteAudit<'_>,
 ) -> Result<(), Error> {
     let _ = pull_sieve(
-        client,
+        backend,
         repo,
         alias,
         &attribution.caller,

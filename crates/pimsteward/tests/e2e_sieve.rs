@@ -17,7 +17,7 @@ async fn sieve_install_update_delete_lifecycle() {
 
     // Initial pull so the tree has current state
     let _ = pull_sieve(
-        &ctx.client,
+        &ctx.sieve_backend(),
         &ctx.repo,
         &ctx.alias_slug(),
         "e2e",
@@ -30,6 +30,7 @@ async fn sieve_install_update_delete_lifecycle() {
         r#"require ["fileinto"]; if header :contains "subject" "foo" { fileinto "Junk"; }"#;
     let installed = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -53,10 +54,11 @@ async fn sieve_install_update_delete_lifecycle() {
         r#"require ["fileinto"]; if header :contains "subject" "bar" { fileinto "Trash"; }"#;
     write::sieve::update_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &script_id,
+        &name,
         v2_content,
     )
     .await
@@ -67,9 +69,16 @@ async fn sieve_install_update_delete_lifecycle() {
     assert!(body2.contains("\"Trash\""));
 
     // Delete
-    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script_id)
-        .await
-        .expect("delete");
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.managesieve(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &name,
+    )
+    .await
+    .expect("delete");
     assert!(ctx.repo.read_file(&sieve_path).is_err());
 }
 
@@ -83,6 +92,7 @@ async fn sieve_restore_content_change() {
     let good_content = r#"require ["fileinto"]; fileinto "Archive";"#;
     let script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -99,10 +109,11 @@ async fn sieve_restore_content_change() {
     let bad_content = r#"require ["fileinto"]; fileinto "Junk";"#;
     write::sieve::update_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &script_id,
+        &name,
         bad_content,
     )
     .await
@@ -138,9 +149,16 @@ async fn sieve_restore_content_change() {
     assert_eq!(live.content.as_deref(), Some(good_content));
 
     // Cleanup
-    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script_id)
-        .await
-        .expect("cleanup");
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.managesieve(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &name,
+    )
+    .await
+    .expect("cleanup");
 }
 
 /// Restore recreate: install → snapshot → delete → restore → verify
@@ -155,6 +173,7 @@ async fn sieve_restore_recreate_after_delete() {
     let content = r#"require ["fileinto"]; fileinto "Archive";"#;
     let script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -163,14 +182,21 @@ async fn sieve_restore_recreate_after_delete() {
     )
     .await
     .expect("install");
-    let script_id = script.id.clone();
+    let _script_id = script.id.clone();
 
     let good_sha = current_head(&ctx.repo);
 
     // Delete
-    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script_id)
-        .await
-        .expect("delete");
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.managesieve(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &name,
+    )
+    .await
+    .expect("delete");
 
     // Plan restore — should be Recreate
     let (plan, token) =
@@ -220,10 +246,17 @@ async fn sieve_restore_recreate_after_delete() {
     );
 
     // Cleanup
-    let new_id = &found.unwrap().id;
-    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, new_id)
-        .await
-        .expect("cleanup");
+    let new_name = &found.unwrap().name;
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.managesieve(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        new_name,
+    )
+    .await
+    .expect("cleanup");
 }
 
 /// add_sieve_rule: install → activate → append rule → verify merged
@@ -241,6 +274,7 @@ if header :contains "subject" "first" { fileinto "Folder1"; stop; }
 "#;
     let script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -269,11 +303,11 @@ if header :contains "subject" "first" { fileinto "Folder1"; stop; }
 if header :contains "subject" "second" { discard; stop; }
 "#;
     let updated = write::sieve::add_sieve_rule(
-        &ctx.client,
+        &ctx.sieve_backend(),
+        ctx.mail_source().as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &ms,
         new_rule,
         Some("appended in test"),
     )
@@ -315,9 +349,16 @@ if header :contains "subject" "second" { discard; stop; }
     )
     .await
     .expect("deactivate");
-    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script_id)
-        .await
-        .expect("cleanup");
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.managesieve(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &name,
+    )
+    .await
+    .expect("cleanup");
 }
 
 /// add_sieve_rule auto-bootstraps a `main` script when nothing is
@@ -356,11 +397,11 @@ async fn sieve_add_rule_auto_bootstraps_when_no_active_script() {
     }
 
     let bootstrapped = write::sieve::add_sieve_rule(
-        &ctx.client,
+        &ctx.sieve_backend(),
+        ctx.mail_source().as_ref(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &ms,
         // INBOX is the one folder every alias has — keeps this test
         // independent of the alias's folder layout while still passing
         // the fileinto folder-validation check in add_sieve_rule.
@@ -424,6 +465,7 @@ if header :contains "subject" "beta" { fileinto "B"; stop; }
 "#;
     let script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -443,11 +485,10 @@ if header :contains "subject" "beta" { fileinto "B"; stop; }
     .expect("activate");
 
     write::sieve::remove_sieve_rule(
-        &ctx.client,
+        &ctx.sieve_backend(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &ms,
         "alpha rule",
     )
     .await
@@ -464,11 +505,10 @@ if header :contains "subject" "beta" { fileinto "B"; stop; }
 
     // Removing a missing rule returns 404.
     let err = write::sieve::remove_sieve_rule(
-        &ctx.client,
+        &ctx.sieve_backend(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &ms,
         "ghost rule",
     )
     .await
@@ -485,9 +525,16 @@ if header :contains "subject" "beta" { fileinto "B"; stop; }
     )
     .await
     .expect("deactivate");
-    write::sieve::delete_sieve_script(&ctx.client, &ctx.repo, &ctx.alias_slug(), &attr, &script.id)
-        .await
-        .expect("cleanup");
+    write::sieve::delete_sieve_script(
+        &ctx.client,
+        &ctx.managesieve(),
+        &ctx.repo,
+        &ctx.alias_slug(),
+        &attr,
+        &name,
+    )
+    .await
+    .expect("cleanup");
 }
 
 fn current_head(repo: &pimsteward::store::Repo) -> String {

@@ -16,20 +16,23 @@
 //!
 //! Calendar has both [`CalendarSource`] and [`CalendarWriter`] traits with
 //! REST and iCloud-CalDAV implementations. Contacts has [`ContactsSource`]
-//! (REST + CardDAV). Sieve is forwardemail-specific and has no trait.
+//! (REST + CardDAV). Sieve has [`SieveBackend`] (FE REST + Stalwart
+//! ManageSieve).
 
 pub mod caldav;
 pub mod carddav;
 pub mod dav;
 pub mod imap;
 pub mod rest;
+pub mod sieve;
 pub mod traits;
 
 pub use caldav::{DavCalendarSource, DavCalendarWriter};
 pub use carddav::{DavContactsSource, DavContactsWriter};
 pub use imap::ImapMailSource;
 pub use rest::{RestCalendarSource, RestCalendarWriter, RestContactsSource, RestMailSource};
+pub use sieve::{ForwardemailSieveBackend, StalwartSieveBackend};
 pub use traits::{
     CalendarSource, CalendarWriter, ContactsSource, FetchedMessage, ListResult, MailSource,
-    MailWriter,
+    MailWriter, SieveBackend, SieveScriptMeta,
 };

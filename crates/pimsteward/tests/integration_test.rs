@@ -2,10 +2,12 @@
 //! in-process mocks.
 
 use pimsteward::forwardemail::Client;
+use pimsteward::mcp::ManageSieveConfig;
 use pimsteward::pull::calendar::pull_calendar;
 use pimsteward::pull::contacts::pull_contacts;
 use pimsteward::pull::mail::pull_mail;
 use pimsteward::pull::sieve::pull_sieve;
+use pimsteward::source::sieve::ForwardemailSieveBackend;
 use pimsteward::source::{RestCalendarSource, RestContactsSource, RestMailSource};
 use pimsteward::store::Repo;
 use wiremock::matchers::{method, path};
@@ -18,6 +20,19 @@ fn make_client(base: &str) -> Client {
         "pw".to_string(),
     )
     .unwrap()
+}
+
+fn dummy_managesieve() -> ManageSieveConfig {
+    ManageSieveConfig {
+        host: String::new(),
+        port: 0,
+        user: String::new(),
+        password: String::new(),
+    }
+}
+
+fn make_backend(client: Client) -> ForwardemailSieveBackend {
+    ForwardemailSieveBackend::new(client, dummy_managesieve())
 }
 
 #[tokio::test]
@@ -186,7 +201,8 @@ async fn sieve_pull_creates_then_detects_content_change() {
         .await;
 
     let client = make_client(&server.uri());
-    let s1 = pull_sieve(&client, &repo, "test-alias", "test", "test@x")
+    let backend = make_backend(client);
+    let s1 = pull_sieve(&backend, &repo, "test-alias", "test", "test@x")
         .await
         .unwrap();
     assert_eq!(s1.added, 1);
@@ -224,7 +240,7 @@ async fn sieve_pull_creates_then_detects_content_change() {
         .mount(&server)
         .await;
 
-    let s2 = pull_sieve(&client, &repo, "test-alias", "test", "test@x")
+    let s2 = pull_sieve(&backend, &repo, "test-alias", "test", "test@x")
         .await
         .unwrap();
     assert_eq!(s2.updated, 1);

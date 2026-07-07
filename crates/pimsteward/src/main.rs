@@ -245,8 +245,15 @@ async fn main() -> Result<()> {
             let alias = alias_from_user(&user);
             let client = Client::new(cfg.forwardemail.api_base.clone(), user, pass)?;
             let repo = Repo::open_or_init(&cfg.storage.repo_path)?;
+            let ms = pimsteward::mcp::ManageSieveConfig {
+                host: cfg.forwardemail.managesieve_host.clone(),
+                port: cfg.forwardemail.managesieve_port,
+                user: String::new(),
+                password: String::new(),
+            };
+            let backend = pimsteward::source::sieve::ForwardemailSieveBackend::new(client, ms);
             let summary = pull::sieve::pull_sieve(
-                &client,
+                &backend,
                 &repo,
                 &alias,
                 "pimsteward-pull",
@@ -334,7 +341,16 @@ async fn main() -> Result<()> {
                 .check_read(pimsteward::Resource::Sieve)
                 .is_ok()
             {
-                let s = pull::sieve::pull_sieve(&client, &repo, &alias, author.0, author.1).await?;
+                let ms = pimsteward::mcp::ManageSieveConfig {
+                    host: cfg.forwardemail.managesieve_host.clone(),
+                    port: cfg.forwardemail.managesieve_port,
+                    user: String::new(),
+                    password: String::new(),
+                };
+                let backend =
+                    pimsteward::source::sieve::ForwardemailSieveBackend::new(client.clone(), ms);
+                let s = pull::sieve::pull_sieve(&backend, &repo, &alias, author.0, author.1)
+                    .await?;
                 tracing::info!(summary = %s, "pull-sieve done");
                 println!("{s}");
             }

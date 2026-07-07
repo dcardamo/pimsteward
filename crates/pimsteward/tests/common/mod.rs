@@ -119,6 +119,21 @@ impl E2eContext {
             password,
         }
     }
+
+    /// FE-shaped `SieveBackend` (REST CRUD + ManageSieve activation) for
+    /// the test alias. Used by e2e sieve tests that exercise the
+    /// trait-based sieve plumbing.
+    pub fn sieve_backend(&self) -> pimsteward::source::ForwardemailSieveBackend {
+        pimsteward::source::ForwardemailSieveBackend::new(
+            self.client.clone(),
+            self.managesieve(),
+        )
+    }
+
+    /// REST-backed `MailSource` for fileinto validation in sieve tests.
+    pub fn mail_source(&self) -> Arc<dyn pimsteward::source::MailSource> {
+        Arc::new(pimsteward::source::RestMailSource::new(self.client.clone()))
+    }
 }
 
 fn env_path(key: &str, default: &str) -> PathBuf {

@@ -612,6 +612,7 @@ async fn sieve_restore_isolation_from_new_scripts() {
     let good_a = r#"require ["fileinto"]; fileinto "Archive";"#;
     let script_a = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -628,10 +629,11 @@ async fn sieve_restore_isolation_from_new_scripts() {
     let bad_a = r#"require ["fileinto"]; fileinto "Junk";"#;
     write::sieve::update_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &script_a.id,
+        &name_a,
         bad_a,
     )
     .await
@@ -642,6 +644,7 @@ async fn sieve_restore_isolation_from_new_scripts() {
     let content_b = r#"require ["fileinto"]; fileinto "Later";"#;
     let script_b = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -654,6 +657,7 @@ async fn sieve_restore_isolation_from_new_scripts() {
     let content_c = r#"require ["fileinto"]; fileinto "Alt";"#;
     let script_c = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -715,13 +719,14 @@ async fn sieve_restore_isolation_from_new_scripts() {
     );
 
     // Cleanup
-    for id in [&script_a.id, &script_b.id, &script_c.id] {
+    for name in [&name_a, &name_b, &name_c] {
         let _ = write::sieve::delete_sieve_script(
             &ctx.client,
+            &ctx.managesieve(),
             &ctx.repo,
             &ctx.alias_slug(),
             &attr,
-            id,
+            name,
         )
         .await;
     }
@@ -1041,6 +1046,7 @@ async fn sieve_restore_noop_when_state_matches_head() {
     let content = r#"require ["fileinto"]; fileinto "Archive";"#;
     let script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -1069,10 +1075,11 @@ async fn sieve_restore_noop_when_state_matches_head() {
 
     let _ = write::sieve::delete_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &script.id,
+        &name,
     )
     .await;
 }
@@ -1260,6 +1267,7 @@ async fn sieve_restore_rejects_wrong_token() {
     let v1 = r#"require ["fileinto"]; fileinto "A";"#;
     let script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -1273,10 +1281,11 @@ async fn sieve_restore_rejects_wrong_token() {
     let v2 = r#"require ["fileinto"]; fileinto "B";"#;
     write::sieve::update_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &script.id,
+        &name,
         v2,
     )
     .await
@@ -1317,10 +1326,11 @@ async fn sieve_restore_rejects_wrong_token() {
 
     let _ = write::sieve::delete_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &script.id,
+        &name,
     )
     .await;
 }
@@ -1447,6 +1457,7 @@ async fn bulk_restore_scoped_to_contacts_touches_only_contact_paths() {
     let sieve_content = r#"require ["fileinto"]; fileinto "Survive";"#;
     let script = write::sieve::install_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
@@ -1602,10 +1613,11 @@ async fn bulk_restore_scoped_to_contacts_touches_only_contact_paths() {
     .await;
     let _ = write::sieve::delete_sieve_script(
         &ctx.client,
+        &ctx.managesieve(),
         &ctx.repo,
         &ctx.alias_slug(),
         &attr,
-        &script.id,
+        &sieve_name,
     )
     .await;
     let _ = ctx.client.delete_calendar_event(&event.id).await;

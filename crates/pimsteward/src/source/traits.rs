@@ -182,3 +182,77 @@ pub trait ContactsSource: Send + Sync {
     /// includes the raw vCard in `content` and the CardDAV etag in `etag`.
     async fn list_contacts(&self) -> Result<Vec<Contact>, Error>;
 }
+
+// ── Sieve ───────────────────────────────────────────────────────────
+
+/// Read/write abstraction over a Sieve script store. Two implementations:
+/// - **forwardemail (REST):** script CRUD over the `/v1/sieve-scripts`
+///   REST API, activation over ManageSieve (the REST `is_active` field
+///   is read-only).
+/// - **Stalwart:** full CRUD + activation over ManageSieve (RFC 5804),
+///   with STARTTLS on port 4190. No REST surface.
+///
+/// The trait is script-name keyed (not backend-id keyed) because
+/// ManageSieve has no stable opaque ids — `LISTSCRIPTS` returns names
+/// only, and `GETSCRIPT`/`PUTSCRIPT`/`DELETESCRIPT`/`SETACTIVE` all
+/// key on the script name. The forwardemail REST surface is also
+/// name-keyed at this layer (the REST `id` is retained in
+/// [`SieveScriptMeta`] for the audit-trail meta.json but is not used
+/// as the dispatch key).
+#[async_trait]
+pub trait SieveBackend: Send + Sync {
+    fn tag(&self) -> &'static str;
+    /// List every script and whether it's currently active.
+    async fn list_scripts(&self) -> Result<Vec<SieveScriptMeta>, Error>;
+    /// Fetch the full content of one script by name. Returns
+    /// `Error::Api{status:404}` if no script with that name exists.
+    async fn get_script(&self, name: &str) -> Result<SieveScriptMeta, Error>;
+    /// Create or replace a script's content. Stalwart's ManageSieve
+    /// `PUTSCRIPT` is an upsert (create-or-replace by name); the FE
+    /// REST surface is also an upsert if the caller first checks the
+    /// existing list — implementations may transparently fall back to
+    /// update when a create returns a 422 "already exists".
+    ///
+    /// The returned [`SieveScriptMeta`] reflects the post-write state.
+    /// `is_valid` / `validation_errors` are populated when the backend
+    /// parses the script server-side (FE REST does; Stalwart
+    /// ManageSieve does NOT — it accepts bytes and reports syntax
+    /// errors only via the NO response code, which is surfaced as a
+    /// 422 `Error::Api`).
+    async fn put_script(
+        &self,
+        name: &str,
+        content: &str,
+    ) -> Result<SieveScriptMeta, Error>;
+    /// Delete a script by name. Idempotent — deleting a non-existent
+    /// script returns `Ok(())`.
+    async fn delete_script(&self, name: &str) -> Result<(), Error>;
+    /// Activate a script by name (deactivates any previously active
+    /// script). Pass an empty string to deactivate all scripts.
+    async fn activate_script(&self, name: &str) -> Result<(), Error>;
+    /// Return the name of the currently active script, or `None` if
+    /// no script is active.
+    async fn get_active(&self) -> Result<Option<String>, Error>;
+}
+
+/// Backend-neutral view of one sieve script. The `id` field is the
+/// backend's opaque identifier (FE REST id; Stalwart uses the script
+/// name) — kept for the audit-trail meta.json but not used as a
+/// dispatch key by [`SieveBackend`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SieveScriptMeta {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub is_active: bool,
+    /// True when the backend reports the script parses cleanly.
+    /// Stalwart's ManageSieve has no parse step on PUTSCRIPT, so
+    /// `is_valid` is `true` on a successful put and `false` is
+    /// signalled via a 422 `Error::Api` instead.
+    #[serde(default)]
+    pub is_valid: bool,
+    #[serde(default)]
+    pub validation_errors: Vec<String>,
+}

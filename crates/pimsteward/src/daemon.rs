@@ -160,14 +160,13 @@ async fn spawn_mcp_http_listener(
                         std::io::Error::other("provider returned no calendar writer for MCP factory")
                     })?;
 
-                // Client + ManageSieve config: Forward Email surfaces a REST
-                // `client` and its own ManageSieve endpoint; Stalwart has no
-                // REST surface but DOES expose ManageSieve (the trusted Sieve
-                // runtime runs user scripts via the LMTP ingest pipeline, and
-                // the managesieve listener on 4190 lets pimsteward activate /
-                // edit the user's script). Downcast once and reuse for both
-                // the SMTP sender and the ManageSieve config so we don't pay
-                // the as_any cost twice. iCloud has neither -> both `None`.
+                // Client + ManageSieve + SieveBackend: Forward Email surfaces
+                // a REST `client` and its own ManageSieve endpoint (implicit
+                // TLS); Stalwart has no REST surface but DOES expose
+                // ManageSieve (STARTTLS on 4190) and runs user Sieve scripts
+                // via the LMTP ingest pipeline. iCloud has neither. Downcast
+                // once and reuse for the SMTP sender, the ManageSieve config,
+                // and the SieveBackend so we don't pay the as_any cost twice.
                 let stalwart = provider
                     .as_any()
                     .downcast_ref::<crate::provider::stalwart::StalwartProvider>();
@@ -194,6 +193,25 @@ async fn spawn_mcp_http_listener(
                         }),
                     ),
                 };
+
+                // SieveBackend — the trait the MCP `list_sieve_rules` /
+                // `add_sieve_rule` / `remove_sieve_rule` tools dispatch
+                // through. FE wraps the REST `client` + the ManageSieve
+                // config (REST for CRUD, ManageSieve for activation);
+                // Stalwart is pure ManageSieve (STARTTLS). iCloud: `None`.
+                let sieve_backend: Option<Arc<dyn crate::source::traits::SieveBackend>> =
+                    match (client.as_ref(), managesieve.as_ref(), stalwart) {
+                        (Some(c), Some(ms), _) => Some(Arc::new(
+                            crate::source::sieve::ForwardemailSieveBackend::new(
+                                c.clone(),
+                                ms.clone(),
+                            ),
+                        )),
+                        (None, Some(ms), _) => Some(Arc::new(
+                            crate::source::sieve::StalwartSieveBackend::new(ms.clone()),
+                        )),
+                        _ => None,
+                    };
 
                 // SMTP-submission sender for the `send_email` tool. Built only
                 // for Stalwart (which has no REST send surface) by downcasting
@@ -224,6 +242,7 @@ async fn spawn_mcp_http_listener(
                     calendar_source,
                     calendar_writer,
                     managesieve,
+                    sieve_backend,
                     search_index,
                     smtp_sender,
                 ))
@@ -409,16 +428,24 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
         match fe_provider.as_ref() {
             Some(fe) => {
                 let client = fe.client().clone();
+                let ms = crate::mcp::ManageSieveConfig {
+                    host: cfg.forwardemail.managesieve_host.clone(),
+                    port: cfg.forwardemail.managesieve_port,
+                    user: fe.user().to_string(),
+                    password: fe.password().to_string(),
+                };
+                let backend =
+                    crate::source::sieve::ForwardemailSieveBackend::new(client, ms);
                 let h = spawn_puller(
                     "sieve",
                     Duration::from_secs(cfg.pull.sieve_interval_seconds),
-                    client,
+                    backend,
                     repo.clone(),
                     alias.clone(),
-                    |c, r, a| {
+                    |b, r, a| {
                         Box::pin(async move {
                             pull::sieve::pull_sieve(
-                                &c,
+                                &b,
                                 &r,
                                 &a,
                                 "pimsteward-pull",
@@ -432,11 +459,54 @@ pub async fn run(cfg: Config, http: Option<HttpOptions>) -> Result<(), Error> {
                 handles.push(h);
             }
             None => {
-                tracing::info!(
-                    provider = provider.name(),
-                    "sieve capability present but no REST client; skipping sieve content \
-                     backup pull (activation still available via ManageSieve)",
-                );
+                // Stalwart: pull sieve scripts via ManageSieve (STARTTLS).
+                // The SieveBackend is the same one the MCP tools use, built
+                // from the StalwartProvider's managesieve_config(). iCloud
+                // has no sieve surface at all, so we only enter this branch
+                // when the provider advertises sieve (see capabilities check
+                // above) — for iCloud that check fails and we never get here.
+                if let Some(st) = provider
+                    .as_any()
+                    .downcast_ref::<crate::provider::stalwart::StalwartProvider>()
+                {
+                    let ms = st.managesieve_config();
+                    let backend = crate::source::sieve::StalwartSieveBackend::new(
+                        crate::mcp::ManageSieveConfig {
+                            host: ms.host,
+                            port: ms.port,
+                            user: ms.user,
+                            password: ms.password,
+                        },
+                    );
+                    let h = spawn_puller(
+                        "sieve",
+                        Duration::from_secs(cfg.pull.sieve_interval_seconds),
+                        backend,
+                        repo.clone(),
+                        alias.clone(),
+                        |b, r, a| {
+                            Box::pin(async move {
+                                pull::sieve::pull_sieve(
+                                    &b,
+                                    &r,
+                                    &a,
+                                    "pimsteward-pull",
+                                    "pull@pimsteward.local",
+                                )
+                                .await
+                                .map(|s| s.to_string())
+                            })
+                        },
+                    );
+                    handles.push(h);
+                } else {
+                    tracing::info!(
+                        provider = provider.name(),
+                        "sieve capability present but no SieveBackend available; skipping \
+                         sieve content backup pull (activation may still be available via \
+                         ManageSieve)",
+                    );
+                }
             }
         }
     }
@@ -1324,22 +1394,27 @@ type PullFn = Box<
         + Sync,
 >;
 
-fn spawn_puller(
+#[allow(dead_code)]
+fn _pull_fn_unused(_: PullFn) {}
+
+fn spawn_puller<T>(
     name: &'static str,
     period: Duration,
-    client: Client,
+    input: T,
     repo: Arc<Repo>,
     alias: String,
     f: impl Fn(
-            Client,
+            T,
             Arc<Repo>,
             String,
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, Error>> + Send>>
         + Send
         + Sync
         + 'static,
-) -> tokio::task::JoinHandle<()> {
-    let f: PullFn = Box::new(f);
+) -> tokio::task::JoinHandle<()>
+where
+    T: Clone + Send + Sync + 'static,
+{
     let span = tracing::info_span!("puller", resource = name);
     tokio::spawn(
         async move {
@@ -1347,7 +1422,7 @@ fn spawn_puller(
             tracing::info!(period_secs = period.as_secs(), "puller started");
             loop {
                 ticker.tick().await;
-                match (f)(client.clone(), repo.clone(), alias.clone()).await {
+                match (f)(input.clone(), repo.clone(), alias.clone()).await {
                     Ok(summary) => tracing::info!(%summary, "pull ok"),
                     Err(e) => tracing::error!(error = %e, "pull failed"),
                 }
