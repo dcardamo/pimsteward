@@ -125,7 +125,7 @@ pub async fn add_sieve_rule(
     };
     let rule_text = rule_text_owned.as_str();
 
-    let active = resolve_or_bootstrap_active(backend, rule_text).await?;
+    let active = resolve_or_bootstrap_active(backend, rule_text, comment).await?;
 
     // If we just bootstrapped, the script's content already contains the
     // rule — nothing to append. Audit + commit and return.
@@ -225,6 +225,7 @@ struct ResolvedActive {
 async fn resolve_or_bootstrap_active(
     backend: &dyn SieveBackend,
     bootstrap_content: &str,
+    comment: Option<&str>,
 ) -> Result<ResolvedActive, Error> {
     if let Some(active_name) = backend.get_active().await? {
         let script = backend.get_script(&active_name).await?;
@@ -239,8 +240,9 @@ async fn resolve_or_bootstrap_active(
         String::new()
     } else {
         // Re-emit through the merge function so the bootstrap content
-        // gets the same require-line normalization as appended rules.
-        merge_sieve_with_rule("", bootstrap_content, None)
+        // gets the same require-line normalization as appended rules,
+        // and the comment header is rendered as the rule's name.
+        merge_sieve_with_rule("", bootstrap_content, comment)
     };
 
     // If a `main` script already exists (perhaps deactivated), update
