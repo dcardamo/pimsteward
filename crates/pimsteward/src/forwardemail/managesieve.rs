@@ -171,8 +171,22 @@ impl ManageSieveSession {
             writer: wr,
         };
 
-        // AUTHENTICATE PLAIN (no banner read after STARTTLS — the server
-        // sends capabilities then waits for the next command).
+        // After STARTTLS the server emits a fresh capability banner
+        // (IMPLEMENTATION/VERSION/SASL/SIEVE/...OK). Drain it before
+        // sending AUTHENTICATE — otherwise read_response for the auth
+        // reply captures the banner's OK line and returns prematurely.
+        loop {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), session.reader.read_line(&mut line))
+                .await
+                .map_err(|_| Error::config("ManageSieve post-STARTTLS banner timeout"))?
+                .map_err(|e| Error::config(format!("ManageSieve post-STARTTLS read: {e}")))?;
+            if line.trim().starts_with("OK") {
+                break;
+            }
+        }
+
+        // AUTHENTICATE PLAIN.
         let auth_str =
             base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{password}"));
         session
