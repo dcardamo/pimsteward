@@ -160,10 +160,17 @@ async fn spawn_mcp_http_listener(
                         std::io::Error::other("provider returned no calendar writer for MCP factory")
                     })?;
 
-                // Client + ManageSieve config are forwardemail-specific.
-                // For the iCloud provider they're absent; mail/sieve tools
-                // that need them return "unsupported by provider" at call
-                // time.
+                // Client + ManageSieve config: Forward Email surfaces a REST
+                // `client` and its own ManageSieve endpoint; Stalwart has no
+                // REST surface but DOES expose ManageSieve (the trusted Sieve
+                // runtime runs user scripts via the LMTP ingest pipeline, and
+                // the managesieve listener on 4190 lets pimsteward activate /
+                // edit the user's script). Downcast once and reuse for both
+                // the SMTP sender and the ManageSieve config so we don't pay
+                // the as_any cost twice. iCloud has neither -> both `None`.
+                let stalwart = provider
+                    .as_any()
+                    .downcast_ref::<crate::provider::stalwart::StalwartProvider>();
                 let (client, managesieve) = match fe.as_ref() {
                     Some(fe) => (
                         Some(fe.client().clone()),
@@ -174,7 +181,18 @@ async fn spawn_mcp_http_listener(
                             password: fe.password().to_string(),
                         }),
                     ),
-                    None => (None, None),
+                    None => (
+                        None,
+                        stalwart.map(|st| {
+                            let ms = st.managesieve_config();
+                            crate::mcp::ManageSieveConfig {
+                                host: ms.host,
+                                port: ms.port,
+                                user: ms.user,
+                                password: ms.password,
+                            }
+                        }),
+                    ),
                 };
 
                 // SMTP-submission sender for the `send_email` tool. Built only
@@ -184,9 +202,7 @@ async fn spawn_mcp_http_listener(
                 // `build_scheduling_sender` uses for the daemon's scheduling
                 // send. forwardemail and iCloud get `None`: forwardemail sends
                 // through the REST `client`, iCloud has no send transport.
-                let smtp_sender = provider
-                    .as_any()
-                    .downcast_ref::<crate::provider::stalwart::StalwartProvider>()
+                let smtp_sender = stalwart
                     .map(|st| Arc::new(crate::smtp::SmtpSender::new(st.smtp_config())));
 
                 let repo =
