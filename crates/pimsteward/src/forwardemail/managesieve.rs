@@ -290,19 +290,35 @@ impl ManageSieveSession {
         }
     }
 
-    /// Delete a script by name (RFC 5804 DELETESCRIPT). Returns
-    /// `Error::Api{status:404}` if the server reports no such script.
+    /// Delete a script by name (RFC 5804 DELETESCRIPT). Returns:
+    /// - `Ok(())` on a successful delete.
+    /// - `Error::Api{status:404}` if the server reports no such script
+    ///   (the `NO` response has no `(ACTIVE)` code — used by callers for
+    ///   idempotent deletes of already-gone scripts).
+    /// - `Error::Api{status:409}` if the server refuses because the
+    ///   script is currently active (`NO (ACTIVE) ...`). The caller must
+    ///   deactivate (SETACTIVE "") before retrying.
     pub async fn delete_script(&mut self, name: &str) -> Result<(), Error> {
         self.send_command(&format!("DELETESCRIPT \"{name}\"")).await?;
         let resp = self.read_response().await?;
         if resp.starts_with("OK") {
-            Ok(())
-        } else {
-            Err(Error::Api {
-                status: 404,
-                message: format!("ManageSieve DELETESCRIPT failed: {}", resp.trim()),
-            })
+            return Ok(());
         }
+        let trimmed = resp.trim();
+        // Stalwart returns `NO (ACTIVE) "You may not delete an active script"`
+        // when the target script is currently active. Surface that as a 409
+        // (Conflict) so the backend can deactivate-then-retry; a plain NO
+        // (no such script) stays a 404 for idempotent-delete callers.
+        if trimmed.contains("(ACTIVE)") {
+            return Err(Error::Api {
+                status: 409,
+                message: format!("ManageSieve DELETESCRIPT refused (active): {trimmed}"),
+            });
+        }
+        Err(Error::Api {
+            status: 404,
+            message: format!("ManageSieve DELETESCRIPT failed: {trimmed}"),
+        })
     }
 
     async fn send_command(&mut self, cmd: &str) -> Result<(), Error> {

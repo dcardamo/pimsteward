@@ -226,9 +226,18 @@ impl SieveBackend for StalwartSieveBackend {
     async fn delete_script(&self, name: &str) -> Result<(), Error> {
         let mut session = self.connect().await?;
         // Idempotent: a NO for "no such script" is treated as success.
+        // Stalwart refuses DELETESCRIPT on the active script with
+        // `NO (ACTIVE)` (surfaced as 409); deactivate-then-delete in that
+        // case so callers get the script removed without a separate
+        // deactivate call.
         match session.delete_script(name).await {
             Ok(()) => Ok(()),
             Err(Error::Api { status: 404, .. }) => Ok(()),
+            Err(Error::Api { status: 409, .. }) => {
+                // Deactivate (SETACTIVE "") and retry the delete.
+                session.set_active("").await?;
+                session.delete_script(name).await
+            }
             Err(e) => Err(e),
         }
     }
