@@ -187,10 +187,13 @@ async fn sieve_pull_creates_then_detects_content_change() {
         "security_warnings": [], "validation_errors": []
     });
 
+    // list_sieve_scripts is called twice per pull: once by list_scripts()
+    // and once by get_script() (which re-lists to resolve the script name
+    // to its REST id — FE has no get-by-name endpoint). Allow 2 hits.
     Mock::given(method("GET"))
         .and(path("/v1/sieve-scripts"))
         .respond_with(ResponseTemplate::new(200).set_body_json(list_v1))
-        .up_to_n_times(1)
+        .up_to_n_times(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -230,7 +233,7 @@ async fn sieve_pull_creates_then_detects_content_change() {
     Mock::given(method("GET"))
         .and(path("/v1/sieve-scripts"))
         .respond_with(ResponseTemplate::new(200).set_body_json(list_v2))
-        .up_to_n_times(1)
+        .up_to_n_times(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
